@@ -23,9 +23,35 @@ impl Default for CgroupLimits {
     }
 }
 
+impl CgroupLimits {
+    /// Validate and adjust limits to prevent system issues
+    pub fn validated(mut self) -> Self {
+        // Enforce minimum memory limit of 256MB to prevent fork failures
+        if let Some(memory_limit) = self.memory_limit_bytes {
+            const MIN_MEMORY_LIMIT: u64 = 256 * 1024 * 1024; // 256MB minimum
+            if memory_limit < MIN_MEMORY_LIMIT {
+                eprintln!("Warning: Memory limit {}MB is too low, adjusting to {}MB", 
+                         memory_limit / (1024 * 1024), MIN_MEMORY_LIMIT / (1024 * 1024));
+                self.memory_limit_bytes = Some(MIN_MEMORY_LIMIT);
+            }
+        }
+
+        // Ensure reasonable PIDs limit
+        if let Some(pids_limit) = self.pids_limit {
+            if pids_limit < 64 {  // Increase minimum PIDs
+                eprintln!("Warning: PIDs limit {} is too low, adjusting to 64", pids_limit);
+                self.pids_limit = Some(64);
+            }
+        }
+
+        self
+    }
+}
+
 pub struct CgroupManager {
     cgroup_root: PathBuf,
     container_id: String,
+    initialization_mode: bool, // Whether we're in container initialization
 }
 
 impl CgroupManager {
@@ -33,6 +59,7 @@ impl CgroupManager {
         CgroupManager {
             cgroup_root: PathBuf::from("/sys/fs/cgroup"),
             container_id,
+            initialization_mode: true,
         }
     }
 
@@ -40,14 +67,17 @@ impl CgroupManager {
     pub fn create_cgroups(&self, limits: &CgroupLimits) -> Result<(), String> {
         println!("Creating cgroups for container: {}", self.container_id);
 
+        // Validate and adjust limits
+        let validated_limits = limits.clone().validated();
+
         // Check if cgroup v2 is available
         let cgroup_v2_path = self.cgroup_root.join("cgroup.controllers");
         let use_cgroup_v2 = cgroup_v2_path.exists();
 
         if use_cgroup_v2 {
-            self.create_cgroup_v2(limits)
+            self.create_cgroup_v2(&validated_limits)
         } else {
-            self.create_cgroup_v1(limits)
+            self.create_cgroup_v1(&validated_limits)
         }
     }
 
@@ -71,17 +101,28 @@ impl CgroupManager {
             }
         }
 
-        // Set memory limit
-        if let Some(memory_limit) = limits.memory_limit_bytes {
-            let memory_max = container_cgroup.join("memory.max");
-            if let Err(e) = fs::write(&memory_max, memory_limit.to_string()) {
-                eprintln!("Warning: Failed to set memory limit: {}", e);
-            } else {
-                println!("Set memory limit to {} bytes", memory_limit);
+        // Skip memory limits during initialization to prevent fork failures
+        if !self.initialization_mode {
+            // Set memory limit only after initialization
+            if let Some(memory_limit) = limits.memory_limit_bytes {
+                let memory_max = container_cgroup.join("memory.max");
+                if let Err(e) = fs::write(&memory_max, memory_limit.to_string()) {
+                    eprintln!("Warning: Failed to set memory limit: {}", e);
+                } else {
+                    println!("Set memory limit to {} bytes", memory_limit);
+                }
+
+                // Set memory.swap.max to prevent swap thrashing
+                let memory_swap_max = container_cgroup.join("memory.swap.max");
+                if let Err(e) = fs::write(&memory_swap_max, "0") {
+                    eprintln!("Warning: Failed to disable swap: {}", e);
+                }
             }
+        } else {
+            println!("Skipping memory limits during initialization to prevent fork failures");
         }
 
-        // Set CPU limits
+        // Set CPU limits (these are generally safe during initialization)
         if let Some(cpu_quota) = limits.cpu_quota {
             if let Some(cpu_period) = limits.cpu_period {
                 let cpu_max = container_cgroup.join("cpu.max");
@@ -110,13 +151,18 @@ impl CgroupManager {
             }
         }
 
-        // Set PIDs limit
+        // Set PIDs limit (but use a generous limit during initialization)
         if let Some(pids_limit) = limits.pids_limit {
             let pids_max = container_cgroup.join("pids.max");
-            if let Err(e) = fs::write(&pids_max, pids_limit.to_string()) {
+            let effective_pids_limit = if self.initialization_mode {
+                std::cmp::max(pids_limit, 512) // Ensure at least 512 PIDs during init
+            } else {
+                pids_limit
+            };
+            if let Err(e) = fs::write(&pids_max, effective_pids_limit.to_string()) {
                 eprintln!("Warning: Failed to set PIDs limit: {}", e);
             } else {
-                println!("Set PIDs limit to {}", pids_limit);
+                println!("Set PIDs limit to {}", effective_pids_limit);
             }
         }
 
@@ -127,22 +173,33 @@ impl CgroupManager {
     fn create_cgroup_v1(&self, limits: &CgroupLimits) -> Result<(), String> {
         println!("Using cgroup v1 for container: {}", self.container_id);
 
-        // Memory cgroup
-        if let Some(memory_limit) = limits.memory_limit_bytes {
-            let memory_cgroup = self.cgroup_root.join("memory/quilt").join(&self.container_id);
-            if let Err(e) = fs::create_dir_all(&memory_cgroup) {
-                eprintln!("Warning: Failed to create memory cgroup: {}", e);
-            } else {
-                let memory_limit_file = memory_cgroup.join("memory.limit_in_bytes");
-                if let Err(e) = fs::write(&memory_limit_file, memory_limit.to_string()) {
-                    eprintln!("Warning: Failed to set memory limit: {}", e);
+        // Skip memory cgroup creation during initialization to prevent fork failures
+        if !self.initialization_mode {
+            // Memory cgroup - only create after initialization
+            if let Some(memory_limit) = limits.memory_limit_bytes {
+                let memory_cgroup = self.cgroup_root.join("memory/quilt").join(&self.container_id);
+                if let Err(e) = fs::create_dir_all(&memory_cgroup) {
+                    eprintln!("Warning: Failed to create memory cgroup: {}", e);
                 } else {
-                    println!("Set memory limit to {} bytes", memory_limit);
+                    let memory_limit_file = memory_cgroup.join("memory.limit_in_bytes");
+                    if let Err(e) = fs::write(&memory_limit_file, memory_limit.to_string()) {
+                        eprintln!("Warning: Failed to set memory limit: {}", e);
+                    } else {
+                        println!("Set memory limit to {} bytes", memory_limit);
+                    }
+
+                    // Disable memory swapping
+                    let memory_swappiness = memory_cgroup.join("memory.swappiness");
+                    if let Err(e) = fs::write(&memory_swappiness, "0") {
+                        eprintln!("Warning: Failed to set memory swappiness: {}", e);
+                    }
                 }
             }
+        } else {
+            println!("Skipping memory cgroup during initialization to prevent fork failures");
         }
 
-        // CPU cgroup
+        // CPU cgroup (generally safe during initialization)
         let cpu_cgroup = self.cgroup_root.join("cpu/quilt").join(&self.container_id);
         if let Err(e) = fs::create_dir_all(&cpu_cgroup) {
             eprintln!("Warning: Failed to create CPU cgroup: {}", e);
@@ -178,17 +235,58 @@ impl CgroupManager {
             }
         }
 
-        // PIDs cgroup
+        // PIDs cgroup (with generous limits during initialization)
         if let Some(pids_limit) = limits.pids_limit {
             let pids_cgroup = self.cgroup_root.join("pids/quilt").join(&self.container_id);
             if let Err(e) = fs::create_dir_all(&pids_cgroup) {
                 eprintln!("Warning: Failed to create PIDs cgroup: {}", e);
             } else {
+                let effective_pids_limit = if self.initialization_mode {
+                    std::cmp::max(pids_limit, 512) // Ensure at least 512 PIDs during init
+                } else {
+                    pids_limit
+                };
                 let pids_limit_file = pids_cgroup.join("pids.max");
-                if let Err(e) = fs::write(&pids_limit_file, pids_limit.to_string()) {
+                if let Err(e) = fs::write(&pids_limit_file, effective_pids_limit.to_string()) {
                     eprintln!("Warning: Failed to set PIDs limit: {}", e);
                 } else {
-                    println!("Set PIDs limit to {}", pids_limit);
+                    println!("Set PIDs limit to {}", effective_pids_limit);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Finalize cgroup settings after container initialization
+    pub fn finalize_limits(&mut self, limits: &CgroupLimits) -> Result<(), String> {
+        if !self.initialization_mode {
+            return Ok(()); // Already finalized
+        }
+
+        println!("Finalizing cgroup limits for container: {}", self.container_id);
+        self.initialization_mode = false;
+
+        // Apply final memory limits without headroom
+        if let Some(memory_limit) = limits.memory_limit_bytes {
+            let cgroup_v2_path = self.cgroup_root.join("cgroup.controllers");
+            let use_cgroup_v2 = cgroup_v2_path.exists();
+
+            if use_cgroup_v2 {
+                let container_cgroup = self.cgroup_root.join("quilt").join(&self.container_id);
+                let memory_max = container_cgroup.join("memory.max");
+                if let Err(e) = fs::write(&memory_max, memory_limit.to_string()) {
+                    eprintln!("Warning: Failed to finalize memory limit: {}", e);
+                } else {
+                    println!("Finalized memory limit to {} bytes", memory_limit);
+                }
+            } else {
+                let memory_cgroup = self.cgroup_root.join("memory/quilt").join(&self.container_id);
+                let memory_limit_file = memory_cgroup.join("memory.limit_in_bytes");
+                if let Err(e) = fs::write(&memory_limit_file, memory_limit.to_string()) {
+                    eprintln!("Warning: Failed to finalize memory limit: {}", e);
+                } else {
+                    println!("Finalized memory limit to {} bytes", memory_limit);
                 }
             }
         }

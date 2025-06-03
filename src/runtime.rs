@@ -9,8 +9,10 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 use flate2::read::GzDecoder;
 use tar::Archive;
-use nix::unistd::{chroot, chdir, Pid};
+use nix::unistd::{chroot, chdir, Pid, fork, ForkResult, execv};
 use std::os::unix::fs::PermissionsExt;
+use std::ffi::CString;
+use nix::sys::wait::{waitpid, WaitStatus};
 
 #[derive(Debug, Clone)]
 pub enum ContainerState {
@@ -144,7 +146,7 @@ impl ContainerRuntime {
         };
 
         // Create cgroups
-        let cgroup_manager = CgroupManager::new(id.to_string());
+        let mut cgroup_manager = CgroupManager::new(id.to_string());
         if let Some(limits) = &config.resource_limits {
             if let Err(e) = cgroup_manager.create_cgroups(limits) {
                 eprintln!("Warning: Failed to create cgroups: {}", e);
@@ -237,48 +239,104 @@ impl ContainerRuntime {
                 std::env::set_var(key, value);
             }
 
-            // Execute the main command
+            // Execute the main command with better logging
             println!("Executing main command in container: {:?}", command_clone);
             
-            let mut cmd = Command::new(&command_clone[0]);
-            if command_clone.len() > 1 {
-                cmd.args(&command_clone[1..]);
+            // Handle command execution more intelligently
+            let (shell_cmd, shell_args) = if command_clone.len() >= 3 
+                && (command_clone[0].ends_with("/sh") || command_clone[0].ends_with("/bash"))
+                && command_clone[1] == "-c" {
+                // Command is already a shell command like ["/bin/sh", "-c", "actual command"]
+                // Extract the actual command to avoid double-shell wrapping
+                ("/bin/sh".to_string(), vec!["-c".to_string(), command_clone[2..].join(" ")])
+            } else if command_clone.len() == 1 {
+                // Single command - execute it through shell
+                ("/bin/sh".to_string(), vec!["-c".to_string(), command_clone[0].clone()])
+            } else {
+                // Multiple arguments - join them and execute through shell
+                ("/bin/sh".to_string(), vec!["-c".to_string(), command_clone.join(" ")])
+            };
+
+            // Write command info to container log (before chroot changes access)
+            if let Ok(mut containers) = containers_clone.lock() {
+                if let Some(container) = containers.get_mut(&id_clone) {
+                    container.add_log(format!("Executing command: {:?}", command_clone));
+                }
             }
 
-            // Capture output
-            match cmd.output() {
-                Ok(output) => {
-                    let stdout = String::from_utf8_lossy(&output.stdout);
-                    let stderr = String::from_utf8_lossy(&output.stderr);
+            // Use simple fork+exec approach that works after chroot
+            match unsafe { fork() } {
+                Ok(ForkResult::Child) => {
+                    // In child process - exec the command
                     
-                    // Add logs to container
-                    if let Ok(mut containers) = containers_clone.lock() {
-                        if let Some(container) = containers.get_mut(&id_clone) {
-                            if !stdout.is_empty() {
-                                container.add_log(format!("stdout: {}", stdout));
-                            }
-                            if !stderr.is_empty() {
-                                container.add_log(format!("stderr: {}", stderr));
-                            }
+                    // Prepare arguments for exec
+                    let mut exec_args = vec![shell_cmd.clone()];
+                    exec_args.extend(shell_args);
+                    
+                    // Convert to CString
+                    let program = CString::new(shell_cmd).unwrap();
+                    let args: Result<Vec<CString>, _> = exec_args.iter()
+                        .map(|s| CString::new(s.clone()))
+                        .collect();
+                    
+                    match args {
+                        Ok(arg_cstrings) => {
+                            let arg_refs: Vec<&CString> = arg_cstrings.iter().collect();
+                            
+                            // Try execv - this should replace the child process
+                            let e = execv(&program, &arg_refs).unwrap_err();
+                            eprintln!("Failed to exec in child: {}", e);
+                            std::process::exit(1);
                         }
-                    }
-
-                    if output.status.success() {
-                        println!("Container {} command completed successfully", id_clone);
-                        0
-                    } else {
-                        println!("Container {} command failed with exit code: {:?}", 
-                                id_clone, output.status.code());
-                        output.status.code().unwrap_or(1)
+                        Err(e) => {
+                            eprintln!("Failed to prepare arguments: {}", e);
+                            std::process::exit(1);
+                        }
                     }
                 }
-                Err(e) => {
-                    eprintln!("Failed to execute command in container {}: {}", id_clone, e);
+                Ok(ForkResult::Parent { child, .. }) => {
+                    // In parent process - wait for child to complete
+                    let exit_code = match waitpid(child, None) {
+                        Ok(WaitStatus::Exited(_, code)) => {
+                            println!("Command completed with exit code: {}", code);
+                            code as i32
+                        }
+                        Ok(WaitStatus::Signaled(_, signal, _)) => {
+                            println!("Command terminated by signal: {:?}", signal);
+                            128 + signal as i32
+                        }
+                        Ok(status) => {
+                            println!("Command completed with status: {:?}", status);
+                            1
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to wait for command: {}", e);
+                            1
+                        }
+                    };
+                    
+                    // Add completion log to container
                     if let Ok(mut containers) = containers_clone.lock() {
                         if let Some(container) = containers.get_mut(&id_clone) {
-                            container.add_log(format!("Execution error: {}", e));
+                            if exit_code == 0 {
+                                container.add_log("Command completed successfully".to_string());
+                            } else {
+                                container.add_log(format!("Command failed with exit code: {}", exit_code));
+                            }
                         }
                     }
+                    
+                    exit_code
+                }
+                Err(e) => {
+                    eprintln!("Failed to fork: {}", e);
+                    
+                    if let Ok(mut containers) = containers_clone.lock() {
+                        if let Some(container) = containers.get_mut(&id_clone) {
+                            container.add_log(format!("Failed to fork: {}", e));
+                        }
+                    }
+                    
                     1
                 }
             }
@@ -292,6 +350,13 @@ impl ContainerRuntime {
                 // Add process to cgroups
                 if let Err(e) = cgroup_manager.add_process(pid) {
                     eprintln!("Warning: Failed to add process to cgroups: {}", e);
+                }
+
+                // Finalize cgroup limits after process is started
+                if let Some(limits) = &config.resource_limits {
+                    if let Err(e) = cgroup_manager.finalize_limits(limits) {
+                        eprintln!("Warning: Failed to finalize cgroup limits: {}", e);
+                    }
                 }
 
                 // Update container state
@@ -388,6 +453,9 @@ impl ContainerRuntime {
             ("cat", vec!["/bin/cat", "/usr/bin/cat"]),
         ];
 
+        // First, ensure we have essential library directories
+        self.setup_library_directories(rootfs_path)?;
+
         for (binary_name, host_paths) in essential_binaries {
             let container_binary_path = format!("{}/bin/{}", rootfs_path, binary_name);
             
@@ -425,10 +493,63 @@ impl ContainerRuntime {
             }
         }
 
+        // Copy essential libraries
+        self.copy_essential_libraries(rootfs_path)?;
+
         // Ensure basic shell works
         self.verify_container_shell(rootfs_path)?;
 
         println!("✅ Container binaries fixed and verified");
+        Ok(())
+    }
+
+    /// Setup essential library directories
+    fn setup_library_directories(&self, rootfs_path: &str) -> Result<(), String> {
+        let lib_dirs = vec![
+            format!("{}/lib", rootfs_path),
+            format!("{}/lib64", rootfs_path),
+            format!("{}/lib/x86_64-linux-gnu", rootfs_path),
+        ];
+
+        for dir in lib_dirs {
+            if let Err(e) = fs::create_dir_all(&dir) {
+                eprintln!("Warning: Failed to create library directory {}: {}", dir, e);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Copy essential libraries needed by binaries
+    fn copy_essential_libraries(&self, rootfs_path: &str) -> Result<(), String> {
+        let essential_libs = vec![
+            ("/lib/x86_64-linux-gnu/libc.so.6", "lib/x86_64-linux-gnu/libc.so.6"),
+            ("/lib64/ld-linux-x86-64.so.2", "lib64/ld-linux-x86-64.so.2"),
+            ("/lib/x86_64-linux-gnu/libtinfo.so.6", "lib/x86_64-linux-gnu/libtinfo.so.6"),
+            ("/lib/x86_64-linux-gnu/libdl.so.2", "lib/x86_64-linux-gnu/libdl.so.2"),
+        ];
+
+        for (host_lib, container_lib) in essential_libs {
+            if Path::new(host_lib).exists() {
+                let container_lib_path = format!("{}/{}", rootfs_path, container_lib);
+                if let Some(parent) = Path::new(&container_lib_path).parent() {
+                    if let Err(e) = fs::create_dir_all(parent) {
+                        eprintln!("Warning: Failed to create lib directory: {}", e);
+                        continue;
+                    }
+                }
+
+                match fs::copy(host_lib, &container_lib_path) {
+                    Ok(_) => {
+                        println!("  ✓ Copied library: {}", container_lib);
+                    }
+                    Err(e) => {
+                        eprintln!("  ⚠ Failed to copy library {}: {}", host_lib, e);
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -440,13 +561,22 @@ impl ContainerRuntime {
                 .map_err(|e| format!("Failed to remove broken binary {}: {}", binary_name, e))?;
         }
 
+        // For critical binaries, try to create a shell script wrapper that's more likely to work
+        if binary_name == "sh" {
+            return self.create_robust_shell(container_binary_path);
+        }
+
+        if binary_name == "echo" {
+            return self.create_echo_script(container_binary_path);
+        }
+
         // Try to find a working binary on the host
         for host_path in host_paths {
             if Path::new(host_path).exists() {
                 // Check if it's executable
                 if let Ok(metadata) = fs::metadata(host_path) {
                     if metadata.permissions().mode() & 0o111 != 0 {
-                        // Copy the binary
+                        // For simple utilities, try copying first
                         match fs::copy(host_path, container_binary_path) {
                             Ok(_) => {
                                 // Make sure it's executable
@@ -470,47 +600,342 @@ impl ContainerRuntime {
             }
         }
 
-        // If we couldn't copy a binary, try to create a simple shell script as fallback
-        if binary_name == "sh" {
-            self.create_fallback_shell(container_binary_path)?;
-        } else {
-            println!("  ⚠ Could not fix binary {}, container may not work properly", binary_name);
+        // If copying failed, create a simple script implementation
+        match binary_name {
+            "ls" => self.create_ls_script(container_binary_path),
+            "cat" => self.create_cat_script(container_binary_path),
+            _ => {
+                println!("  ⚠ Could not fix binary {}, container may not work properly", binary_name);
+                Ok(())
+            }
+        }
+    }
+
+    /// Create a robust shell script that works without external dependencies
+    fn create_robust_shell(&self, shell_path: &str) -> Result<(), String> {
+        let container_root = Path::new(shell_path).parent().unwrap().parent().unwrap();
+        
+        // AVOID using Nix busybox - it has /nix/store dependencies that won't work after chroot
+        // Check if there's a busybox but verify it's not Nix-linked
+        let busybox_path = container_root.join("bin/busybox");
+        if busybox_path.exists() {
+            // Check if it's Nix-linked by looking for /nix/store in its dependencies
+            if let Ok(output) = Command::new("ldd").arg(&busybox_path).output() {
+                let ldd_output = String::from_utf8_lossy(&output.stdout);
+                if ldd_output.contains("/nix/store") {
+                    println!("  ⚠ Busybox is Nix-linked, avoiding it");
+                } else {
+                    // It's a good busybox, use it
+                    match fs::copy(&busybox_path, shell_path) {
+                Ok(_) => {
+                    let mut perms = fs::metadata(shell_path)
+                        .map_err(|e| format!("Failed to get shell permissions: {}", e))?
+                        .permissions();
+                    perms.set_mode(0o755);
+                    fs::set_permissions(shell_path, perms)
+                        .map_err(|e| format!("Failed to set shell permissions: {}", e))?;
+                            println!("  ✅ Created shell using non-Nix busybox");
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            println!("  ⚠ Failed to copy busybox: {}", e);
+                        }
+                    }
+                }
+            }
         }
 
+        // Try to create a statically linked shell binary first
+        if let Ok(()) = self.create_minimal_shell_binary(shell_path) {
+                    return Ok(());
+                }
+
+        // Try copying minimal shells from host that are more likely to be portable
+        let minimal_shells = ["/bin/dash", "/bin/ash", "/usr/bin/dash"];
+        for shell in &minimal_shells {
+            if Path::new(shell).exists() {
+                // Check if it's statically linked or has reasonable dependencies
+                if let Ok(output) = Command::new("ldd").arg(shell).output() {
+                    let ldd_output = String::from_utf8_lossy(&output.stdout);
+                    if ldd_output.contains("not a dynamic executable") || 
+                       (!ldd_output.contains("/nix/store") && ldd_output.contains("libc.so.6")) {
+                        // It's either static or has standard dependencies
+                        match fs::copy(shell, shell_path) {
+                            Ok(_) => {
+                                // Copy standard system libraries
+                                self.copy_shell_dependencies(shell, container_root.to_str().unwrap())?;
+                                
+                                let mut perms = fs::metadata(shell_path)
+                                    .map_err(|e| format!("Failed to get shell permissions: {}", e))?
+                                    .permissions();
+                                perms.set_mode(0o755);
+                                fs::set_permissions(shell_path, perms)
+                                    .map_err(|e| format!("Failed to set shell permissions: {}", e))?;
+                                
+                                println!("  ✅ Created shell by copying {}", shell);
+                                return Ok(());
+                            }
+                            Err(e) => {
+                                println!("  ⚠ Failed to copy {}: {}", shell, e);
+                                continue;
+                            }
+                        }
+                    } else {
+                        println!("  ⚠ Shell {} has complex dependencies, skipping", shell);
+                    }
+                }
+            }
+        }
+
+        // Final fallback - create a shell script
+        self.create_shell_script(shell_path)
+    }
+
+    /// Copy essential libraries for a shell binary
+    fn copy_shell_dependencies(&self, shell_binary: &str, container_root: &str) -> Result<(), String> {
+        // Use ldd to find dependencies
+        let output = Command::new("ldd")
+            .arg(shell_binary)
+            .output()
+            .map_err(|e| format!("Failed to run ldd: {}", e))?;
+
+        let ldd_output = String::from_utf8_lossy(&output.stdout);
+        
+        for line in ldd_output.lines() {
+            if let Some(lib_path) = self.extract_library_path(line) {
+                if Path::new(&lib_path).exists() {
+                    let lib_name = Path::new(&lib_path).file_name().unwrap().to_str().unwrap();
+                    let container_lib_path = format!("{}/lib/{}", container_root, lib_name);
+                    
+                    if let Some(parent) = Path::new(&container_lib_path).parent() {
+                        fs::create_dir_all(parent).ok();
+                    }
+                    
+                    if fs::copy(&lib_path, &container_lib_path).is_ok() {
+                        println!("    ✓ Copied library: {}", lib_name);
+                    }
+                }
+            }
+        }
+        
         Ok(())
     }
 
-    /// Create a simple fallback shell script
-    fn create_fallback_shell(&self, shell_path: &str) -> Result<(), String> {
-        let shell_script = r#"#!/bin/bash
-# Fallback shell for Quilt containers
-if [ "$#" -eq 0 ]; then
-    echo "Fallback shell activated - limited functionality"
-    echo "Available commands: echo, exit"
-    while read -p "$ " cmd args; do
-        case "$cmd" in
-            echo) echo $args ;;
-            exit) exit 0 ;;
-            *) echo "Command not found: $cmd" ;;
-        esac
-    done
-else
-    # Execute command mode
-    case "$1" in
-        -c)
-            shift
-            eval "$@"
-            ;;
-        *)
-            echo "Executing: $@"
-            eval "$@"
-            ;;
-    esac
+    /// Extract library path from ldd output
+    fn extract_library_path(&self, ldd_line: &str) -> Option<String> {
+        // Parse lines like: "libc.so.6 => /lib/x86_64-linux-gnu/libc.so.6 (0x...)"
+        if let Some(arrow_pos) = ldd_line.find(" => ") {
+            let after_arrow = &ldd_line[arrow_pos + 4..];
+            if let Some(space_pos) = after_arrow.find(' ') {
+                let path = after_arrow[..space_pos].trim();
+                if path.starts_with('/') && Path::new(path).exists() {
+                    return Some(path.to_string());
+                }
+            }
+        }
+        None
+    }
+
+    /// Create a minimal shell binary that can execute basic commands
+    fn create_minimal_shell_binary(&self, shell_path: &str) -> Result<(), String> {
+        // Create a more complete C program that can handle shell commands
+        let c_program = r#"
+#include <unistd.h>
+#include <sys/wait.h>
+#include <string.h>
+#include <stdlib.h>
+#include <stdio.h>
+
+// Simple built-in command implementations
+int builtin_echo(char *args) {
+    if (args && strlen(args) > 0) {
+        printf("%s\n", args);
+    } else {
+        printf("\n");
+    }
+    return 0;
+}
+
+int builtin_pwd(void) {
+    char cwd[1024];
+    if (getcwd(cwd, sizeof(cwd)) != NULL) {
+        printf("%s\n", cwd);
+        return 0;
+    }
+    return 1;
+}
+
+int main(int argc, char *argv[]) {
+    if (argc >= 3 && strcmp(argv[1], "-c") == 0) {
+        char *command = argv[2];
+        
+        // Handle simple built-in commands to avoid dependency on other binaries
+        if (strncmp(command, "echo ", 5) == 0) {
+            return builtin_echo(command + 5);
+        } else if (strcmp(command, "echo") == 0) {
+            return builtin_echo("");
+        } else if (strcmp(command, "pwd") == 0) {
+            return builtin_pwd();
+        } else if (strncmp(command, "echo '", 6) == 0 || strncmp(command, "echo \"", 6) == 0) {
+            // Handle quoted echo
+            char *start = command + 6;
+            char *end = strchr(start, command[5]); // Find matching quote
+            if (end) {
+                *end = '\0';
+                printf("%s\n", start);
+                return 0;
+            }
+        }
+        
+        // For complex commands, use fork+exec to avoid system() issues
+        pid_t pid = fork();
+        if (pid == 0) {
+            // Child process - try to execute with sh directly
+            // First try our own shell recursively for simple commands
+            if (strstr(command, ";") || strstr(command, "&&") || strstr(command, "||") || strstr(command, "|")) {
+                // Complex command with operators - just try to run individual parts
+                printf("Complex command execution not fully supported in minimal shell\n");
+                exit(1);
+            } else {
+                // Simple command - try to execute it directly
+                char *args[64];
+                char *token;
+                char cmd_copy[1024];
+                int i = 0;
+                
+                strncpy(cmd_copy, command, sizeof(cmd_copy)-1);
+                cmd_copy[sizeof(cmd_copy)-1] = '\0';
+                
+                token = strtok(cmd_copy, " ");
+                while (token != NULL && i < 63) {
+                    args[i++] = token;
+                    token = strtok(NULL, " ");
+                }
+                args[i] = NULL;
+                
+                if (i > 0) {
+                    execvp(args[0], args);
+                }
+                
+                // If execvp fails, exit with error
+                exit(127);
+            }
+        } else if (pid > 0) {
+            // Parent process - wait for child
+            int status;
+            waitpid(pid, &status, 0);
+            return WEXITSTATUS(status);
+        } else {
+            // Fork failed
+            return 1;
+        }
+    }
+    
+    // Interactive mode - just print a message and exit
+    printf("Minimal shell ready (use -c for command execution)\n");
+    return 0;
+}
+"#;
+
+        // Try to compile a static shell
+        let temp_c_file = "/tmp/minimal_shell.c";
+        let temp_binary = "/tmp/minimal_shell";
+        
+        fs::write(temp_c_file, c_program)
+            .map_err(|e| format!("Failed to write C file: {}", e))?;
+
+        // First try with static linking
+        let mut compile_result = Command::new("gcc")
+            .args(&["-static", "-o", temp_binary, temp_c_file])
+            .output();
+
+        // If static compilation fails, try dynamic with musl if available
+        if compile_result.is_err() || !compile_result.as_ref().unwrap().status.success() {
+            compile_result = Command::new("musl-gcc")
+                .args(&["-static", "-o", temp_binary, temp_c_file])
+                .output();
+        }
+
+        // If still fails, try regular dynamic compilation
+        if compile_result.is_err() || !compile_result.as_ref().unwrap().status.success() {
+            compile_result = Command::new("gcc")
+                .args(&["-o", temp_binary, temp_c_file])
+                .output();
+        }
+
+        match compile_result {
+            Ok(output) if output.status.success() => {
+                // Check if the binary is usable
+                if Path::new(temp_binary).exists() {
+                    match fs::copy(temp_binary, shell_path) {
+                        Ok(_) => {
+                            let mut perms = fs::metadata(shell_path)
+                                .map_err(|e| format!("Failed to get shell permissions: {}", e))?
+                                .permissions();
+                            perms.set_mode(0o755);
+                            fs::set_permissions(shell_path, perms)
+                                .map_err(|e| format!("Failed to set shell permissions: {}", e))?;
+                            
+                            // Cleanup
+                            fs::remove_file(temp_c_file).ok();
+                            fs::remove_file(temp_binary).ok();
+                            
+                            // Check if it's statically linked
+                            if let Ok(ldd_output) = Command::new("ldd").arg(shell_path).output() {
+                                let ldd_str = String::from_utf8_lossy(&ldd_output.stdout);
+                                if ldd_str.contains("not a dynamic executable") {
+                                    println!("  ✅ Created static shell binary");
+                                } else {
+                                    println!("  ✅ Created dynamic shell binary");
+                                }
+                            } else {
+                                println!("  ✅ Created shell binary");
+                            }
+                            
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            println!("  ⚠ Failed to copy compiled shell: {}", e);
+                        }
+                    }
+                }
+            }
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                println!("  ⚠ Compilation failed: {}", stderr);
+            }
+            Err(e) => {
+                println!("  ⚠ Failed to run compiler: {}", e);
+            }
+        }
+
+        // Cleanup
+        fs::remove_file(temp_c_file).ok();
+        fs::remove_file(temp_binary).ok();
+
+        Err("Could not create minimal shell binary".to_string())
+    }
+
+    /// Create a shell script implementation
+    fn create_shell_script(&self, shell_path: &str) -> Result<(), String> {
+        // Create a simple shell script that uses exec to replace itself
+        let shell_script = r#"#!/bin/sh
+# Simple shell for Quilt containers
+
+if [ "$1" = "-c" ]; then
+    shift
+    # Execute the command using exec to replace the current process
+    # This avoids issues with nested shells and process management
+    exec /bin/sh -c "$*"
 fi
+
+# Interactive mode - simplified
+echo "Container shell ready"
+        exit 0
 "#;
 
         fs::write(shell_path, shell_script)
-            .map_err(|e| format!("Failed to create fallback shell: {}", e))?;
+            .map_err(|e| format!("Failed to create shell script: {}", e))?;
 
         // Make it executable
         let mut perms = fs::metadata(shell_path)
@@ -520,7 +945,98 @@ fi
         fs::set_permissions(shell_path, perms)
             .map_err(|e| format!("Failed to set shell permissions: {}", e))?;
 
-        println!("  ✅ Created fallback shell at {}", shell_path);
+        println!("  ✅ Created shell script at {}", shell_path);
+        Ok(())
+    }
+
+    /// Create a simple echo script
+    fn create_echo_script(&self, echo_path: &str) -> Result<(), String> {
+        let echo_script = r#"#!/bin/sh
+# Simple echo implementation
+printf '%s\n' "$*"
+"#;
+
+        fs::write(echo_path, echo_script)
+            .map_err(|e| format!("Failed to create echo script: {}", e))?;
+
+        let mut perms = fs::metadata(echo_path)
+            .map_err(|e| format!("Failed to get echo permissions: {}", e))?
+            .permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(echo_path, perms)
+            .map_err(|e| format!("Failed to set echo permissions: {}", e))?;
+
+        println!("  ✅ Created echo script at {}", echo_path);
+        Ok(())
+    }
+
+    /// Create a simple ls script
+    fn create_ls_script(&self, ls_path: &str) -> Result<(), String> {
+        let ls_script = r#"#!/bin/sh
+# Simple ls implementation
+for arg in "$@"; do
+    if [ -d "$arg" ]; then
+        printf 'Contents of %s:\n' "$arg"
+        for f in "$arg"/*; do
+            [ -e "$f" ] && printf '%s\n' "${f##*/}"
+        done
+    elif [ -f "$arg" ]; then
+        printf '%s\n' "$arg"
+    else
+        # Default to current directory
+        for f in ./*; do
+            [ -e "$f" ] && printf '%s\n' "${f##*/}"
+        done
+        break
+    fi
+done
+"#;
+
+        fs::write(ls_path, ls_script)
+            .map_err(|e| format!("Failed to create ls script: {}", e))?;
+
+        let mut perms = fs::metadata(ls_path)
+            .map_err(|e| format!("Failed to get ls permissions: {}", e))?
+            .permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(ls_path, perms)
+            .map_err(|e| format!("Failed to set ls permissions: {}", e))?;
+
+        println!("  ✅ Created ls script at {}", ls_path);
+        Ok(())
+    }
+
+    /// Create a simple cat script
+    fn create_cat_script(&self, cat_path: &str) -> Result<(), String> {
+        let cat_script = r#"#!/bin/sh
+# Simple cat implementation
+if [ $# -eq 0 ]; then
+    # Read from stdin (not practical in this context, just exit)
+    exit 0
+fi
+
+for file in "$@"; do
+    if [ -f "$file" ]; then
+        while IFS= read -r line; do
+            printf '%s\n' "$line"
+        done < "$file"
+    else
+        printf 'cat: %s: No such file or directory\n' "$file" >&2
+    fi
+done
+"#;
+
+        fs::write(cat_path, cat_script)
+            .map_err(|e| format!("Failed to create cat script: {}", e))?;
+
+        let mut perms = fs::metadata(cat_path)
+            .map_err(|e| format!("Failed to get cat permissions: {}", e))?
+            .permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(cat_path, perms)
+            .map_err(|e| format!("Failed to set cat permissions: {}", e))?;
+
+        println!("  ✅ Created cat script at {}", cat_path);
         Ok(())
     }
 
