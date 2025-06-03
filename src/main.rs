@@ -13,7 +13,12 @@ pub mod quilt_rpc {
 }
 
 use quilt_rpc::quilt_service_server::{QuiltService, QuiltServiceServer};
-use quilt_rpc::{ContainerResponse, CreateContainerRequest, ContainerStatusRequest, ContainerStatusResponse, LogRequest, LogResponse, RemoveContainerRequest, RemoveContainerResponse, StopContainerRequest, StopContainerResponse};
+use quilt_rpc::{
+    CreateContainerRequest, CreateContainerResponse, GetContainerStatusRequest,
+    ContainerStatusResponse, GetContainerLogsRequest, LogStreamResponse,
+    RemoveContainerRequest, RemoveContainerResponse, StopContainerRequest, StopContainerResponse,
+};
+use quilt_rpc::log_stream_response::LogSource; // Enum for log source
 
 #[derive(Debug, Clone)]
 pub struct ContainerState {
@@ -45,17 +50,23 @@ impl QuiltService for MyQuiltService {
     async fn create_container(
         &self,
         request: Request<CreateContainerRequest>,
-    ) -> Result<Response<ContainerResponse>, Status> {
+    ) -> Result<Response<CreateContainerResponse>, Status> {
         println!("Got a create_container request: {:?}", request);
         let req_inner = request.into_inner();
+
+        if req_inner.command.is_empty() {
+            return Err(Status::invalid_argument("Command cannot be empty"));
+        }
+
+        let executable = req_inner.command[0].clone();
+        let args = req_inner.command.iter().skip(1).cloned().collect::<Vec<String>>();
+
         let container_id = Uuid::new_v4().to_string();
 
-        // Define base path for container runtime data
         let base_runtime_path = PathBuf::from("./active_containers");
         let container_dir = base_runtime_path.join(&container_id);
         let rootfs_dir = container_dir.join("rootfs");
 
-        // Create the directory for the container's rootfs
         fs::create_dir_all(&rootfs_dir).map_err(|e| {
             eprintln!("Failed to create rootfs directory {}: {}", rootfs_dir.display(), e);
             Status::internal(format!("Failed to create container directory: {}", e))
@@ -69,13 +80,11 @@ impl QuiltService for MyQuiltService {
             )));
         }
 
-        // Open the tarball
         let tarball_file = File::open(image_path).map_err(|e| {
             eprintln!("Failed to open image tarball {}: {}", image_path.display(), e);
             Status::internal(format!("Failed to open image tarball: {}", e))
         })?;
 
-        // Handle potential .gz compression
         if image_path.extension().map_or(false, |ext| ext == "gz") {
             let gz_decoder = GzDecoder::new(tarball_file);
             let mut archive = Archive::new(gz_decoder);
@@ -84,9 +93,6 @@ impl QuiltService for MyQuiltService {
                 Status::internal(format!("Failed to unpack gzipped tarball: {}", e))
             })?;
         } else {
-            // Assume uncompressed tar if not .gz
-            // Note: tar::Archive needs Read, so we might need BufReader if tarball_file isn't already buffered
-            // For File, it should be fine.
             let mut archive = Archive::new(tarball_file);
             archive.unpack(&rootfs_dir).map_err(|e| {
                 eprintln!("Failed to unpack tarball to {}: {}", rootfs_dir.display(), e);
@@ -98,11 +104,11 @@ impl QuiltService for MyQuiltService {
 
         let container_state = ContainerState {
             id: container_id.clone(),
-            image_tarball_path: req_inner.image_tarball_path,
+            image_tarball_path: req_inner.image_tarball_path.clone(),
             rootfs_path: rootfs_dir.to_str().unwrap_or_default().to_string(),
-            command: req_inner.command,
-            args: req_inner.args,
-            env_vars: req_inner.env_vars,
+            command: executable,
+            args: args,
+            env_vars: req_inner.environment_variables.iter().map(|(k,v)| format!("{}={}",k,v)).collect(),
             status: "PENDING".to_string(),
             exit_code: None,
         };
@@ -110,17 +116,16 @@ impl QuiltService for MyQuiltService {
         let mut containers_map = self.containers.lock().await;
         containers_map.insert(container_id.clone(), container_state);
 
-        let reply = ContainerResponse {
+        let reply = CreateContainerResponse {
             container_id,
             status: "PENDING".to_string(),
-            message: format!("Container creation initiated, rootfs at {}", rootfs_dir.display()),
         };
         Ok(Response::new(reply))
     }
 
     async fn get_container_status(
         &self,
-        request: Request<ContainerStatusRequest>,
+        request: Request<GetContainerStatusRequest>,
     ) -> Result<Response<ContainerStatusResponse>, Status> {
         println!("Got a get_container_status request: {:?}", request);
         let req_inner = request.into_inner();
@@ -129,7 +134,6 @@ impl QuiltService for MyQuiltService {
         let containers_map = self.containers.lock().await;
         match containers_map.get(&container_id) {
             Some(state) => {
-                // Print details to server console to "use" the fields and for debugging
                 println!(
                     "Container Details (ID: {}):\n  Image Tarball: {}\n  RootFS Path: {}\n  Command: {}\n  Args: {:?}\n  Env: {:?}\n  Status: {}\n  Exit Code: {:?}",
                     state.id,
@@ -146,7 +150,7 @@ impl QuiltService for MyQuiltService {
                     container_id: state.id.clone(),
                     status: state.status.clone(),
                     exit_code: state.exit_code.unwrap_or(0),
-                    message: format!("Status for '{}': {}. Command: '{}'", state.id, state.status, state.command),
+                    error_message: if state.status == "FAILED" { "Container failed".to_string() } else { "".to_string() },
                 };
                 Ok(Response::new(reply))
             }
@@ -157,11 +161,11 @@ impl QuiltService for MyQuiltService {
         }
     }
 
-    type GetContainerLogsStream = tokio_stream::wrappers::ReceiverStream<Result<LogResponse, Status>>;
+    type GetContainerLogsStream = tokio_stream::wrappers::ReceiverStream<Result<LogStreamResponse, Status>>;
 
     async fn get_container_logs(
         &self,
-        request: Request<LogRequest>,
+        request: Request<GetContainerLogsRequest>,
     ) -> Result<Response<Self::GetContainerLogsStream>, Status> {
         println!("Got a get_container_logs request: {:?}", request);
         let req_inner = request.into_inner();
@@ -175,14 +179,11 @@ impl QuiltService for MyQuiltService {
                     container_id
                 )));
             }
-        } // Release lock early
+        }
 
         let (tx, rx) = tokio::sync::mpsc::channel(4);
-        // Clone container_id again for the tokio::spawn closure
-        let log_stream_container_id = container_id.clone(); 
 
         tokio::spawn(async move {
-            // Dummy log lines
             let logs = vec![
                 "Log line 1 for container".to_string(),
                 "Log line 2 for container".to_string(),
@@ -190,9 +191,10 @@ impl QuiltService for MyQuiltService {
             ];
 
             for log_line in logs {
-                tx.send(Ok(LogResponse {
-                    container_id: log_stream_container_id.clone(), // Use the cloned ID here
-                    line: log_line,
+                tx.send(Ok(LogStreamResponse {
+                    source: LogSource::Stdout.into(),
+                    content: log_line.into_bytes(),
+                    timestamp_nanos: 0,
                 })).await.unwrap_or_else(|e| eprintln!("Failed to send log: {:?}",e));
                 tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
             }
@@ -213,12 +215,10 @@ impl QuiltService for MyQuiltService {
         match containers_map.get_mut(&container_id) {
             Some(state) => {
                 state.status = "STOPPED".to_string();
-                // In a real scenario, we might set an exit code or wait for the process to terminate
-                state.exit_code = Some(0); // Dummy exit code
+                state.exit_code = Some(0);
                 let reply = StopContainerResponse {
                     container_id: state.id.clone(),
                     status: "STOPPED".to_string(),
-                    message: format!("Container {} stop request processed", state.id),
                 };
                 Ok(Response::new(reply))
             }
@@ -242,7 +242,6 @@ impl QuiltService for MyQuiltService {
             containers_map.remove(&container_id);
             let reply = RemoveContainerResponse {
                 container_id,
-                status: "REMOVED".to_string(),
                 message: "Container removed successfully".to_string(),
             };
             Ok(Response::new(reply))
@@ -257,7 +256,6 @@ impl QuiltService for MyQuiltService {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // For now, let's listen on a TCP port. We can change to UDS later.
     let addr = "[::1]:50051".parse()?;
     let quilt_service = MyQuiltService::new();
 

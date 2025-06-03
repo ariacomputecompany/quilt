@@ -54,6 +54,13 @@ This is the most complex phase and will be iterative.
     *   Mechanism to use a base rootfs tarball (e.g., Alpine mini rootfs). The `CreateContainerRequest` will specify the path to this tarball.
     *   Logic to create a temporary directory for the container and unpack the tarball into it.
     *   Use `pivot_root` (or `chroot` as a simpler, less isolated starting point, then move to `pivot_root`) to change the container's root filesystem. This will require `nix` crate for syscalls.
+
+**\[Checkpoint: Transition to Alpine Linux Focus]**
+
+*   **Target Environment Alignment**: Before proceeding with deep syscall integrations (namespaces, `pivot_root`, cgroups), prioritize setting up an Alpine Linux test environment (VM or container).
+*   **Musl Compilation**: Configure the Rust toolchain for `x86_64-unknown-linux-musl` cross-compilation (or native compilation if developing directly on Alpine). Ensure `quiltd` can be built as a statically linked `musl` binary if possible, or that all dependencies are compatible.
+*   **Iterative Testing on Alpine**: All subsequent features in Phase 2 should be regularly tested on the Alpine environment to catch compatibility issues early. The goal is to ensure `quiltd` behaves as expected on the target platform.
+
 3.  **Namespace Creation (`nix` crate)**:
     *   **PID Namespace (`CLONE_NEWPID`)**: Isolate process IDs.
     *   **Mount Namespace (`CLONE_NEWNS`)**: Isolate filesystem mount points. Ensure `/proc` is remounted correctly within the new namespace.
