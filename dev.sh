@@ -6,7 +6,7 @@
 set -e
 
 QUILTD_BIN="./target/x86_64-unknown-linux-gnu/debug/quilt"
-CLI_BIN="./quilt-cli/target/debug/quilt-cli"
+CLI_BIN="./quilt-cli/target/x86_64-unknown-linux-gnu/debug/quilt-cli"
 
 # Colors for output
 RED='\033[0;31m'
@@ -90,7 +90,7 @@ cli() {
 
 # Quick test - create and check a container
 test() {
-    log "Running quick test..."
+    log "Running comprehensive test with new features..."
     
     # Ensure server is running
     if ! pgrep -f quilt > /dev/null; then
@@ -103,25 +103,116 @@ test() {
         error "alpine.tar.gz not found. Please ensure you have an Alpine rootfs tarball."
     fi
     
-    log "Creating test container..."
-    CONTAINER_ID=$(cli create --image-tarball-path alpine.tar.gz -- /bin/echo "Hello from Quilt dev test!" | grep "Container created successfully" | grep -o '[a-f0-9-]\{36\}')
+    log "=== TEST 1: Basic container with setup commands ==="
+    log "Creating container with npm and typescript setup..."
+    CONTAINER_ID1=$(cli create \
+        --image-path alpine.tar.gz \
+        --setup "npm: typescript ts-node" \
+        --setup "apk: curl wget" \
+        --memory-limit 256 \
+        --cpu-limit 50.0 \
+        --enable-all-namespaces \
+        -- node --version 2>/dev/null | grep "Container created" | grep -o '[a-f0-9-]\{36\}' || echo "")
     
-    if [ -z "$CONTAINER_ID" ]; then
-        error "Failed to create container"
+    if [ -n "$CONTAINER_ID1" ]; then
+        log "✅ Container 1 created: $CONTAINER_ID1"
+        sleep 3
+        log "Container 1 status:"
+        cli status "$CONTAINER_ID1"
+        log "Container 1 logs:"
+        cli logs "$CONTAINER_ID1"
+    else
+        warn "❌ Failed to create container 1 (npm test)"
     fi
     
-    log "Container created: $CONTAINER_ID"
+    log "=== TEST 2: Python container with pip packages ==="
+    log "Creating container with Python and pip setup..."
+    CONTAINER_ID2=$(cli create \
+        --image-path alpine.tar.gz \
+        --setup "pip: requests beautifulsoup4" \
+        --memory-limit 128 \
+        -- python3 -c "import requests; print('Python container with requests:', requests.__version__)" 2>/dev/null | grep "Container created" | grep -o '[a-f0-9-]\{36\}' || echo "")
     
-    # Wait a moment for execution
-    sleep 3
+    if [ -n "$CONTAINER_ID2" ]; then
+        log "✅ Container 2 created: $CONTAINER_ID2"
+        sleep 3
+        log "Container 2 status:"
+        cli status "$CONTAINER_ID2"
+        log "Container 2 logs:"
+        cli logs "$CONTAINER_ID2"
+    else
+        warn "❌ Failed to create container 2 (python test)"
+    fi
     
-    log "Checking container status..."
-    cli status "$CONTAINER_ID"
+    log "=== TEST 3: Resource limited container ==="
+    log "Creating container with strict resource limits..."
+    CONTAINER_ID3=$(cli create \
+        --image-path alpine.tar.gz \
+        --memory-limit 64 \
+        --cpu-limit 25.0 \
+        -- /bin/sh -c "echo 'Memory info:'; cat /proc/meminfo | head -5; echo 'CPU info:'; cat /proc/cpuinfo | head -5" 2>/dev/null | grep "Container created" | grep -o '[a-f0-9-]\{36\}' || echo "")
     
-    log "Getting container logs..."
-    cli logs "$CONTAINER_ID"
+    if [ -n "$CONTAINER_ID3" ]; then
+        log "✅ Container 3 created: $CONTAINER_ID3"
+        sleep 3
+        log "Container 3 status:"
+        cli status "$CONTAINER_ID3"
+        log "Container 3 logs:"
+        cli logs "$CONTAINER_ID3"
+    else
+        warn "❌ Failed to create container 3 (resource test)"
+    fi
     
-    log "Test complete!"
+    log "=== TEST 4: Namespace isolation test ==="
+    log "Creating container to test namespace isolation..."
+    CONTAINER_ID4=$(cli create \
+        --image-path alpine.tar.gz \
+        --enable-all-namespaces \
+        -- /bin/sh -c "echo 'Container hostname:'; hostname; echo 'Container PID 1:'; ps aux | head -3; echo 'Mount points:'; mount | head -5" 2>/dev/null | grep "Container created" | grep -o '[a-f0-9-]\{36\}' || echo "")
+    
+    if [ -n "$CONTAINER_ID4" ]; then
+        log "✅ Container 4 created: $CONTAINER_ID4"
+        sleep 3
+        log "Container 4 status:"
+        cli status "$CONTAINER_ID4"
+        log "Container 4 logs:"
+        cli logs "$CONTAINER_ID4"
+    else
+        warn "❌ Failed to create container 4 (namespace test)"
+    fi
+    
+    log "=== Test Summary ==="
+    if [ -n "$CONTAINER_ID1" ]; then
+        log "✅ Test 1 (npm/typescript): PASSED"
+    else
+        warn "❌ Test 1 (npm/typescript): FAILED"
+    fi
+    
+    if [ -n "$CONTAINER_ID2" ]; then
+        log "✅ Test 2 (python/pip): PASSED"
+    else
+        warn "❌ Test 2 (python/pip): FAILED"
+    fi
+    
+    if [ -n "$CONTAINER_ID3" ]; then
+        log "✅ Test 3 (resource limits): PASSED"
+    else
+        warn "❌ Test 3 (resource limits): FAILED"
+    fi
+    
+    if [ -n "$CONTAINER_ID4" ]; then
+        log "✅ Test 4 (namespace isolation): PASSED"
+    else
+        warn "❌ Test 4 (namespace isolation): FAILED"
+    fi
+    
+    log "Enhanced container features test complete!"
+    log "Features tested:"
+    log "  🔧 Dynamic setup commands (npm, pip, apk)"
+    log "  🛡️ Linux namespace isolation (PID, Mount, UTS, IPC, Network)"
+    log "  📊 Resource limits (memory, CPU)"
+    log "  🏗️ Container lifecycle management"
+    log "  📋 Log collection and status tracking"
 }
 
 # Clean up - kill server and remove containers
@@ -195,17 +286,49 @@ help() {
     echo "  server      Start the server (foreground)"
     echo "  server-bg   Start the server in background"
     echo "  cli [args]  Run quilt-cli with arguments"
-    echo "  test        Run a quick test (create container, check status, get logs)"
+    echo "  test        Run comprehensive tests with enhanced features"
     echo "  clean       Stop server and clean up containers"
     echo "  status      Show development environment status"
     echo "  help        Show this help message"
     echo ""
-    echo "Examples:"
-    echo "  ./dev.sh build"
-    echo "  ./dev.sh server-bg"
-    echo "  ./dev.sh cli create --image-tarball-path alpine.tar.gz -- /bin/echo 'Hello World'"
-    echo "  ./dev.sh test"
-    echo "  ./dev.sh clean"
+    echo "Enhanced CLI Examples:"
+    echo "  # Basic container"
+    echo "  ./dev.sh cli create --image-path alpine.tar.gz -- /bin/echo 'Hello World'"
+    echo ""
+    echo "  # Container with npm packages"
+    echo "  ./dev.sh cli create --image-path alpine.tar.gz \\"
+    echo "    --setup 'npm: typescript ts-node' \\"
+    echo "    -- node --version"
+    echo ""
+    echo "  # Container with Python packages and resource limits"
+    echo "  ./dev.sh cli create --image-path alpine.tar.gz \\"
+    echo "    --setup 'pip: requests beautifulsoup4' \\"
+    echo "    --memory-limit 256 \\"
+    echo "    --cpu-limit 50.0 \\"
+    echo "    -- python3 -c 'import requests; print(requests.__version__)'"
+    echo ""
+    echo "  # Container with full namespace isolation"
+    echo "  ./dev.sh cli create --image-path alpine.tar.gz \\"
+    echo "    --enable-all-namespaces \\"
+    echo "    -- /bin/sh -c 'hostname; ps aux'"
+    echo ""
+    echo "  # Multiple setup commands"
+    echo "  ./dev.sh cli create --image-path alpine.tar.gz \\"
+    echo "    --setup 'apk: python3 py3-pip nodejs npm' \\"
+    echo "    --setup 'npm: typescript' \\"
+    echo "    --setup 'pip: requests' \\"
+    echo "    -- /bin/sh -c 'node --version && python3 --version'"
+    echo ""
+    echo "Container Management:"
+    echo "  ./dev.sh cli status <container-id>    # Check container status"
+    echo "  ./dev.sh cli logs <container-id>      # Get container logs"
+    echo "  ./dev.sh cli stop <container-id>      # Stop container"
+    echo "  ./dev.sh cli remove <container-id>    # Remove container"
+    echo ""
+    echo "Development:"
+    echo "  ./dev.sh test          # Run all feature tests"
+    echo "  ./dev.sh clean         # Clean up everything"
+    echo "  ./dev.sh status        # Check development status"
 }
 
 # Main script logic

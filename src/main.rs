@@ -1,218 +1,229 @@
+mod runtime;
+mod namespace;
+mod cgroup;
+mod runtime_manager;
+
+use runtime::{ContainerRuntime, ContainerConfig, ContainerState};
+use crate::cgroup::CgroupLimits;
+use crate::namespace::NamespaceConfig;
+
+use std::sync::Arc;
+use tokio::sync::Mutex;
 use tonic::{transport::Server, Request, Response, Status};
 use uuid::Uuid;
-use std::fs::{self, File};
-use std::path::{Path, PathBuf};
-use flate2::read::GzDecoder;
-use tar::Archive;
 
-mod runtime;
-use runtime::{ContainerRuntime, ContainerState};
-
-pub mod quilt_rpc {
+// Include the generated protobuf code
+pub mod quilt {
     tonic::include_proto!("quilt");
 }
 
-use quilt_rpc::quilt_service_server::{QuiltService, QuiltServiceServer};
-use quilt_rpc::{
-    CreateContainerRequest, CreateContainerResponse, GetContainerStatusRequest,
-    ContainerStatusResponse, GetContainerLogsRequest, LogStreamResponse,
-    RemoveContainerRequest, RemoveContainerResponse, StopContainerRequest, StopContainerResponse,
+use quilt::quilt_service_server::{QuiltService, QuiltServiceServer};
+use quilt::{
+    CreateContainerRequest, CreateContainerResponse,
+    GetContainerStatusRequest, GetContainerStatusResponse,
+    GetContainerLogsRequest, GetContainerLogsResponse,
+    StopContainerRequest, StopContainerResponse,
+    RemoveContainerRequest, RemoveContainerResponse,
+    LogEntry, ContainerStatus,
 };
 
-#[derive(Debug)]
-pub struct MyQuiltService {
-    runtime: ContainerRuntime,
+pub struct QuiltServiceImpl {
+    runtime: Arc<Mutex<ContainerRuntime>>,
 }
 
-impl MyQuiltService {
-    fn new() -> Self {
-        MyQuiltService {
-            runtime: ContainerRuntime::new(),
+impl QuiltServiceImpl {
+    pub fn new() -> Self {
+        Self {
+            runtime: Arc::new(Mutex::new(ContainerRuntime::new())),
         }
     }
 }
 
 #[tonic::async_trait]
-impl QuiltService for MyQuiltService {
+impl QuiltService for QuiltServiceImpl {
     async fn create_container(
         &self,
         request: Request<CreateContainerRequest>,
     ) -> Result<Response<CreateContainerResponse>, Status> {
-        println!("Got a create_container request: {:?}", request);
-        let req_inner = request.into_inner();
-
-        if req_inner.command.is_empty() {
-            return Err(Status::invalid_argument("Command cannot be empty"));
-        }
-
-        let executable = req_inner.command[0].clone();
-        let args = req_inner.command.iter().skip(1).cloned().collect::<Vec<String>>();
-
+        let req = request.into_inner();
         let container_id = Uuid::new_v4().to_string();
 
-        let base_runtime_path = PathBuf::from("./active_containers");
-        let container_dir = base_runtime_path.join(&container_id);
-        let rootfs_dir = container_dir.join("rootfs");
+        println!("Creating container {} with image: {}", container_id, req.image_path);
 
-        fs::create_dir_all(&rootfs_dir).map_err(|e| {
-            eprintln!("Failed to create rootfs directory {}: {}", rootfs_dir.display(), e);
-            Status::internal(format!("Failed to create container directory: {}", e))
-        })?;
-
-        let image_path = Path::new(&req_inner.image_tarball_path);
-        if !image_path.exists() {
-            return Err(Status::invalid_argument(format!(
-                "Image tarball not found at: {}",
-                image_path.display()
-            )));
-        }
-
-        let tarball_file = File::open(image_path).map_err(|e| {
-            eprintln!("Failed to open image tarball {}: {}", image_path.display(), e);
-            Status::internal(format!("Failed to open image tarball: {}", e))
-        })?;
-
-        if image_path.extension().map_or(false, |ext| ext == "gz") {
-            let gz_decoder = GzDecoder::new(tarball_file);
-            let mut archive = Archive::new(gz_decoder);
-            archive.unpack(&rootfs_dir).map_err(|e| {
-                eprintln!("Failed to unpack gzipped tarball to {}: {}", rootfs_dir.display(), e);
-                Status::internal(format!("Failed to unpack gzipped tarball: {}", e))
-            })?;
+        // Parse resource limits
+        let resource_limits = if req.memory_limit_mb > 0 || req.cpu_limit_percent > 0.0 {
+            Some(CgroupLimits {
+                memory_limit_bytes: if req.memory_limit_mb > 0 {
+                    Some((req.memory_limit_mb as u64) * 1024 * 1024)
+                } else {
+                    None
+                },
+                cpu_quota: if req.cpu_limit_percent > 0.0 {
+                    // Convert percentage to quota (100000 microseconds = 100% CPU)
+                    Some((req.cpu_limit_percent * 1000.0) as i64)
+                } else {
+                    None
+                },
+                cpu_period: Some(100000), // 100ms period
+                cpu_shares: Some(1024),   // Default
+                pids_limit: Some(1024),   // Default
+            })
         } else {
-            let mut archive = Archive::new(tarball_file);
-            archive.unpack(&rootfs_dir).map_err(|e| {
-                eprintln!("Failed to unpack tarball to {}: {}", rootfs_dir.display(), e);
-                Status::internal(format!("Failed to unpack tarball: {}", e))
-            })?;
-        }
-
-        println!("Successfully unpacked image {} to {}", image_path.display(), rootfs_dir.display());
-
-        let container_state = ContainerState {
-            id: container_id.clone(),
-            image_tarball_path: req_inner.image_tarball_path.clone(),
-            rootfs_path: rootfs_dir.to_str().unwrap_or_default().to_string(),
-            command: executable,
-            args: args,
-            env_vars: req_inner.environment_variables.iter().map(|(k,v)| format!("{}={}",k,v)).collect(),
-            status: "PENDING".to_string(),
-            exit_code: None,
-            pid: None,
-            logs: Vec::new(),
+            Some(CgroupLimits::default())
         };
 
-        // Store the container state
-        {
-            let mut containers_map = self.runtime.containers.lock().await;
-            containers_map.insert(container_id.clone(), container_state);
-        }
+        // Parse namespace configuration
+        let namespace_config = Some(NamespaceConfig {
+            pid: req.enable_pid_namespace,
+            mount: req.enable_mount_namespace,
+            uts: req.enable_uts_namespace,
+            ipc: req.enable_ipc_namespace,
+            network: req.enable_network_namespace,
+        });
 
-        // Start the container execution in the background
-        println!("Starting container execution for: {}", container_id);
-        self.runtime.start_container_execution(container_id.clone()).await;
-
-        let reply = CreateContainerResponse {
-            container_id,
-            status: "PENDING".to_string(),
+        // Create container configuration
+        let config = ContainerConfig {
+            image_path: req.image_path,
+            command: req.command,
+            environment: req.environment,
+            setup_commands: req.setup_commands,
+            resource_limits,
+            namespace_config,
+            working_directory: if req.working_directory.is_empty() {
+                None
+            } else {
+                Some(req.working_directory)
+            },
         };
-        Ok(Response::new(reply))
+
+        let runtime = self.runtime.lock().await;
+        match runtime.create_container(container_id.clone(), config) {
+            Ok(()) => {
+                println!("✅ Container {} created successfully", container_id);
+                
+                // Automatically start the container
+                match runtime.start_container(&container_id) {
+                    Ok(()) => {
+                        println!("✅ Container {} started successfully", container_id);
+                    }
+                    Err(e) => {
+                        eprintln!("❌ Failed to start container {}: {}", container_id, e);
+                        return Err(Status::internal(format!("Failed to start container: {}", e)));
+                    }
+                }
+
+                Ok(Response::new(CreateContainerResponse {
+                    container_id,
+                    success: true,
+                    error_message: String::new(),
+                }))
+            }
+            Err(e) => {
+                eprintln!("❌ Failed to create container: {}", e);
+                Ok(Response::new(CreateContainerResponse {
+                    container_id: String::new(),
+                    success: false,
+                    error_message: e,
+                }))
+            }
+        }
     }
 
     async fn get_container_status(
         &self,
         request: Request<GetContainerStatusRequest>,
-    ) -> Result<Response<ContainerStatusResponse>, Status> {
-        println!("Got a get_container_status request: {:?}", request);
-        let req_inner = request.into_inner();
-        let container_id = req_inner.container_id;
+    ) -> Result<Response<GetContainerStatusResponse>, Status> {
+        let req = request.into_inner();
+        let runtime = self.runtime.lock().await;
 
-        let containers_map = self.runtime.containers.lock().await;
-        match containers_map.get(&container_id) {
-            Some(state) => {
-                println!(
-                    "Container Details (ID: {}):\n  Image Tarball: {}\n  RootFS Path: {}\n  Command: {}\n  Args: {:?}\n  Env: {:?}\n  Status: {}\n  Exit Code: {:?}\n  PID: {:?}",
-                    state.id,
-                    state.image_tarball_path,
-                    state.rootfs_path,
-                    state.command,
-                    state.args,
-                    state.env_vars,
-                    state.status,
-                    state.exit_code,
-                    state.pid
-                );
-
-                let reply = ContainerStatusResponse {
-                    container_id: state.id.clone(),
-                    status: state.status.clone(),
-                    exit_code: state.exit_code.unwrap_or(0),
-                    error_message: if state.status == "FAILED" { "Container failed".to_string() } else { "".to_string() },
+        match runtime.get_container_info(&req.container_id) {
+            Some(container) => {
+                let status = match container.state {
+                    ContainerState::PENDING => ContainerStatus::Pending,
+                    ContainerState::RUNNING => ContainerStatus::Running,
+                    ContainerState::EXITED(_) => ContainerStatus::Exited,
+                    ContainerState::FAILED(_) => ContainerStatus::Failed,
                 };
-                Ok(Response::new(reply))
+
+                let exit_code = match container.state {
+                    ContainerState::EXITED(code) => code,
+                    _ => 0,
+                };
+
+                let error_message = match container.state {
+                    ContainerState::FAILED(ref msg) => msg.clone(),
+                    _ => String::new(),
+                };
+
+                // Get container stats
+                let stats = runtime.get_container_stats(&req.container_id)
+                    .unwrap_or_default();
+
+                Ok(Response::new(GetContainerStatusResponse {
+                    container_id: req.container_id,
+                    status: status as i32,
+                    exit_code,
+                    error_message,
+                    pid: container.pid.map(|p| p.as_raw()).unwrap_or(0),
+                    created_at: container.created_at,
+                    memory_usage_bytes: stats.get("memory_usage_bytes")
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(0),
+                    rootfs_path: container.rootfs_path,
+                }))
             }
-            None => Err(Status::not_found(format!(
-                "Container {} not found",
-                container_id
-            ))),
+            None => Err(Status::not_found(format!("Container {} not found", req.container_id))),
         }
     }
-
-    type GetContainerLogsStream = tokio_stream::wrappers::ReceiverStream<Result<LogStreamResponse, Status>>;
 
     async fn get_container_logs(
         &self,
         request: Request<GetContainerLogsRequest>,
-    ) -> Result<Response<Self::GetContainerLogsStream>, Status> {
-        println!("Got a get_container_logs request: {:?}", request);
-        let req_inner = request.into_inner();
-        let container_id = req_inner.container_id;
+    ) -> Result<Response<GetContainerLogsResponse>, Status> {
+        let req = request.into_inner();
+        let runtime = self.runtime.lock().await;
 
-        let logs = {
-            let containers_map = self.runtime.containers.lock().await;
-            match containers_map.get(&container_id) {
-                Some(state) => state.logs.clone(),
-                None => {
-                    return Err(Status::not_found(format!(
-                        "Container {} not found for logs",
-                        container_id
-                    )));
-                }
+        match runtime.get_container_logs(&req.container_id) {
+            Some(logs) => {
+                let log_entries: Vec<LogEntry> = logs
+                    .into_iter()
+                    .map(|entry| LogEntry {
+                        timestamp: entry.timestamp,
+                        message: entry.message,
+                    })
+                    .collect();
+
+                Ok(Response::new(GetContainerLogsResponse {
+                    container_id: req.container_id,
+                    logs: log_entries,
+                }))
             }
-        };
-
-        let (tx, rx) = tokio::sync::mpsc::channel(4);
-
-        tokio::spawn(async move {
-            for log_entry in logs {
-                tx.send(Ok(LogStreamResponse {
-                    source: log_entry.source.into(),
-                    content: log_entry.content.into_bytes(),
-                    timestamp_nanos: log_entry.timestamp_nanos,
-                })).await.unwrap_or_else(|e| eprintln!("Failed to send log: {:?}",e));
-            }
-        });
-
-        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(rx)))
+            None => Err(Status::not_found(format!("Container {} not found", req.container_id))),
+        }
     }
 
     async fn stop_container(
         &self,
         request: Request<StopContainerRequest>,
     ) -> Result<Response<StopContainerResponse>, Status> {
-        println!("Got a stop_container request: {:?}", request);
-        let req_inner = request.into_inner();
-        let container_id = req_inner.container_id;
+        let req = request.into_inner();
+        let runtime = self.runtime.lock().await;
 
-        match self.runtime.stop_container(&container_id).await {
-            Ok(status) => {
-                let reply = StopContainerResponse {
-                    container_id,
-                    status,
-                };
-                Ok(Response::new(reply))
+        match runtime.stop_container(&req.container_id) {
+            Ok(()) => {
+                println!("✅ Container {} stopped successfully", req.container_id);
+                Ok(Response::new(StopContainerResponse {
+                    success: true,
+                    error_message: String::new(),
+                }))
             }
-            Err(error_msg) => Err(Status::not_found(error_msg)),
+            Err(e) => {
+                eprintln!("❌ Failed to stop container {}: {}", req.container_id, e);
+                Ok(Response::new(StopContainerResponse {
+                    success: false,
+                    error_message: e,
+                }))
+            }
         }
     }
 
@@ -220,32 +231,45 @@ impl QuiltService for MyQuiltService {
         &self,
         request: Request<RemoveContainerRequest>,
     ) -> Result<Response<RemoveContainerResponse>, Status> {
-        println!("Got a remove_container request: {:?}", request);
-        let req_inner = request.into_inner();
-        let container_id = req_inner.container_id;
+        let req = request.into_inner();
+        let runtime = self.runtime.lock().await;
 
-        match self.runtime.remove_container(&container_id).await {
+        match runtime.remove_container(&req.container_id) {
             Ok(()) => {
-                let reply = RemoveContainerResponse {
-                    container_id,
-                    message: "Container removed successfully".to_string(),
-                };
-                Ok(Response::new(reply))
+                println!("✅ Container {} removed successfully", req.container_id);
+                Ok(Response::new(RemoveContainerResponse {
+                    success: true,
+                    error_message: String::new(),
+                }))
             }
-            Err(error_msg) => Err(Status::internal(error_msg)),
+            Err(e) => {
+                eprintln!("❌ Failed to remove container {}: {}", req.container_id, e);
+                Ok(Response::new(RemoveContainerResponse {
+                    success: false,
+                    error_message: e,
+                }))
+            }
         }
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let addr = "[::1]:50051".parse()?;
-    let quilt_service = MyQuiltService::new();
+    println!("🚀 Starting Quilt Container Runtime Server");
+    println!("Features enabled:");
+    println!("  ✅ Linux Namespaces (PID, Mount, UTS, IPC, Network)");
+    println!("  ✅ Cgroup Resource Management (Memory, CPU, PIDs)");
+    println!("  ✅ Dynamic Runtime Setup Commands (npm, pip, apk, etc.)");
+    println!("  ✅ Container Isolation and Security");
 
-    println!("QuiltService listening on {}", addr);
+    let service = QuiltServiceImpl::new();
+    let addr = "127.0.0.1:50051".parse()?;
+
+    println!("🌐 Quilt gRPC server listening on {}", addr);
+    println!("📋 Ready to accept container creation requests...");
 
     Server::builder()
-        .add_service(QuiltServiceServer::new(quilt_service))
+        .add_service(QuiltServiceServer::new(service))
         .serve(addr)
         .await?;
 

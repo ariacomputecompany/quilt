@@ -4,77 +4,99 @@ package quilt;
 
 // The main service for managing containers
 service QuiltService {
-    // Creates a new container
+    // Creates a new container with advanced features
     rpc CreateContainer (CreateContainerRequest) returns (CreateContainerResponse);
     // Gets the status of a container
-    rpc GetContainerStatus (GetContainerStatusRequest) returns (ContainerStatusResponse);
+    rpc GetContainerStatus (GetContainerStatusRequest) returns (GetContainerStatusResponse);
     // Gets the logs of a container
-    rpc GetContainerLogs (GetContainerLogsRequest) returns (stream LogStreamResponse);
+    rpc GetContainerLogs (GetContainerLogsRequest) returns (GetContainerLogsResponse);
     // Stops a running container
     rpc StopContainer (StopContainerRequest) returns (StopContainerResponse);
     // Removes a container
     rpc RemoveContainer (RemoveContainerRequest) returns (RemoveContainerResponse);
 }
 
+// Container status enumeration
+enum ContainerStatus {
+    PENDING = 0;   // Container created but not started
+    RUNNING = 1;   // Container is actively running
+    EXITED = 2;    // Container finished execution
+    FAILED = 3;    // Container failed to start or execute
+}
+
 message CreateContainerRequest {
-    string image_tarball_path = 1;
-    repeated string command = 2;
-    map<string, string> environment_variables = 3;
-    // Basic resource limits - to be expanded later
-    message ResourceLimits {
-        int64 cpu_cores = 1; // Example: 1 for one core
-        int64 memory_mb = 2; // Example: 512 for 512MB
-    }
-    ResourceLimits resource_limits = 4;
+    // Basic container configuration
+    string image_path = 1;                          // Path to container image tarball
+    repeated string command = 2;                    // Command to execute in container
+    map<string, string> environment = 3;           // Environment variables
+    string working_directory = 4;                  // Working directory inside container
+    
+    // Setup commands for dynamic runtime installation
+    repeated string setup_commands = 5;            // Setup commands (e.g., "npm: typescript", "apk: python3")
+    
+    // Resource limits
+    int32 memory_limit_mb = 6;                     // Memory limit in megabytes (0 = default)
+    float cpu_limit_percent = 7;                   // CPU limit as percentage (0.0 = default)
+    
+    // Namespace configuration
+    bool enable_pid_namespace = 8;                 // Enable PID namespace isolation
+    bool enable_mount_namespace = 9;               // Enable mount namespace isolation
+    bool enable_uts_namespace = 10;                // Enable UTS namespace isolation (hostname)
+    bool enable_ipc_namespace = 11;                // Enable IPC namespace isolation
+    bool enable_network_namespace = 12;            // Enable network namespace isolation
 }
 
 message CreateContainerResponse {
-  string container_id = 1;
-    string status = 2; // e.g., "PENDING", "RUNNING"
+    string container_id = 1;                       // Generated container ID
+    bool success = 2;                              // Whether creation was successful
+    string error_message = 3;                      // Error message if creation failed
 }
 
 message GetContainerStatusRequest {
-  string container_id = 1;
+    string container_id = 1;                       // Container ID to query
 }
 
-message ContainerStatusResponse {
-  string container_id = 1;
-    string status = 2;        // e.g., "RUNNING", "EXITED", "FAILED"
-    int32 exit_code = 3;      // Only relevant if status is EXITED
-    string error_message = 4; // Only relevant if status is FAILED
+message GetContainerStatusResponse {
+    string container_id = 1;                       // Container ID
+    ContainerStatus status = 2;                    // Current container status
+    int32 exit_code = 3;                          // Exit code (if exited)
+    string error_message = 4;                      // Error message (if failed)
+    int32 pid = 5;                                // Process ID (if running)
+    uint64 created_at = 6;                        // Creation timestamp
+    uint64 memory_usage_bytes = 7;                // Current memory usage
+    string rootfs_path = 8;                       // Container rootfs path
+}
+
+message LogEntry {
+    uint64 timestamp = 1;                         // Timestamp of log entry
+    string message = 2;                           // Log message content
 }
 
 message GetContainerLogsRequest {
-  string container_id = 1;
-    bool follow = 2; // If true, stream logs until container exits
+    string container_id = 1;                      // Container ID to get logs for
 }
 
-message LogStreamResponse {
-    enum LogSource {
-        STDOUT = 0;
-        STDERR = 1;
-    }
-    LogSource source = 1;
-    bytes content = 2;
-    int64 timestamp_nanos = 3; // Optional: timestamp of the log entry
+message GetContainerLogsResponse {
+    string container_id = 1;                      // Container ID
+    repeated LogEntry logs = 2;                   // All log entries
 }
 
 message StopContainerRequest {
-  string container_id = 1;
-    int64 timeout_seconds = 2; // Optional: how long to wait before force killing
+    string container_id = 1;                      // Container ID to stop
+    int32 timeout_seconds = 2;                    // Timeout before force kill (optional)
 }
 
 message StopContainerResponse {
-  string container_id = 1;
-    string status = 2; // e.g., "STOPPED"
+    bool success = 1;                             // Whether stop was successful
+    string error_message = 2;                     // Error message if stop failed
 }
 
 message RemoveContainerRequest {
-  string container_id = 1;
-    bool force = 2; // If true, remove even if running (will be stopped first)
+    string container_id = 1;                      // Container ID to remove
+    bool force = 2;                               // Force removal even if running
 }
 
 message RemoveContainerResponse {
-  string container_id = 1;
-    string message = 2; // e.g., "Container removed successfully"
+    bool success = 1;                             // Whether removal was successful
+    string error_message = 2;                     // Error message if removal failed
 } 
