@@ -1,0 +1,95 @@
+syntax = "proto3";
+
+package quilt;
+
+// The Quilt service definition.
+service QuiltService {
+  // Creates a new container.
+  rpc CreateContainer(CreateContainerRequest) returns (ContainerResponse);
+  // Gets the status of a container.
+  rpc GetContainerStatus(ContainerStatusRequest) returns (ContainerStatusResponse);
+  // Streams the logs of a container.
+  rpc GetContainerLogs(LogRequest) returns (stream LogResponse);
+  // Stops a running container.
+  rpc StopContainer(StopContainerRequest) returns (StopContainerResponse);
+  // Removes a container.
+  rpc RemoveContainer(RemoveContainerRequest) returns (RemoveContainerResponse);
+}
+
+// Request message for creating a container.
+message CreateContainerRequest {
+  string image_tarball_path = 1; // Path to the rootfs tarball
+  string command = 2;             // Command to run in the container
+  repeated string args = 3;       // Arguments for the command
+  repeated string env_vars = 4;   // Environment variables (e.g., "KEY=VALUE")
+  // Basic resource limits (to be defined further)
+  // message ResourceLimits {
+  //   int64 cpu_cores = 1;
+  //   int64 memory_mb = 2;
+  // }
+  // ResourceLimits resource_limits = 5;
+}
+
+// General response message for container operations that return a container ID and status.
+message ContainerResponse {
+  string container_id = 1;
+  string status = 2; // e.g., "PENDING", "RUNNING", "EXITED"
+  string message = 3; // Optional message, e.g., error details
+}
+
+// Request message for getting container status.
+message ContainerStatusRequest {
+  string container_id = 1;
+}
+
+// Response message for container status.
+message ContainerStatusResponse {
+  string container_id = 1;
+  string status = 2;       // e.g., "RUNNING", "EXITED", "UNKNOWN"
+  int32 exit_code = 3;     // Exit code if the container has exited
+  string message = 4;      // Optional message, e.g., error details
+}
+
+// Request message for getting container logs.
+message LogRequest {
+  string container_id = 1;
+  bool follow = 2; // Stream logs continuously if true
+  // int32 tail = 3; // Number of recent lines to fetch (0 for all)
+}
+
+// Response message for container logs.
+message LogResponse {
+  string container_id = 1;
+  string line = 2; // A single line of log output
+  // enum StreamType {
+  //   STDOUT = 0;
+  //   STDERR = 1;
+  // }
+  // StreamType stream = 3; // Indicates if it's stdout or stderr
+}
+
+// Request message for stopping a container.
+message StopContainerRequest {
+  string container_id = 1;
+  // int32 timeout_seconds = 2; // Optional timeout for stopping
+}
+
+// Response message for stopping a container.
+message StopContainerResponse {
+  string container_id = 1;
+  string status = 2;  // e.g., "STOPPED", "NOT_FOUND"
+  string message = 3; // Optional message
+}
+
+// Request message for removing a container.
+message RemoveContainerRequest {
+  string container_id = 1;
+  // bool force = 2; // Force removal if the container is running
+}
+
+// Response message for removing a container.
+message RemoveContainerResponse {
+  string container_id = 1;
+  string status = 2;  // e.g., "REMOVED", "NOT_FOUND"
+  string message = 3; // Optional message
+} 
