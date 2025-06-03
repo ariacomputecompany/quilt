@@ -1,15 +1,15 @@
 use tonic::{transport::Server, Request, Response, Status};
 use uuid::Uuid;
-use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::Mutex;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use flate2::read::GzDecoder;
 use tar::Archive;
 
+mod runtime;
+use runtime::{ContainerRuntime, ContainerState};
+
 pub mod quilt_rpc {
-    tonic::include_proto!("quilt"); // The string specified here must match the proto package name
+    tonic::include_proto!("quilt");
 }
 
 use quilt_rpc::quilt_service_server::{QuiltService, QuiltServiceServer};
@@ -18,29 +18,16 @@ use quilt_rpc::{
     ContainerStatusResponse, GetContainerLogsRequest, LogStreamResponse,
     RemoveContainerRequest, RemoveContainerResponse, StopContainerRequest, StopContainerResponse,
 };
-use quilt_rpc::log_stream_response::LogSource; // Enum for log source
-
-#[derive(Debug, Clone)]
-pub struct ContainerState {
-    id: String,
-    image_tarball_path: String,
-    rootfs_path: String,
-    command: String,
-    args: Vec<String>,
-    env_vars: Vec<String>,
-    status: String, // e.g., PENDING, RUNNING, EXITED, FAILED
-    exit_code: Option<i32>,
-}
 
 #[derive(Debug)]
 pub struct MyQuiltService {
-    containers: Arc<Mutex<HashMap<String, ContainerState>>>,
+    runtime: ContainerRuntime,
 }
 
 impl MyQuiltService {
     fn new() -> Self {
         MyQuiltService {
-            containers: Arc::new(Mutex::new(HashMap::new())),
+            runtime: ContainerRuntime::new(),
         }
     }
 }
@@ -111,10 +98,19 @@ impl QuiltService for MyQuiltService {
             env_vars: req_inner.environment_variables.iter().map(|(k,v)| format!("{}={}",k,v)).collect(),
             status: "PENDING".to_string(),
             exit_code: None,
+            pid: None,
+            logs: Vec::new(),
         };
 
-        let mut containers_map = self.containers.lock().await;
-        containers_map.insert(container_id.clone(), container_state);
+        // Store the container state
+        {
+            let mut containers_map = self.runtime.containers.lock().await;
+            containers_map.insert(container_id.clone(), container_state);
+        }
+
+        // Start the container execution in the background
+        println!("Starting container execution for: {}", container_id);
+        self.runtime.start_container_execution(container_id.clone()).await;
 
         let reply = CreateContainerResponse {
             container_id,
@@ -131,11 +127,11 @@ impl QuiltService for MyQuiltService {
         let req_inner = request.into_inner();
         let container_id = req_inner.container_id;
 
-        let containers_map = self.containers.lock().await;
+        let containers_map = self.runtime.containers.lock().await;
         match containers_map.get(&container_id) {
             Some(state) => {
                 println!(
-                    "Container Details (ID: {}):\n  Image Tarball: {}\n  RootFS Path: {}\n  Command: {}\n  Args: {:?}\n  Env: {:?}\n  Status: {}\n  Exit Code: {:?}",
+                    "Container Details (ID: {}):\n  Image Tarball: {}\n  RootFS Path: {}\n  Command: {}\n  Args: {:?}\n  Env: {:?}\n  Status: {}\n  Exit Code: {:?}\n  PID: {:?}",
                     state.id,
                     state.image_tarball_path,
                     state.rootfs_path,
@@ -143,7 +139,8 @@ impl QuiltService for MyQuiltService {
                     state.args,
                     state.env_vars,
                     state.status,
-                    state.exit_code
+                    state.exit_code,
+                    state.pid
                 );
 
                 let reply = ContainerStatusResponse {
@@ -171,32 +168,28 @@ impl QuiltService for MyQuiltService {
         let req_inner = request.into_inner();
         let container_id = req_inner.container_id;
 
-        {
-            let containers_map = self.containers.lock().await;
-            if !containers_map.contains_key(&container_id) {
-                return Err(Status::not_found(format!(
-                    "Container {} not found for logs",
-                    container_id
-                )));
+        let logs = {
+            let containers_map = self.runtime.containers.lock().await;
+            match containers_map.get(&container_id) {
+                Some(state) => state.logs.clone(),
+                None => {
+                    return Err(Status::not_found(format!(
+                        "Container {} not found for logs",
+                        container_id
+                    )));
+                }
             }
-        }
+        };
 
         let (tx, rx) = tokio::sync::mpsc::channel(4);
 
         tokio::spawn(async move {
-            let logs = vec![
-                "Log line 1 for container".to_string(),
-                "Log line 2 for container".to_string(),
-                "Log line 3 for container".to_string(),
-            ];
-
-            for log_line in logs {
+            for log_entry in logs {
                 tx.send(Ok(LogStreamResponse {
-                    source: LogSource::Stdout.into(),
-                    content: log_line.into_bytes(),
-                    timestamp_nanos: 0,
+                    source: log_entry.source.into(),
+                    content: log_entry.content.into_bytes(),
+                    timestamp_nanos: log_entry.timestamp_nanos,
                 })).await.unwrap_or_else(|e| eprintln!("Failed to send log: {:?}",e));
-                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
             }
         });
 
@@ -211,21 +204,15 @@ impl QuiltService for MyQuiltService {
         let req_inner = request.into_inner();
         let container_id = req_inner.container_id;
 
-        let mut containers_map = self.containers.lock().await;
-        match containers_map.get_mut(&container_id) {
-            Some(state) => {
-                state.status = "STOPPED".to_string();
-                state.exit_code = Some(0);
+        match self.runtime.stop_container(&container_id).await {
+            Ok(status) => {
                 let reply = StopContainerResponse {
-                    container_id: state.id.clone(),
-                    status: "STOPPED".to_string(),
+                    container_id,
+                    status,
                 };
                 Ok(Response::new(reply))
             }
-            None => Err(Status::not_found(format!(
-                "Container {} not found for stopping",
-                container_id
-            ))),
+            Err(error_msg) => Err(Status::not_found(error_msg)),
         }
     }
 
@@ -237,19 +224,15 @@ impl QuiltService for MyQuiltService {
         let req_inner = request.into_inner();
         let container_id = req_inner.container_id;
 
-        let mut containers_map = self.containers.lock().await;
-        if containers_map.contains_key(&container_id) {
-            containers_map.remove(&container_id);
-            let reply = RemoveContainerResponse {
-                container_id,
-                message: "Container removed successfully".to_string(),
-            };
-            Ok(Response::new(reply))
-        } else {
-            Err(Status::not_found(format!(
-                "Container {} not found for removal",
-                container_id
-            )))
+        match self.runtime.remove_container(&container_id).await {
+            Ok(()) => {
+                let reply = RemoveContainerResponse {
+                    container_id,
+                    message: "Container removed successfully".to_string(),
+                };
+                Ok(Response::new(reply))
+            }
+            Err(error_msg) => Err(Status::internal(error_msg)),
         }
     }
 }
