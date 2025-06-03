@@ -19,8 +19,8 @@ impl Default for NamespaceConfig {
             pid: true,
             mount: true,
             uts: true,
-            ipc: true,
-            network: true, // Start with basic network isolation
+            ipc: false,    // Disable IPC namespace by default for compatibility
+            network: false, // Disable network namespace by default for compatibility
         }
     }
 }

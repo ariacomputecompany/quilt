@@ -32,6 +32,123 @@ info() {
     echo -e "${BLUE}[INFO]${NC} $1"
 }
 
+# Generate a minimal Nix-based rootfs
+generate_nixos_rootfs() {
+    local rootfs_name="${1:-minimal}"
+    local packages="${2:-coreutils bash}"
+    local output_path="./nixos-${rootfs_name}.tar.gz"
+    
+    log "Generating Nix-based rootfs: $rootfs_name with packages: $packages"
+    
+    # Create a temporary Nix expression for the rootfs
+    cat > /tmp/rootfs.nix << EOF
+{ pkgs ? import <nixpkgs> {} }:
+
+let
+  # Create a minimal environment with specified packages
+  basePackages = with pkgs; [
+    $packages
+    busybox
+    glibc
+  ];
+  
+  # Build a directory with all the packages
+  rootfsEnv = pkgs.buildEnv {
+    name = "quilt-rootfs-$rootfs_name";
+    paths = basePackages;
+    pathsToLink = [ "/bin" "/lib" "/share" "/etc" ];
+  };
+  
+in pkgs.runCommand "quilt-rootfs-$rootfs_name.tar.gz" {
+  buildInputs = [ pkgs.gnutar pkgs.gzip ];
+} ''
+  mkdir -p rootfs/{bin,lib,etc,proc,sys,dev,tmp,var,usr}
+  
+  # Copy essential files from the environment
+  cp -r \${rootfsEnv}/bin/* rootfs/bin/ 2>/dev/null || true
+  cp -r \${rootfsEnv}/lib/* rootfs/lib/ 2>/dev/null || true
+  
+  # Create essential files and directories
+  echo "root:x:0:0:root:/:/bin/sh" > rootfs/etc/passwd
+  echo "root:x:0:" > rootfs/etc/group
+  echo "127.0.0.1 localhost" > rootfs/etc/hosts
+  echo "localhost" > rootfs/etc/hostname
+  
+  # Create device files
+  mknod rootfs/dev/null c 1 3 || true
+  mknod rootfs/dev/zero c 1 5 || true
+  mknod rootfs/dev/random c 1 8 || true
+  mknod rootfs/dev/urandom c 1 9 || true
+  
+  # Create the tarball
+  cd rootfs
+  tar czf \$out .
+''
+EOF
+
+    # Build the rootfs with Nix
+    if nix-build /tmp/rootfs.nix -o "$output_path" 2>/dev/null; then
+        log "✅ Generated Nix rootfs: $output_path"
+        return 0
+    else
+        # Fallback: create a minimal rootfs using existing tools
+        warn "Nix build failed, creating minimal rootfs manually..."
+        create_minimal_rootfs "$output_path"
+        return 0
+    fi
+}
+
+# Create a minimal rootfs manually as fallback
+create_minimal_rootfs() {
+    local output_path="$1"
+    local temp_dir=$(mktemp -d)
+    
+    log "Creating minimal rootfs at $output_path"
+    
+    # Create basic directory structure
+    mkdir -p "$temp_dir"/{bin,lib,lib64,etc,proc,sys,dev,tmp,var,usr/bin,usr/lib}
+    
+    # Copy essential binaries from host (if available)
+    if command -v busybox >/dev/null 2>&1; then
+        cp "$(which busybox)" "$temp_dir/bin/"
+        # Create common command symlinks
+        cd "$temp_dir/bin"
+        for cmd in sh ls cat echo mkdir rm cp mv; do
+            ln -sf busybox "$cmd" 2>/dev/null || true
+        done
+        cd - >/dev/null
+    else
+        # Copy basic shell and utilities
+        cp /bin/sh "$temp_dir/bin/" 2>/dev/null || true
+        cp /bin/bash "$temp_dir/bin/" 2>/dev/null || true
+        cp /bin/ls "$temp_dir/bin/" 2>/dev/null || true
+        cp /bin/cat "$temp_dir/bin/" 2>/dev/null || true
+        cp /bin/echo "$temp_dir/bin/" 2>/dev/null || true
+    fi
+    
+    # Copy essential libraries
+    if [ -f /lib/x86_64-linux-gnu/libc.so.6 ]; then
+        cp /lib/x86_64-linux-gnu/libc.so.6 "$temp_dir/lib/" 2>/dev/null || true
+        cp /lib64/ld-linux-x86-64.so.2 "$temp_dir/lib64/" 2>/dev/null || true
+    fi
+    
+    # Create essential files
+    echo "root:x:0:0:root:/:/bin/sh" > "$temp_dir/etc/passwd"
+    echo "root:x:0:" > "$temp_dir/etc/group"
+    echo "127.0.0.1 localhost" > "$temp_dir/etc/hosts"
+    echo "localhost" > "$temp_dir/etc/hostname"
+    
+    # Create the tarball
+    cd "$temp_dir"
+    tar czf "$output_path" .
+    cd - >/dev/null
+    
+    # Cleanup
+    rm -rf "$temp_dir"
+    
+    log "✅ Created minimal rootfs: $output_path"
+}
+
 # Build both binaries (using native target for development)
 build() {
     log "Building quiltd (native target for development)..."
@@ -90,7 +207,7 @@ cli() {
 
 # Quick test - create and check a container
 test() {
-    log "Running comprehensive test with new features..."
+    log "Running comprehensive test with Nix-based containers..."
     
     # Ensure server is running
     if ! pgrep -f quilt > /dev/null; then
@@ -98,21 +215,27 @@ test() {
         server-bg
     fi
     
-    # Check if alpine.tar.gz exists
-    if ! [ -f "alpine.tar.gz" ]; then
-        error "alpine.tar.gz not found. Please ensure you have an Alpine rootfs tarball."
+    # Generate test rootfs environments
+    log "=== Preparing Nix-based rootfs environments ==="
+    
+    # Generate minimal rootfs
+    if [ ! -f "./nixos-minimal.tar.gz" ]; then
+        generate_nixos_rootfs "minimal" "coreutils bash findutils"
     fi
     
-    log "=== TEST 1: Basic container with setup commands ==="
-    log "Creating container with npm and typescript setup..."
+    # Generate development rootfs with common tools
+    if [ ! -f "./nixos-dev.tar.gz" ]; then
+        generate_nixos_rootfs "dev" "coreutils bash findutils curl wget python3 nodejs"
+    fi
+    
+    log "=== TEST 1: Basic Nix container ==="
+    log "Creating container with minimal Nix environment..."
     CONTAINER_ID1=$(cli create \
-        --image-path alpine.tar.gz \
-        --setup "npm: typescript ts-node" \
-        --setup "apk: curl wget" \
+        --image-path ./nixos-minimal.tar.gz \
         --memory-limit 256 \
         --cpu-limit 50.0 \
         --enable-all-namespaces \
-        -- node --version 2>/dev/null | grep "Container created" | grep -o '[a-f0-9-]\{36\}' || echo "")
+        -- /bin/sh -c "echo 'Hello from Nix container!'; ls /bin; uname -a" 2>/dev/null | grep "Container created" | grep -o '[a-f0-9-]\{36\}' || echo "")
     
     if [ -n "$CONTAINER_ID1" ]; then
         log "✅ Container 1 created: $CONTAINER_ID1"
@@ -122,16 +245,16 @@ test() {
         log "Container 1 logs:"
         cli logs "$CONTAINER_ID1"
     else
-        warn "❌ Failed to create container 1 (npm test)"
+        warn "❌ Failed to create container 1 (minimal Nix test)"
     fi
     
-    log "=== TEST 2: Python container with pip packages ==="
-    log "Creating container with Python and pip setup..."
+    log "=== TEST 2: Development Nix container ==="
+    log "Creating container with development tools..."
     CONTAINER_ID2=$(cli create \
-        --image-path alpine.tar.gz \
-        --setup "pip: requests beautifulsoup4" \
-        --memory-limit 128 \
-        -- python3 -c "import requests; print('Python container with requests:', requests.__version__)" 2>/dev/null | grep "Container created" | grep -o '[a-f0-9-]\{36\}' || echo "")
+        --image-path ./nixos-dev.tar.gz \
+        --memory-limit 512 \
+        --setup "nix: python3 python3Packages.requests python3Packages.pip" \
+        -- /bin/sh -c "echo 'Development container ready'; which python3; python3 --version" 2>/dev/null | grep "Container created" | grep -o '[a-f0-9-]\{36\}' || echo "")
     
     if [ -n "$CONTAINER_ID2" ]; then
         log "✅ Container 2 created: $CONTAINER_ID2"
@@ -141,16 +264,16 @@ test() {
         log "Container 2 logs:"
         cli logs "$CONTAINER_ID2"
     else
-        warn "❌ Failed to create container 2 (python test)"
+        warn "❌ Failed to create container 2 (development test)"
     fi
     
-    log "=== TEST 3: Resource limited container ==="
+    log "=== TEST 3: Resource limited Nix container ==="
     log "Creating container with strict resource limits..."
     CONTAINER_ID3=$(cli create \
-        --image-path alpine.tar.gz \
+        --image-path ./nixos-minimal.tar.gz \
         --memory-limit 64 \
         --cpu-limit 25.0 \
-        -- /bin/sh -c "echo 'Memory info:'; cat /proc/meminfo | head -5; echo 'CPU info:'; cat /proc/cpuinfo | head -5" 2>/dev/null | grep "Container created" | grep -o '[a-f0-9-]\{36\}' || echo "")
+        -- /bin/sh -c "echo 'Memory info:'; cat /proc/meminfo | head -5 2>/dev/null || echo 'No /proc/meminfo'; echo 'Container info:'; echo 'PWD:' \$PWD; echo 'USER:' \$USER; echo 'PATH:' \$PATH" 2>/dev/null | grep "Container created" | grep -o '[a-f0-9-]\{36\}' || echo "")
     
     if [ -n "$CONTAINER_ID3" ]; then
         log "✅ Container 3 created: $CONTAINER_ID3"
@@ -166,9 +289,9 @@ test() {
     log "=== TEST 4: Namespace isolation test ==="
     log "Creating container to test namespace isolation..."
     CONTAINER_ID4=$(cli create \
-        --image-path alpine.tar.gz \
+        --image-path ./nixos-minimal.tar.gz \
         --enable-all-namespaces \
-        -- /bin/sh -c "echo 'Container hostname:'; hostname; echo 'Container PID 1:'; ps aux | head -3; echo 'Mount points:'; mount | head -5" 2>/dev/null | grep "Container created" | grep -o '[a-f0-9-]\{36\}' || echo "")
+        -- /bin/sh -c "echo 'Container hostname:'; hostname; echo 'Container processes:'; ps aux 2>/dev/null || ps; echo 'Container filesystem:'; ls -la /" 2>/dev/null | grep "Container created" | grep -o '[a-f0-9-]\{36\}' || echo "")
     
     if [ -n "$CONTAINER_ID4" ]; then
         log "✅ Container 4 created: $CONTAINER_ID4"
@@ -183,15 +306,15 @@ test() {
     
     log "=== Test Summary ==="
     if [ -n "$CONTAINER_ID1" ]; then
-        log "✅ Test 1 (npm/typescript): PASSED"
+        log "✅ Test 1 (minimal Nix): PASSED"
     else
-        warn "❌ Test 1 (npm/typescript): FAILED"
+        warn "❌ Test 1 (minimal Nix): FAILED"
     fi
     
     if [ -n "$CONTAINER_ID2" ]; then
-        log "✅ Test 2 (python/pip): PASSED"
+        log "✅ Test 2 (development Nix): PASSED"
     else
-        warn "❌ Test 2 (python/pip): FAILED"
+        warn "❌ Test 2 (development Nix): FAILED"
     fi
     
     if [ -n "$CONTAINER_ID3" ]; then
@@ -206,9 +329,9 @@ test() {
         warn "❌ Test 4 (namespace isolation): FAILED"
     fi
     
-    log "Enhanced container features test complete!"
+    log "Nix-based container features test complete!"
     log "Features tested:"
-    log "  🔧 Dynamic setup commands (npm, pip, apk)"
+    log "  🔧 Nix-generated rootfs environments"
     log "  🛡️ Linux namespace isolation (PID, Mount, UTS, IPC, Network)"
     log "  📊 Resource limits (memory, CPU)"
     log "  🏗️ Container lifecycle management"
@@ -231,6 +354,10 @@ clean() {
         log "Cleaning up container directories..."
         rm -rf active_containers/*
     fi
+    
+    # Clean up generated rootfs files
+    log "Cleaning up generated rootfs files..."
+    rm -f ./nixos-*.tar.gz
     
     log "Cleanup complete!"
 }
@@ -259,65 +386,89 @@ status() {
         info "❌ Server: Not running"
     fi
     
-    # Check for Alpine rootfs
-    if [ -f "alpine.tar.gz" ]; then
-        info "✅ Alpine rootfs: Available"
+    # Check for Nix
+    if command -v nix >/dev/null 2>&1; then
+        info "✅ Nix: Available ($(nix --version | head -1))"
     else
-        info "❌ Alpine rootfs: Missing (needed for testing)"
+        info "⚠️  Nix: Not available (will use fallback rootfs generation)"
     fi
+    
+    # Check for generated rootfs files
+    ROOTFS_COUNT=$(ls -1 ./nixos-*.tar.gz 2>/dev/null | wc -l)
+    info "📦 Generated rootfs files: $ROOTFS_COUNT"
     
     # Check active containers
     if [ -d "active_containers" ]; then
         CONTAINER_COUNT=$(ls -1 active_containers 2>/dev/null | wc -l)
-        info "📦 Active containers: $CONTAINER_COUNT"
+        info "🏃 Active containers: $CONTAINER_COUNT"
     else
-        info "📦 Active containers: 0"
+        info "🏃 Active containers: 0"
     fi
+}
+
+# Generate rootfs environments
+generate() {
+    case "${2:-minimal}" in
+        minimal)
+            generate_nixos_rootfs "minimal" "coreutils bash findutils"
+            ;;
+        dev|development)
+            generate_nixos_rootfs "dev" "coreutils bash findutils curl wget python3 nodejs"
+            ;;
+        python)
+            generate_nixos_rootfs "python" "coreutils bash python3 python3Packages.pip python3Packages.requests"
+            ;;
+        node|nodejs)
+            generate_nixos_rootfs "nodejs" "coreutils bash nodejs npm"
+            ;;
+        rust)
+            generate_nixos_rootfs "rust" "coreutils bash rustc cargo gcc"
+            ;;
+        *)
+            error "Unknown rootfs type: ${2}. Available: minimal, dev, python, nodejs, rust"
+            ;;
+    esac
 }
 
 # Show help
 help() {
-    echo "Quilt Development Script"
+    echo "Quilt Development Script - Nix-Based Container Runtime"
     echo ""
     echo "Usage: ./dev.sh [command]"
     echo ""
     echo "Commands:"
-    echo "  build       Build both quiltd and quilt-cli"
-    echo "  server      Start the server (foreground)"
-    echo "  server-bg   Start the server in background"
-    echo "  cli [args]  Run quilt-cli with arguments"
-    echo "  test        Run comprehensive tests with enhanced features"
-    echo "  clean       Stop server and clean up containers"
-    echo "  status      Show development environment status"
-    echo "  help        Show this help message"
+    echo "  build         Build both quiltd and quilt-cli"
+    echo "  server        Start the server (foreground)"
+    echo "  server-bg     Start the server in background"
+    echo "  cli [args]    Run quilt-cli with arguments"
+    echo "  test          Run comprehensive tests with Nix-based containers"
+    echo "  generate [type] Generate rootfs environments (minimal, dev, python, nodejs, rust)"
+    echo "  clean         Stop server and clean up containers"
+    echo "  status        Show development environment status"
+    echo "  help          Show this help message"
     echo ""
-    echo "Enhanced CLI Examples:"
-    echo "  # Basic container"
-    echo "  ./dev.sh cli create --image-path alpine.tar.gz -- /bin/echo 'Hello World'"
+    echo "Nix-Based CLI Examples:"
+    echo "  # Basic container with minimal Nix rootfs"
+    echo "  ./dev.sh cli create --image-path ./nixos-minimal.tar.gz -- /bin/echo 'Hello World'"
     echo ""
-    echo "  # Container with npm packages"
-    echo "  ./dev.sh cli create --image-path alpine.tar.gz \\"
-    echo "    --setup 'npm: typescript ts-node' \\"
-    echo "    -- node --version"
+    echo "  # Container with development environment"
+    echo "  ./dev.sh cli create --image-path ./nixos-dev.tar.gz \\"
+    echo "    --setup 'nix: python3 python3Packages.requests' \\"
+    echo "    -- python3 -c 'print(\"Python container ready\")'"
     echo ""
-    echo "  # Container with Python packages and resource limits"
-    echo "  ./dev.sh cli create --image-path alpine.tar.gz \\"
-    echo "    --setup 'pip: requests beautifulsoup4' \\"
+    echo "  # Container with resource limits and full isolation"
+    echo "  ./dev.sh cli create --image-path ./nixos-minimal.tar.gz \\"
     echo "    --memory-limit 256 \\"
     echo "    --cpu-limit 50.0 \\"
-    echo "    -- python3 -c 'import requests; print(requests.__version__)'"
-    echo ""
-    echo "  # Container with full namespace isolation"
-    echo "  ./dev.sh cli create --image-path alpine.tar.gz \\"
     echo "    --enable-all-namespaces \\"
     echo "    -- /bin/sh -c 'hostname; ps aux'"
     echo ""
-    echo "  # Multiple setup commands"
-    echo "  ./dev.sh cli create --image-path alpine.tar.gz \\"
-    echo "    --setup 'apk: python3 py3-pip nodejs npm' \\"
-    echo "    --setup 'npm: typescript' \\"
-    echo "    --setup 'pip: requests' \\"
-    echo "    -- /bin/sh -c 'node --version && python3 --version'"
+    echo "Rootfs Generation:"
+    echo "  ./dev.sh generate minimal    # Basic shell and coreutils"
+    echo "  ./dev.sh generate dev        # Development tools (curl, wget, python, node)"
+    echo "  ./dev.sh generate python     # Python with common packages"
+    echo "  ./dev.sh generate nodejs     # Node.js with npm"
+    echo "  ./dev.sh generate rust       # Rust development environment"
     echo ""
     echo "Container Management:"
     echo "  ./dev.sh cli status <container-id>    # Check container status"
@@ -329,6 +480,9 @@ help() {
     echo "  ./dev.sh test          # Run all feature tests"
     echo "  ./dev.sh clean         # Clean up everything"
     echo "  ./dev.sh status        # Check development status"
+    echo ""
+    echo "Note: This version uses Nix for generating container rootfs environments."
+    echo "If Nix is not available, it will fall back to creating minimal rootfs manually."
 }
 
 # Main script logic
@@ -348,6 +502,9 @@ case "${1:-help}" in
         ;;
     test)
         test
+        ;;
+    generate)
+        generate "$@"
         ;;
     clean)
         clean

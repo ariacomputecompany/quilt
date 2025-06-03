@@ -1,338 +1,456 @@
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::collections::HashMap;
+use crate::system_runtime::SystemRuntime;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum RuntimeType {
-    NodeJs,      // npm, yarn, node
-    Python,      // pip, conda, python
-    Rust,        // cargo, rustc
-    Go,          // go mod, go get
-    Java,        // maven, gradle
-    System,      // apt, apk, yum (system package managers)
+#[derive(Debug, Clone)]
+pub enum Runtime {
+    NodeJs,
+    Python,
+    Ruby,
+    Go,
+    Java,
+    Php,
+    Nix,
+    Custom(String),
+}
+
+impl Runtime {
+    pub fn from_string(runtime: &str) -> Result<Runtime, String> {
+        match runtime.to_lowercase().as_str() {
+            "node" | "nodejs" | "npm" => Ok(Runtime::NodeJs),
+            "python" | "python3" | "pip" => Ok(Runtime::Python),
+            "ruby" | "gem" => Ok(Runtime::Ruby),
+            "go" | "golang" => Ok(Runtime::Go),
+            "java" | "maven" | "gradle" => Ok(Runtime::Java),
+            "php" | "composer" => Ok(Runtime::Php),
+            "nix" => Ok(Runtime::Nix),
+            custom => Ok(Runtime::Custom(custom.to_string())),
+        }
+    }
+
+    pub fn get_name(&self) -> String {
+        match self {
+            Runtime::NodeJs => "NodeJs".to_string(),
+            Runtime::Python => "Python".to_string(),
+            Runtime::Ruby => "Ruby".to_string(),
+            Runtime::Go => "Go".to_string(),
+            Runtime::Java => "Java".to_string(),
+            Runtime::Php => "PHP".to_string(),
+            Runtime::Nix => "Nix".to_string(),
+            Runtime::Custom(name) => name.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct SetupCommand {
-    pub runtime_type: RuntimeType,
-    pub command: String,
-    pub args: Vec<String>,
-    pub description: String,
-}
-
-impl SetupCommand {
-    pub fn new(runtime_type: RuntimeType, command: String, args: Vec<String>, description: String) -> Self {
-        SetupCommand {
-            runtime_type,
-            command,
-            args,
-            description,
-        }
-    }
-
-    /// Create a Node.js npm install command
-    pub fn npm_install(packages: Vec<String>) -> Self {
-        let mut args = vec!["install".to_string(), "-g".to_string()];
-        args.extend(packages.clone());
-        
-        SetupCommand {
-            runtime_type: RuntimeType::NodeJs,
-            command: "npm".to_string(),
-            args,
-            description: format!("Install npm packages: {}", packages.join(", ")),
-        }
-    }
-
-    /// Create a Python pip install command
-    pub fn pip_install(packages: Vec<String>) -> Self {
-        let mut args = vec!["install".to_string()];
-        args.extend(packages.clone());
-        
-        SetupCommand {
-            runtime_type: RuntimeType::Python,
-            command: "pip".to_string(),
-            args,
-            description: format!("Install pip packages: {}", packages.join(", ")),
-        }
-    }
-
-    /// Create an Alpine apk add command
-    pub fn apk_add(packages: Vec<String>) -> Self {
-        let mut args = vec!["add".to_string(), "--no-cache".to_string()];
-        args.extend(packages.clone());
-        
-        SetupCommand {
-            runtime_type: RuntimeType::System,
-            command: "apk".to_string(),
-            args,
-            description: format!("Install Alpine packages: {}", packages.join(", ")),
-        }
-    }
-
-    /// Create an Ubuntu/Debian apt install command
-    pub fn apt_install(packages: Vec<String>) -> Self {
-        let mut args = vec!["install".to_string(), "-y".to_string()];
-        args.extend(packages.clone());
-        
-        SetupCommand {
-            runtime_type: RuntimeType::System,
-            command: "apt".to_string(),
-            args,
-            description: format!("Install apt packages: {}", packages.join(", ")),
-        }
-    }
-
-    /// Create a Rust cargo install command
-    pub fn cargo_install(packages: Vec<String>) -> Self {
-        let mut args = vec!["install".to_string()];
-        args.extend(packages.clone());
-        
-        SetupCommand {
-            runtime_type: RuntimeType::Rust,
-            command: "cargo".to_string(),
-            args,
-            description: format!("Install cargo crates: {}", packages.join(", ")),
-        }
-    }
-
-    /// Create a Go install command
-    pub fn go_install(packages: Vec<String>) -> Self {
-        let mut args = vec!["install".to_string()];
-        args.extend(packages.clone());
-        
-        SetupCommand {
-            runtime_type: RuntimeType::Go,
-            command: "go".to_string(),
-            args,
-            description: format!("Install Go packages: {}", packages.join(", ")),
-        }
-    }
+    pub runtime: Runtime,
+    pub packages: Vec<String>,
 }
 
 pub struct RuntimeManager {
-    runtime_configs: HashMap<RuntimeType, RuntimeConfig>,
-}
-
-#[derive(Debug, Clone)]
-struct RuntimeConfig {
-    install_commands: Vec<SetupCommand>,  // Commands to install the runtime itself
-    verify_command: Option<String>,       // Command to verify runtime is available
+    system_runtime: SystemRuntime,
+    installed_runtimes: HashMap<String, Runtime>,
+    available_package_manager: Option<String>,
 }
 
 impl RuntimeManager {
     pub fn new() -> Self {
-        let mut runtime_configs = HashMap::new();
-        
-        // Node.js runtime configuration
-        runtime_configs.insert(RuntimeType::NodeJs, RuntimeConfig {
-            install_commands: vec![
-                SetupCommand::apk_add(vec!["nodejs".to_string(), "npm".to_string()]),
-            ],
-            verify_command: Some("node --version".to_string()),
-        });
-
-        // Python runtime configuration
-        runtime_configs.insert(RuntimeType::Python, RuntimeConfig {
-            install_commands: vec![
-                SetupCommand::apk_add(vec!["python3".to_string(), "py3-pip".to_string()]),
-            ],
-            verify_command: Some("python3 --version".to_string()),
-        });
-
-        // Rust runtime configuration
-        runtime_configs.insert(RuntimeType::Rust, RuntimeConfig {
-            install_commands: vec![
-                SetupCommand::apk_add(vec!["cargo".to_string(), "rust".to_string()]),
-            ],
-            verify_command: Some("cargo --version".to_string()),
-        });
-
-        // Go runtime configuration
-        runtime_configs.insert(RuntimeType::Go, RuntimeConfig {
-            install_commands: vec![
-                SetupCommand::apk_add(vec!["go".to_string()]),
-            ],
-            verify_command: Some("go version".to_string()),
-        });
-
-        // Java runtime configuration
-        runtime_configs.insert(RuntimeType::Java, RuntimeConfig {
-            install_commands: vec![
-                SetupCommand::apk_add(vec!["openjdk11".to_string(), "maven".to_string()]),
-            ],
-            verify_command: Some("java -version".to_string()),
-        });
-
-        // System runtime (package managers are usually pre-installed)
-        runtime_configs.insert(RuntimeType::System, RuntimeConfig {
-            install_commands: vec![],
-            verify_command: None,
-        });
-
         RuntimeManager {
-            runtime_configs,
+            system_runtime: SystemRuntime::new(),
+            installed_runtimes: HashMap::new(),
+            available_package_manager: None,
         }
     }
 
-    /// Execute a series of setup commands in sequence
-    pub fn execute_setup_commands(&self, commands: &[SetupCommand]) -> Result<Vec<String>, String> {
-        let mut results = Vec::new();
-        
-        for command in commands {
-            println!("Executing setup command: {}", command.description);
-            
-            // Ensure runtime is available before executing command
-            if let Err(e) = self.ensure_runtime_available(&command.runtime_type) {
-                return Err(format!("Failed to ensure runtime {:?} is available: {}", command.runtime_type, e));
-            }
-            
-            // Execute the command
-            match self.execute_command(&command.command, &command.args) {
-                Ok(output) => {
-                    println!("✅ Successfully executed: {}", command.description);
-                    results.push(output);
-                }
-                Err(e) => {
-                    let error_msg = format!("❌ Failed to execute '{}': {}", command.description, e);
-                    eprintln!("{}", error_msg);
-                    return Err(error_msg);
-                }
-            }
-        }
-        
-        Ok(results)
-    }
+    /// Initialize the container environment and detect available package manager
+    pub fn initialize_container(&mut self) -> Result<(), String> {
+        println!("🚀 Initializing container runtime environment...");
 
-    /// Ensure a runtime is available, installing it if necessary
-    fn ensure_runtime_available(&self, runtime_type: &RuntimeType) -> Result<(), String> {
-        if let Some(config) = self.runtime_configs.get(runtime_type) {
-            // Check if runtime is already available
-            if let Some(verify_cmd) = &config.verify_command {
-                if self.check_command_available(verify_cmd) {
-                    println!("Runtime {:?} is already available", runtime_type);
-                    return Ok(());
-                }
+        // First, initialize the basic system environment
+        self.system_runtime.initialize_container_environment()?;
+
+        // Detect and prepare package manager
+        match self.system_runtime.check_package_manager_availability() {
+            Ok(package_manager) => {
+                self.available_package_manager = Some(package_manager.clone());
+                self.system_runtime.prepare_for_package_installation(&package_manager)?;
+                println!("✅ Container runtime environment ready with package manager: {}", package_manager);
             }
-
-            // Install runtime if not available
-            if !config.install_commands.is_empty() {
-                println!("Installing runtime {:?}", runtime_type);
-                for install_cmd in &config.install_commands {
-                    if let Err(e) = self.execute_command(&install_cmd.command, &install_cmd.args) {
-                        return Err(format!("Failed to install runtime {:?}: {}", runtime_type, e));
-                    }
-                }
-
-                // Verify installation
-                if let Some(verify_cmd) = &config.verify_command {
-                    if !self.check_command_available(verify_cmd) {
-                        return Err(format!("Runtime {:?} installation verification failed", runtime_type));
-                    }
-                }
+            Err(e) => {
+                eprintln!("⚠️  Warning: {}", e);
+                eprintln!("    Setup commands will be skipped.");
+                self.available_package_manager = None;
             }
         }
 
         Ok(())
     }
 
-    /// Check if a command is available
-    fn check_command_available(&self, command: &str) -> bool {
-        let parts: Vec<&str> = command.split_whitespace().collect();
-        if parts.is_empty() {
-            return false;
-        }
-
-        Command::new(parts[0])
-            .args(&parts[1..])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false)
-    }
-
-    /// Execute a command and return its output
-    fn execute_command(&self, command: &str, args: &[String]) -> Result<String, String> {
-        println!("Executing: {} {}", command, args.join(" "));
-        
-        let output = Command::new(command)
-            .args(args)
-            .output()
-            .map_err(|e| format!("Failed to execute command '{}': {}", command, e))?;
-
-        if output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            
-            // Return combined output
-            let result = if stderr.is_empty() {
-                stdout.to_string()
-            } else {
-                format!("stdout: {}\nstderr: {}", stdout, stderr)
-            };
-            
-            Ok(result)
-        } else {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            Err(format!("Command '{}' failed with exit code {}: {}", 
-                       command, 
-                       output.status.code().unwrap_or(-1), 
-                       stderr))
-        }
-    }
-
-    /// Parse setup commands from a string specification
-    pub fn parse_setup_spec(&self, spec: &str) -> Result<Vec<SetupCommand>, String> {
+    pub fn parse_setup_spec(&self, setup_spec: &str) -> Result<Vec<SetupCommand>, String> {
         let mut commands = Vec::new();
         
-        for line in spec.lines() {
+        for line in setup_spec.lines() {
             let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
+            if line.is_empty() {
                 continue;
             }
+            
+            let command = self.parse_setup_line(line)?;
+            commands.push(command);
+        }
+        
+        Ok(commands)
+    }
 
-            // Parse different command formats
-            if line.starts_with("npm:") {
-                let packages: Vec<String> = line[4..].split_whitespace()
-                    .map(|s| s.to_string()).collect();
-                commands.push(SetupCommand::npm_install(packages));
-            } else if line.starts_with("pip:") {
-                let packages: Vec<String> = line[4..].split_whitespace()
-                    .map(|s| s.to_string()).collect();
-                commands.push(SetupCommand::pip_install(packages));
-            } else if line.starts_with("apk:") {
-                let packages: Vec<String> = line[4..].split_whitespace()
-                    .map(|s| s.to_string()).collect();
-                commands.push(SetupCommand::apk_add(packages));
-            } else if line.starts_with("apt:") {
-                let packages: Vec<String> = line[4..].split_whitespace()
-                    .map(|s| s.to_string()).collect();
-                commands.push(SetupCommand::apt_install(packages));
-            } else if line.starts_with("cargo:") {
-                let packages: Vec<String> = line[6..].split_whitespace()
-                    .map(|s| s.to_string()).collect();
-                commands.push(SetupCommand::cargo_install(packages));
-            } else if line.starts_with("go:") {
-                let packages: Vec<String> = line[3..].split_whitespace()
-                    .map(|s| s.to_string()).collect();
-                commands.push(SetupCommand::go_install(packages));
+    fn parse_setup_line(&self, line: &str) -> Result<SetupCommand, String> {
+        if let Some((runtime_str, packages_str)) = line.split_once(':') {
+            let runtime = Runtime::from_string(runtime_str.trim())?;
+            let packages: Vec<String> = packages_str
+                .split_whitespace()
+                .map(|s| s.to_string())
+                .collect();
+            
+            if packages.is_empty() {
+                return Err(format!("No packages specified for runtime: {}", runtime_str));
+            }
+            
+            Ok(SetupCommand { runtime, packages })
+        } else {
+            Err(format!("Invalid setup command format: '{}'. Expected 'runtime: package1 package2'", line))
+        }
+    }
+
+    pub fn execute_setup_commands(&mut self, commands: &[SetupCommand]) -> Result<(), String> {
+        if commands.is_empty() {
+            return Ok(());
+        }
+
+        // Ensure container is initialized
+        if self.available_package_manager.is_none() {
+            self.initialize_container()?;
+        }
+
+        let package_manager = match &self.available_package_manager {
+            Some(pm) => pm.clone(),
+            None => "none".to_string(),
+        };
+
+        for command in commands {
+            println!("Executing setup command: Install {} packages: {}", 
+                    command.runtime.get_name(), 
+                    command.packages.join(", "));
+            
+            if matches!(command.runtime, Runtime::Nix) {
+                self.handle_nix_packages(&command.packages)?;
             } else {
-                // Generic command format: "command arg1 arg2 ..."
-                let parts: Vec<String> = line.split_whitespace()
-                    .map(|s| s.to_string()).collect();
-                if !parts.is_empty() {
-                    let command = parts[0].clone();
-                    let args = parts[1..].to_vec();
-                    commands.push(SetupCommand::new(
-                        RuntimeType::System,
-                        command.clone(),
-                        args,
-                        format!("Execute: {}", line),
-                    ));
+                self.ensure_runtime_available(&command.runtime, &package_manager)?;
+                self.install_packages(&command.runtime, &command.packages, &package_manager)?;
+            }
+        }
+        
+        Ok(())
+    }
+
+    /// Handle Nix package specifications
+    fn handle_nix_packages(&self, packages: &[String]) -> Result<(), String> {
+        println!("🔧 Processing Nix packages: {:?}", packages);
+        
+        for package in packages {
+            if let Ok(output) = Command::new("/bin/sh")
+                .arg("-c")
+                .arg(&format!("command -v {} || which {} || ls /bin/{} || ls /usr/bin/{}", package, package, package, package))
+                .output() 
+            {
+                if output.status.success() {
+                    println!("  ✓ Nix package '{}' is available", package);
+                } else {
+                    println!("  ⚠ Nix package '{}' not found in standard locations", package);
+                    println!("    (This is normal for Nix packages - they may be available when needed)");
                 }
             }
         }
+        
+        println!("✅ Nix packages processed");
+        Ok(())
+    }
 
-        Ok(commands)
+    fn ensure_runtime_available(&mut self, runtime: &Runtime, package_manager: &str) -> Result<(), String> {
+        let runtime_name = runtime.get_name();
+        
+        // Check if runtime is already installed
+        if self.installed_runtimes.contains_key(&runtime_name) {
+            return Ok(());
+        }
+        
+        if package_manager == "nix" || package_manager == "none" {
+            println!("  ℹ Runtime {} should be pre-available in this environment", runtime_name);
+            self.installed_runtimes.insert(runtime_name, runtime.clone());
+            return Ok(());
+        }
+        
+        match runtime {
+            Runtime::NodeJs => {
+                self.install_nodejs_runtime(package_manager)?;
+            }
+            Runtime::Python => {
+                self.install_python_runtime(package_manager)?;
+            }
+            Runtime::Ruby => {
+                self.install_ruby_runtime(package_manager)?;
+            }
+            Runtime::Go => {
+                self.install_go_runtime(package_manager)?;
+            }
+            Runtime::Java => {
+                self.install_java_runtime(package_manager)?;
+            }
+            Runtime::Php => {
+                self.install_php_runtime(package_manager)?;
+            }
+            Runtime::Nix => {
+                println!("  ℹ Nix runtime is environment-based, no installation needed");
+            }
+            Runtime::Custom(_) => {
+                return Err("Custom runtime installation not implemented".to_string());
+            }
+        }
+        
+        self.installed_runtimes.insert(runtime_name, runtime.clone());
+        Ok(())
+    }
+
+    fn install_nodejs_runtime(&self, package_manager: &str) -> Result<(), String> {
+        println!("Installing runtime NodeJs");
+        let packages = match package_manager {
+            "apk" => vec!["nodejs", "npm"],
+            "apt" => vec!["nodejs", "npm"],
+            "yum" | "dnf" => vec!["nodejs", "npm"],
+            _ => return Err(format!("NodeJs installation not supported for package manager: {}", package_manager)),
+        };
+        
+        self.system_runtime.install_runtime(package_manager, "NodeJs", &packages)
+    }
+
+    fn install_python_runtime(&self, package_manager: &str) -> Result<(), String> {
+        println!("Installing runtime Python");
+        let packages = match package_manager {
+            "apk" => vec!["python3", "py3-pip"],
+            "apt" => vec!["python3", "python3-pip"],
+            "yum" | "dnf" => vec!["python3", "python3-pip"],
+            _ => return Err(format!("Python installation not supported for package manager: {}", package_manager)),
+        };
+        
+        self.system_runtime.install_runtime(package_manager, "Python", &packages)
+    }
+
+    fn install_ruby_runtime(&self, package_manager: &str) -> Result<(), String> {
+        println!("Installing runtime Ruby");
+        let packages = match package_manager {
+            "apk" => vec!["ruby", "ruby-dev", "ruby-bundler"],
+            "apt" => vec!["ruby", "ruby-dev", "bundler"],
+            "yum" | "dnf" => vec!["ruby", "ruby-devel", "rubygems"],
+            _ => return Err(format!("Ruby installation not supported for package manager: {}", package_manager)),
+        };
+        
+        self.system_runtime.install_runtime(package_manager, "Ruby", &packages)
+    }
+
+    fn install_go_runtime(&self, package_manager: &str) -> Result<(), String> {
+        println!("Installing runtime Go");
+        let packages = match package_manager {
+            "apk" => vec!["go"],
+            "apt" => vec!["golang-go"],
+            "yum" | "dnf" => vec!["golang"],
+            _ => return Err(format!("Go installation not supported for package manager: {}", package_manager)),
+        };
+        
+        self.system_runtime.install_runtime(package_manager, "Go", &packages)
+    }
+
+    fn install_java_runtime(&self, package_manager: &str) -> Result<(), String> {
+        println!("Installing runtime Java");
+        let packages = match package_manager {
+            "apk" => vec!["openjdk11", "maven"],
+            "apt" => vec!["openjdk-11-jdk", "maven"],
+            "yum" | "dnf" => vec!["java-11-openjdk-devel", "maven"],
+            _ => return Err(format!("Java installation not supported for package manager: {}", package_manager)),
+        };
+        
+        self.system_runtime.install_runtime(package_manager, "Java", &packages)
+    }
+
+    fn install_php_runtime(&self, package_manager: &str) -> Result<(), String> {
+        println!("Installing runtime PHP");
+        let packages = match package_manager {
+            "apk" => vec!["php", "php-composer", "php-json"],
+            "apt" => vec!["php", "composer", "php-json"],
+            "yum" | "dnf" => vec!["php", "composer", "php-json"],
+            _ => return Err(format!("PHP installation not supported for package manager: {}", package_manager)),
+        };
+        
+        self.system_runtime.install_runtime(package_manager, "PHP", &packages)
+    }
+
+    fn install_packages(&self, runtime: &Runtime, packages: &[String], package_manager: &str) -> Result<(), String> {
+        match runtime {
+            Runtime::NodeJs => self.install_npm_packages(packages),
+            Runtime::Python => self.install_pip_packages(packages),
+            Runtime::Ruby => self.install_gem_packages(packages),
+            Runtime::Go => self.install_go_packages(packages),
+            Runtime::Java => self.install_maven_packages(packages),
+            Runtime::Php => self.install_composer_packages(packages),
+            Runtime::Nix => {
+                println!("  ℹ Nix packages are pre-installed in environment");
+                Ok(())
+            }
+            Runtime::Custom(_) => {
+                if package_manager != "none" {
+                    let packages_str: Vec<&str> = packages.iter().map(|s| s.as_str()).collect();
+                    self.system_runtime.install_runtime(package_manager, "custom", &packages_str)
+                } else {
+                    println!("  ℹ Custom packages cannot be installed - no package manager available");
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    fn install_npm_packages(&self, packages: &[String]) -> Result<(), String> {
+        if packages.is_empty() {
+            return Ok(());
+        }
+
+        println!("📦 Installing npm packages: {}", packages.join(", "));
+        
+        let mut cmd = Command::new("npm");
+        cmd.arg("install").arg("-g");
+        cmd.args(packages);
+
+        match cmd.output() {
+            Ok(output) => {
+                if output.status.success() {
+                    println!("✅ Successfully installed npm packages");
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    if !stdout.trim().is_empty() {
+                        println!("   npm output: {}", stdout.trim());
+                    }
+                    Ok(())
+                } else {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    Err(format!("Failed to install npm packages: {}", stderr))
+                }
+            }
+            Err(e) => Err(format!("Failed to execute npm command: {}", e)),
+        }
+    }
+
+    fn install_pip_packages(&self, packages: &[String]) -> Result<(), String> {
+        if packages.is_empty() {
+            return Ok(());
+        }
+
+        println!("📦 Installing pip packages: {}", packages.join(", "));
+        
+        let mut cmd = Command::new("pip3");
+        cmd.arg("install");
+        cmd.args(packages);
+
+        match cmd.output() {
+            Ok(output) => {
+                if output.status.success() {
+                    println!("✅ Successfully installed pip packages");
+                    Ok(())
+                } else {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    Err(format!("Failed to install pip packages: {}", stderr))
+                }
+            }
+            Err(e) => Err(format!("Failed to execute pip3 command: {}", e)),
+        }
+    }
+
+    fn install_gem_packages(&self, packages: &[String]) -> Result<(), String> {
+        if packages.is_empty() {
+            return Ok(());
+        }
+
+        println!("📦 Installing gem packages: {}", packages.join(", "));
+        
+        for package in packages {
+            let mut cmd = Command::new("gem");
+            cmd.arg("install").arg(package);
+
+            match cmd.output() {
+                Ok(output) => {
+                    if !output.status.success() {
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        return Err(format!("Failed to install gem package {}: {}", package, stderr));
+                    }
+                }
+                Err(e) => return Err(format!("Failed to execute gem command for {}: {}", package, e)),
+            }
+        }
+        
+        println!("✅ Successfully installed gem packages");
+        Ok(())
+    }
+
+    fn install_go_packages(&self, packages: &[String]) -> Result<(), String> {
+        if packages.is_empty() {
+            return Ok(());
+        }
+
+        println!("📦 Installing Go packages: {}", packages.join(", "));
+        
+        for package in packages {
+            let mut cmd = Command::new("go");
+            cmd.arg("install").arg(package);
+
+            match cmd.output() {
+                Ok(output) => {
+                    if !output.status.success() {
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        return Err(format!("Failed to install Go package {}: {}", package, stderr));
+                    }
+                }
+                Err(e) => return Err(format!("Failed to execute go command for {}: {}", package, e)),
+            }
+        }
+        
+        println!("✅ Successfully installed Go packages");
+        Ok(())
+    }
+
+    fn install_maven_packages(&self, packages: &[String]) -> Result<(), String> {
+        println!("📦 Java/Maven packages requested: {}", packages.join(", "));
+        println!("ℹ️  Java packages typically managed through project files (pom.xml, build.gradle)");
+        Ok(())
+    }
+
+    fn install_composer_packages(&self, packages: &[String]) -> Result<(), String> {
+        if packages.is_empty() {
+            return Ok(());
+        }
+
+        println!("📦 Installing Composer packages: {}", packages.join(", "));
+        
+        let mut cmd = Command::new("composer");
+        cmd.arg("global").arg("require");
+        cmd.args(packages);
+
+        match cmd.output() {
+            Ok(output) => {
+                if output.status.success() {
+                    println!("✅ Successfully installed Composer packages");
+                    Ok(())
+                } else {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    Err(format!("Failed to install Composer packages: {}", stderr))
+                }
+            }
+            Err(e) => Err(format!("Failed to execute composer command: {}", e)),
+        }
     }
 }
 

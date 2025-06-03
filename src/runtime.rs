@@ -166,7 +166,7 @@ impl ContainerRuntime {
         let environment_clone = config.environment.clone();
         let rootfs_path_clone = rootfs_path.clone();
         let setup_commands_clone = setup_commands.clone();
-        let runtime_manager_clone = RuntimeManager::new(); // Create new instance for child process
+        let mut runtime_manager_clone = RuntimeManager::new(); // Create new instance for child process
 
         let child_func = move || -> i32 {
             // This runs in the child process with new namespaces
@@ -199,6 +199,19 @@ impl ContainerRuntime {
             // Change to root directory inside container
             if let Err(e) = chdir("/") {
                 eprintln!("Failed to chdir to /: {}", e);
+                return 1;
+            }
+
+            // Initialize container system environment first
+            if let Err(e) = runtime_manager_clone.initialize_container() {
+                eprintln!("Failed to initialize container environment: {}", e);
+                // Add error to container logs
+                if let Ok(mut containers) = containers_clone.lock() {
+                    if let Some(container) = containers.get_mut(&id_clone) {
+                        container.add_log(format!("Environment initialization failed: {}", e));
+                        container.state = ContainerState::FAILED(e.clone());
+                    }
+                }
                 return 1;
             }
 
