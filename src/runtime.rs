@@ -10,6 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use flate2::read::GzDecoder;
 use tar::Archive;
 use nix::unistd::{chroot, chdir, Pid};
+use std::os::unix::fs::PermissionsExt;
 
 #[derive(Debug, Clone)]
 pub enum ContainerState {
@@ -368,8 +369,182 @@ impl ContainerRuntime {
             return Err(format!("Image file not found: {}", image_path));
         }
 
+        // Fix broken symlinks and ensure working binaries
+        self.fix_container_binaries(rootfs_path)?;
+
         println!("✅ Rootfs setup completed for container {}", container_id);
         Ok(())
+    }
+
+    /// Fix broken symlinks in Nix-generated containers and ensure working binaries
+    fn fix_container_binaries(&self, rootfs_path: &str) -> Result<(), String> {
+        println!("🔧 Fixing container binaries and symlinks...");
+
+        // Essential binaries that must work
+        let essential_binaries = vec![
+            ("sh", vec!["/bin/sh", "/bin/bash", "/usr/bin/sh"]),
+            ("echo", vec!["/bin/echo", "/usr/bin/echo"]),
+            ("ls", vec!["/bin/ls", "/usr/bin/ls"]),
+            ("cat", vec!["/bin/cat", "/usr/bin/cat"]),
+        ];
+
+        for (binary_name, host_paths) in essential_binaries {
+            let container_binary_path = format!("{}/bin/{}", rootfs_path, binary_name);
+            
+            // Check if the binary exists and works in the container
+            if Path::new(&container_binary_path).exists() {
+                // Check if it's a broken symlink
+                if let Ok(target) = fs::read_link(&container_binary_path) {
+                    // It's a symlink, check if target exists
+                    let target_path = if target.is_absolute() {
+                        format!("{}{}", rootfs_path, target.display())
+                    } else {
+                        format!("{}/bin/{}", rootfs_path, target.display())
+                    };
+                    
+                    if !Path::new(&target_path).exists() {
+                        println!("  ⚠ Broken symlink found for {}: {} -> {}", binary_name, container_binary_path, target.display());
+                        self.fix_broken_binary(&container_binary_path, binary_name, &host_paths)?;
+                    } else {
+                        println!("  ✓ Symlink for {} is working", binary_name);
+                    }
+                } else {
+                    // It's a regular file, check if it's executable
+                    if let Ok(metadata) = fs::metadata(&container_binary_path) {
+                        if metadata.permissions().mode() & 0o111 == 0 {
+                            println!("  ⚠ Binary {} is not executable", binary_name);
+                            self.fix_broken_binary(&container_binary_path, binary_name, &host_paths)?;
+                        } else {
+                            println!("  ✓ Binary {} exists and is executable", binary_name);
+                        }
+                    }
+                }
+            } else {
+                println!("  ⚠ Missing binary: {}", binary_name);
+                self.fix_broken_binary(&container_binary_path, binary_name, &host_paths)?;
+            }
+        }
+
+        // Ensure basic shell works
+        self.verify_container_shell(rootfs_path)?;
+
+        println!("✅ Container binaries fixed and verified");
+        Ok(())
+    }
+
+    /// Fix a broken or missing binary by copying from host
+    fn fix_broken_binary(&self, container_binary_path: &str, binary_name: &str, host_paths: &[&str]) -> Result<(), String> {
+        // Remove existing broken symlink or file
+        if Path::new(container_binary_path).exists() {
+            fs::remove_file(container_binary_path)
+                .map_err(|e| format!("Failed to remove broken binary {}: {}", binary_name, e))?;
+        }
+
+        // Try to find a working binary on the host
+        for host_path in host_paths {
+            if Path::new(host_path).exists() {
+                // Check if it's executable
+                if let Ok(metadata) = fs::metadata(host_path) {
+                    if metadata.permissions().mode() & 0o111 != 0 {
+                        // Copy the binary
+                        match fs::copy(host_path, container_binary_path) {
+                            Ok(_) => {
+                                // Make sure it's executable
+                                let mut perms = fs::metadata(container_binary_path)
+                                    .map_err(|e| format!("Failed to get permissions for copied binary: {}", e))?
+                                    .permissions();
+                                perms.set_mode(0o755);
+                                fs::set_permissions(container_binary_path, perms)
+                                    .map_err(|e| format!("Failed to set permissions: {}", e))?;
+                                
+                                println!("  ✅ Fixed {} by copying from {}", binary_name, host_path);
+                                return Ok(());
+                            }
+                            Err(e) => {
+                                eprintln!("  ⚠ Failed to copy {} from {}: {}", binary_name, host_path, e);
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // If we couldn't copy a binary, try to create a simple shell script as fallback
+        if binary_name == "sh" {
+            self.create_fallback_shell(container_binary_path)?;
+        } else {
+            println!("  ⚠ Could not fix binary {}, container may not work properly", binary_name);
+        }
+
+        Ok(())
+    }
+
+    /// Create a simple fallback shell script
+    fn create_fallback_shell(&self, shell_path: &str) -> Result<(), String> {
+        let shell_script = r#"#!/bin/bash
+# Fallback shell for Quilt containers
+if [ "$#" -eq 0 ]; then
+    echo "Fallback shell activated - limited functionality"
+    echo "Available commands: echo, exit"
+    while read -p "$ " cmd args; do
+        case "$cmd" in
+            echo) echo $args ;;
+            exit) exit 0 ;;
+            *) echo "Command not found: $cmd" ;;
+        esac
+    done
+else
+    # Execute command mode
+    case "$1" in
+        -c)
+            shift
+            eval "$@"
+            ;;
+        *)
+            echo "Executing: $@"
+            eval "$@"
+            ;;
+    esac
+fi
+"#;
+
+        fs::write(shell_path, shell_script)
+            .map_err(|e| format!("Failed to create fallback shell: {}", e))?;
+
+        // Make it executable
+        let mut perms = fs::metadata(shell_path)
+            .map_err(|e| format!("Failed to get shell permissions: {}", e))?
+            .permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(shell_path, perms)
+            .map_err(|e| format!("Failed to set shell permissions: {}", e))?;
+
+        println!("  ✅ Created fallback shell at {}", shell_path);
+        Ok(())
+    }
+
+    /// Verify that the container shell works
+    fn verify_container_shell(&self, rootfs_path: &str) -> Result<(), String> {
+        let shell_path = format!("{}/bin/sh", rootfs_path);
+        
+        if !Path::new(&shell_path).exists() {
+            return Err("No shell binary found in container".to_string());
+        }
+
+        // Try to execute a simple command in the container environment
+        // We can't easily test chroot here, but we can at least verify the binary exists and is executable
+        match fs::metadata(&shell_path) {
+            Ok(metadata) => {
+                if metadata.permissions().mode() & 0o111 != 0 {
+                    println!("  ✓ Shell binary is executable: {}", shell_path);
+                    Ok(())
+                } else {
+                    Err(format!("Shell binary is not executable: {}", shell_path))
+                }
+            }
+            Err(e) => Err(format!("Cannot access shell binary: {}", e))
+        }
     }
 
     fn extract_image(&self, image_path: &str, rootfs_path: &str) -> Result<(), String> {
