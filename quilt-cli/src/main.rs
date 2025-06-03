@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand};
+use std::collections::HashMap;
 
 pub mod quilt_rpc {
     // Assuming the `quilt` package name was used in the .proto file
@@ -6,12 +7,14 @@ pub mod quilt_rpc {
 }
 use quilt_rpc::quilt_service_client::QuiltServiceClient;
 use quilt_rpc::{
-    CreateContainerRequest,
-    ContainerStatusRequest,
-    LogRequest,
-    StopContainerRequest,
-    RemoveContainerRequest
+    CreateContainerRequest, CreateContainerResponse, GetContainerStatusRequest, ContainerStatusResponse,
+    GetContainerLogsRequest, LogStreamResponse, StopContainerRequest, StopContainerResponse,
+    RemoveContainerRequest, RemoveContainerResponse,
+    // ResourceLimits is nested, imported via its full path if needed or used directly
 };
+// Correct import for ResourceLimits if used directly by type, or use quilt_rpc::create_container_request::ResourceLimits
+use quilt_rpc::create_container_request::ResourceLimits; 
+use quilt_rpc::log_stream_response::LogSource;
 
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
@@ -33,30 +36,34 @@ enum Commands {
     /// if the command or any of its arguments start with a hyphen.
     /// Example: quilt-cli create --image path/to.tar -- /bin/sh -c "echo hello"
     Create {
-        #[clap(long)]
+        #[clap(long, help = "Path to the rootfs image tarball (e.g., alpine.tar.gz)")]
         image_tarball_path: String,
-        #[clap(long, short, num_args = 0.., value_parser = parse_key_val::<String, String>)]
+        #[clap(long, short, help = "Environment variables in KEY=VALUE format", num_args = 0.., value_parser = parse_key_val::<String, String>)]
         env: Vec<(String, String)>,
         /// The command and its arguments to run in the container
-        #[clap(required = true, num_args = 1..)]
+        #[clap(required = true, num_args = 1.., help = "Command and its arguments (e.g., /bin/echo hello world)")]
         command_and_args: Vec<String>,
     },
     /// Get the status of a container
     Status { 
+        #[clap(help = "ID of the container to get status for")]
         container_id: String 
     },
     /// Get logs from a container
     Logs {
+        #[clap(help = "ID of the container to get logs from")]
         container_id: String,
-        #[clap(long, short)]
+        #[clap(long, short, help = "Follow the log output")]
         follow: bool,
     },
     /// Stop a container
     Stop { 
+        #[clap(help = "ID of the container to stop")]
         container_id: String 
     },
     /// Remove a container
     Rm { 
+        #[clap(help = "ID of the container to remove")]
         container_id: String 
     },
 }
@@ -86,52 +93,63 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })?;
 
     match cli.command {
-        Commands::Create { image_tarball_path, env, mut command_and_args } => {
+        Commands::Create { image_tarball_path, env, command_and_args } => {
             println!("CLI: Requesting container creation...");
             
             if command_and_args.is_empty() {
                 eprintln!("Error: Command cannot be empty.");
-                return Ok(()); // Or appropriate error handling
+                std::process::exit(1);
             }
 
-            let command = command_and_args.remove(0); // First element is the command
-            let args = command_and_args; // Remaining elements are the arguments
+            let environment_variables: HashMap<String, String> = env.into_iter().collect();
+            
+            let resource_limits = Some(ResourceLimits { 
+                cpu_cores: 0, 
+                memory_mb: 0, 
+            });
 
-            let env_vars: Vec<String> = env.into_iter().map(|(k, v)| format!("{}={}", k, v)).collect();
             let request = tonic::Request::new(CreateContainerRequest {
                 image_tarball_path,
-                command,
-                args,
-                env_vars,
+                command: command_and_args, 
+                environment_variables,      
+                resource_limits,            
             });
+
             match client.create_container(request).await {
                 Ok(response) => {
-                    let res = response.into_inner();
-                    println!("Container created successfully! ID: {}, Status: {}, Message: {}", res.container_id, res.status, res.message);
+                    let res: CreateContainerResponse = response.into_inner();
+                    println!("Container created successfully! ID: {}, Status: {}", res.container_id, res.status);
                 }
                 Err(e) => eprintln!("Error creating container: {}", e.message()),
             }
         }
         Commands::Status { container_id } => {
             println!("CLI: Requesting status for container {}...", container_id);
-            let request = tonic::Request::new(ContainerStatusRequest { container_id });
+            let request = tonic::Request::new(GetContainerStatusRequest { container_id }); 
             match client.get_container_status(request).await {
                 Ok(response) => {
-                    let res = response.into_inner();
-                    println!("Container Status - ID: {}, Status: {}, Exit Code: {}, Message: {}", res.container_id, res.status, res.exit_code, res.message);
+                    let res: ContainerStatusResponse = response.into_inner();
+                    println!("Container Status - ID: {}, Status: {}, Exit Code: {}, Error: {}", 
+                             res.container_id, res.status, res.exit_code, res.error_message);
                 }
                 Err(e) => eprintln!("Error getting container status: {}", e.message()),
             }
         }
         Commands::Logs { container_id, follow } => {
             println!("CLI: Requesting logs for container {} (follow: {})...", container_id, follow);
-            let request = tonic::Request::new(LogRequest { container_id: container_id.clone(), follow });
+            let request = tonic::Request::new(GetContainerLogsRequest { container_id: container_id.clone(), follow });
             match client.get_container_logs(request).await {
                 Ok(response) => {
-                    let mut stream = response.into_inner();
+                    let mut stream: tonic::Streaming<LogStreamResponse> = response.into_inner();
                     println!("--- Logs for {} ---", container_id);
                     while let Some(log_entry) = stream.message().await? {
-                        println!("{}", log_entry.line);
+                        let source_str = match LogSource::try_from(log_entry.source) {
+                            Ok(LogSource::Stdout) => "STDOUT",
+                            Ok(LogSource::Stderr) => "STDERR",
+                            _ => "UNKNOWN",
+                        };
+                        let content_str = String::from_utf8_lossy(&log_entry.content);
+                        println!("[{}] ({}ns): {}", source_str, log_entry.timestamp_nanos, content_str.trim_end());
                     }
                     println!("--- End of logs for {} ---", container_id);
                 }
@@ -140,22 +158,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::Stop { container_id } => {
             println!("CLI: Requesting to stop container {}...", container_id);
-            let request = tonic::Request::new(StopContainerRequest { container_id });
+            let request = tonic::Request::new(StopContainerRequest { 
+                container_id: container_id.clone(), 
+                timeout_seconds: 0 
+            });
             match client.stop_container(request).await {
                 Ok(response) => {
-                    let res = response.into_inner();
-                    println!("Stop Container - ID: {}, Status: {}, Message: {}", res.container_id, res.status, res.message);
+                    let res: StopContainerResponse = response.into_inner();
+                    println!("Stop Container - ID: {}, Status: {}", res.container_id, res.status);
                 }
                 Err(e) => eprintln!("Error stopping container: {}", e.message()),
             }
         }
         Commands::Rm { container_id } => {
             println!("CLI: Requesting to remove container {}...", container_id);
-            let request = tonic::Request::new(RemoveContainerRequest { container_id });
+            let request = tonic::Request::new(RemoveContainerRequest { 
+                container_id: container_id.clone(), 
+                force: false 
+            });
             match client.remove_container(request).await {
                 Ok(response) => {
-                    let res = response.into_inner();
-                    println!("Remove Container - ID: {}, Status: {}, Message: {}", res.container_id, res.status, res.message);
+                    let res: RemoveContainerResponse = response.into_inner();
+                    println!("Remove Container - ID: {}, Message: {}", res.container_id, res.message);
                 }
                 Err(e) => eprintln!("Error removing container: {}", e.message()),
             }
