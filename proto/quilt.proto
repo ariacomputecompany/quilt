@@ -29,23 +29,23 @@ message CreateContainerRequest {
 }
 
 message CreateContainerResponse {
-    string container_id = 1;
+  string container_id = 1;
     string status = 2; // e.g., "PENDING", "RUNNING"
 }
 
 message GetContainerStatusRequest {
-    string container_id = 1;
+  string container_id = 1;
 }
 
 message ContainerStatusResponse {
-    string container_id = 1;
+  string container_id = 1;
     string status = 2;        // e.g., "RUNNING", "EXITED", "FAILED"
     int32 exit_code = 3;      // Only relevant if status is EXITED
     string error_message = 4; // Only relevant if status is FAILED
 }
 
 message GetContainerLogsRequest {
-    string container_id = 1;
+  string container_id = 1;
     bool follow = 2; // If true, stream logs until container exits
 }
 
@@ -60,21 +60,21 @@ message LogStreamResponse {
 }
 
 message StopContainerRequest {
-    string container_id = 1;
+  string container_id = 1;
     int64 timeout_seconds = 2; // Optional: how long to wait before force killing
 }
 
 message StopContainerResponse {
-    string container_id = 1;
+  string container_id = 1;
     string status = 2; // e.g., "STOPPED"
 }
 
 message RemoveContainerRequest {
-    string container_id = 1;
+  string container_id = 1;
     bool force = 2; // If true, remove even if running (will be stopped first)
 }
 
 message RemoveContainerResponse {
-    string container_id = 1;
+  string container_id = 1;
     string message = 2; // e.g., "Container removed successfully"
 } 

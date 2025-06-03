@@ -2,3 +2,7 @@
 *.log
 .DS_Store
 active_containers/
+
+# Nix-related
+flake.lock
+result*
