@@ -1,12 +1,8 @@
-mod runtime;
-mod namespace;
-mod cgroup;
-mod runtime_manager;
-mod system_runtime;
+mod daemon;
+mod utils;
 
-use runtime::{ContainerRuntime, ContainerConfig, ContainerState};
-use crate::cgroup::CgroupLimits;
-use crate::namespace::NamespaceConfig;
+use daemon::{ContainerRuntime, ContainerConfig, ContainerState, CgroupLimits, NamespaceConfig};
+use utils::console::ConsoleLogger;
 
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -256,18 +252,10 @@ impl QuiltService for QuiltServiceImpl {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("🚀 Starting Quilt Container Runtime Server");
-    println!("Features enabled:");
-    println!("  ✅ Linux Namespaces (PID, Mount, UTS, IPC, Network)");
-    println!("  ✅ Cgroup Resource Management (Memory, CPU, PIDs)");
-    println!("  ✅ Dynamic Runtime Setup Commands (npm, pip, apk, etc.)");
-    println!("  ✅ Container Isolation and Security");
-
     let service = QuiltServiceImpl::new();
-    let addr = "127.0.0.1:50051".parse()?;
+    let addr: std::net::SocketAddr = "127.0.0.1:50051".parse()?;
 
-    println!("🌐 Quilt gRPC server listening on {}", addr);
-    println!("📋 Ready to accept container creation requests...");
+    ConsoleLogger::server_starting(&addr.to_string());
 
     Server::builder()
         .add_service(QuiltServiceServer::new(service))

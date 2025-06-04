@@ -15,6 +15,12 @@ use quilt::{
     ContainerStatus,
 };
 
+// Use validation utilities from utils module
+#[path = "../utils/mod.rs"]
+mod utils;
+use utils::validation::InputValidator;
+use utils::console::ConsoleLogger;
+
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
 #[clap(propagate_version = true)]
@@ -32,8 +38,9 @@ enum Commands {
         #[clap(long, help = "Path to the container image tarball")]
         image_path: String,
         
-        #[clap(long, short, help = "Environment variables in KEY=VALUE format", 
-               num_args = 0.., value_parser = parse_key_val::<String, String>)]
+        #[arg(short, long, action = clap::ArgAction::Append, 
+              help = "Environment variables in KEY=VALUE format",
+              num_args = 0.., value_parser = InputValidator::parse_key_val)]
         env: Vec<(String, String)>,
         
         #[clap(long, help = "Setup commands for dynamic runtime installation (e.g., 'npm: typescript', 'pip: requests')", 
@@ -101,29 +108,6 @@ enum Commands {
         #[clap(long, short, help = "Force removal even if running")]
         force: bool,
     },
-}
-
-/// Parses a KEY=VALUE string into a (String, String) tuple
-fn parse_key_val<T, U>(s: &str) -> Result<(T, U), Box<dyn std::error::Error + Send + Sync + 'static>>
-where
-    T: std::str::FromStr,
-    T::Err: std::error::Error + Send + Sync + 'static,
-    U: std::str::FromStr,
-    U::Err: std::error::Error + Send + Sync + 'static,
-{
-    let pos = s
-        .find('=')
-        .ok_or_else(|| format!("invalid KEY=value: no `=` found in `{}`", s))?;
-    Ok((s[..pos].parse()?, s[pos + 1..].parse()?))
-}
-
-fn status_to_string(status: ContainerStatus) -> &'static str {
-    match status {
-        ContainerStatus::Pending => "PENDING",
-        ContainerStatus::Running => "RUNNING", 
-        ContainerStatus::Exited => "EXITED",
-        ContainerStatus::Failed => "FAILED",
-    }
 }
 
 #[tokio::main]
@@ -215,30 +199,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(response) => {
                     let res: GetContainerStatusResponse = response.into_inner();
                     let status_enum = ContainerStatus::try_from(res.status).unwrap_or(ContainerStatus::Failed);
+                    let status_str = match status_enum {
+                        ContainerStatus::Pending => "PENDING",
+                        ContainerStatus::Running => "RUNNING", 
+                        ContainerStatus::Exited => "EXITED",
+                        ContainerStatus::Failed => "FAILED",
+                    };
                     
-                    println!("📋 Container Status:");
-                    println!("   ID: {}", res.container_id);
-                    println!("   Status: {}", status_to_string(status_enum));
-                    println!("   Created: {}", res.created_at);
-                    println!("   Rootfs: {}", res.rootfs_path);
-                    
-                    if res.pid > 0 {
-                        println!("   PID: {}", res.pid);
-                    }
-                    
-                    if res.exit_code != 0 || status_enum == ContainerStatus::Exited {
-                        println!("   Exit Code: {}", res.exit_code);
-                    }
-                    
-                    if !res.error_message.is_empty() {
-                        println!("   Error: {}", res.error_message);
-                    }
-                    
-                    if res.memory_usage_bytes > 0 {
-                        println!("   Memory Usage: {} bytes ({:.2} MB)", 
-                                res.memory_usage_bytes, 
-                                res.memory_usage_bytes as f64 / 1024.0 / 1024.0);
-                    }
+                    // Use ConsoleLogger for consistent formatting
+                    let created_at_formatted = utils::process::ProcessUtils::format_timestamp(res.created_at);
+                    ConsoleLogger::format_container_status(
+                        &res.container_id,
+                        status_str,
+                        &created_at_formatted,
+                        &res.rootfs_path,
+                        if res.pid > 0 { Some(res.pid) } else { None },
+                        if res.exit_code != 0 || status_enum == ContainerStatus::Exited { Some(res.exit_code) } else { None },
+                        &res.error_message,
+                        if res.memory_usage_bytes > 0 { Some(res.memory_usage_bytes) } else { None },
+                    );
                 }
                 Err(e) => {
                     eprintln!("❌ Error getting container status: {}", e.message());
@@ -258,19 +237,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         println!("📝 No logs available for container {}", container_id);
                     } else {
                         println!("📝 Logs for container {}:", container_id);
-                        println!("{}", "─".repeat(60));
+                        ConsoleLogger::separator();
                         
                         for log_entry in res.logs {
                             let timestamp = log_entry.timestamp;
                             let message = log_entry.message;
                             
-                            // Convert timestamp to human readable format
-                            let datetime = std::time::UNIX_EPOCH + std::time::Duration::from_secs(timestamp);
-                            let formatted_time = humantime::format_rfc3339_seconds(datetime);
+                            // Convert timestamp to human readable format  
+                            let formatted_time = utils::process::ProcessUtils::format_timestamp(timestamp);
                             
                             println!("[{}] {}", formatted_time, message);
                         }
-                        println!("{}", "─".repeat(60));
+                        ConsoleLogger::separator();
                     }
                 }
                 Err(e) => {

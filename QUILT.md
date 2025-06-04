@@ -1,130 +1,196 @@
-Quilt: Lightweight Container Runtime
+# Quilt
 
-Overview
+## Overview
 
-Quilt is a lightweight, efficient, and flexible container runtime designed to replace traditional container orchestration tools like Docker and Kubernetes within our firmware environment. It is built to handle a large number of ephemeral and long-running containers, support dynamic language environments, and provide robust state management.
+Quilt is a lightweight container runtime built in Rust, designed specifically for agentic firmware environments. It provides a minimal yet powerful containerization solution optimized for efficiency and security.
 
-⸻
+## Architecture
 
-Key Features
+### Core Components
 
-Lightweight and Efficient
-	•	Minimizes resource usage to ensure high performance.
+1. **quiltd** - The container runtime daemon
+   - gRPC server for container management
+   - Linux namespace and cgroup management
+   - Container lifecycle orchestration
 
-Ephemeral and Long-running Containers
-	•	Supports both types of containers with robust state management.
+2. **quilt-cli** - Command-line interface
+   - Container creation and management
+   - Real-time status monitoring
+   - Log streaming capabilities
 
-Dynamic Language Support
-	•	Dynamically downloads and sets up environments for different languages and tools.
+### System Architecture
 
-Integration with Existing Tools
-	•	Seamlessly integrates with package managers and runtime environments.
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                           Host System                            │
+├─────────────────────────────────────────────────────────────────┤
+│                        Quilt Runtime                           │
+│  ┌───────────────┐ ┌───────────────┐ ┌───────────────────────┐   │
+│  │   quiltd      │ │ quilt-cli     │ │  Container Manager    │   │
+│  │  (gRPC API)   │ │ (CLI Client)  │ │                       │   │
+│  └───────────────┘ └───────────────┘ └───────────────────────┘   │
+├─────────────────────────────────────────────────────────────────┤
+│                     Container Layer                            │
+│  ┌───────────────────────────────────────────────────────────┐   │
+│  │                Container Instance                         │   │
+│  │  ┌─────────────┐ ┌─────────────┐ ┌─────────────────────┐ │   │
+│  │  │  Firmware   │ │    OS       │ │   Application       │ │   │
+│  │  │   Layer     │ │             │ │     Logic           │ │   │
+│  │  └─────────────┘ └─────────────┘ └─────────────────────┘ │   │
+│  └───────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────┘
+```
 
-Scalability and Performance
-	•	Highly scalable and performant to handle high loads.
+### Container Runtime Components
 
-Maintenance and Long-term Support
-	•	Built with a strong community and ecosystem for long-term maintenance and support.
+•	**Container Runtime**: The core Quilt runtime (`quiltd`) that manages container lifecycle
+•	**Image Management**: Support for rootfs tarballs and container images
+•	**Operating System**: Linux with namespace and cgroup support
+•	**Namespace Isolation**: Process, mount, network, UTS, and IPC isolation
+•	**Resource Management**: CPU, memory, and process limits via cgroups
 
-⸻
+## Features
 
-Architecture
+### Core Container Management
+- **Container Lifecycle**: Create, start, stop, remove containers
+- **Image Support**: Rootfs tarball extraction and management
+- **Process Isolation**: Linux namespaces (PID, Mount, UTS, IPC, Network)
+- **Resource Limits**: CPU, memory, and process count controls via cgroups
 
-High-Level Architecture
+### Advanced Features
+- **Dynamic Runtime Setup**: Automatic package installation (npm, pip, gem, etc.)
+- **Log Management**: Real-time log capture and streaming
+- **State Tracking**: Comprehensive container state monitoring
+- **Security**: Namespace isolation and resource containment
 
-Host Environment (Firmware VM)
-	•	Operating System: A lightweight Linux distribution (e.g., Alpine Linux) runs on the firmware VM.
-	•	Quilt: Integrated into the firmware, facilitating container management.
+### Developer Experience
+- **gRPC API**: High-performance binary protocol
+- **CLI Interface**: Intuitive command-line tools
+- **Real-time Monitoring**: Live status and log streaming
+- **Nix Integration**: Native Nix development environment support
 
-Container Runtime
-	•	Container Engine: Manages the creation, starting, stopping, and removal of containers.
-	•	Orchestrator: Manages task queues, schedules tasks, and coordinates container lifecycles.
+## Usage Examples
 
-Execution Environments (Containers)
-	•	Ephemeral Containers: Short-lived containers for executing tasks.
-	•	Long-running Containers: Persistent containers for long-running processes.
-	•	Isolation: Each container runs in an isolated environment to ensure tasks do not interfere with each other.
+### Basic Container Operations
 
-Detailed Architecture
+```bash
+# Create and start a container
+quilt-cli create --image /path/to/rootfs.tar.gz --command "echo hello world"
 
-Firmware VM
-	•	Operating System: Alpine Linux
-	•	Quilt: Integrated into the firmware, providing the container runtime and orchestrator.
+# Check container status  
+quilt-cli status <container-id>
 
-Container Engine
-	•	Namespace and Cgroup Management: Uses Linux namespaces and cgroups to isolate processes and manage resources.
-	•	Image Management: Handles the storage and retrieval of container images.
-	•	Container Lifecycle Management: Manages the creation, starting, stopping, and removal of containers.
+# View container logs
+quilt-cli logs <container-id>
 
-Orchestrator
-	•	Task Queue Management: Manages a queue of tasks to be executed.
-	•	Container Scheduling: Schedules tasks to run in containers.
-	•	State Management: Tracks the state of tasks and containers.
-	•	API Interface: Provides an API for submitting tasks and retrieving results.
+# Stop a container
+quilt-cli stop <container-id>
 
-⸻
+# Remove a container
+quilt-cli remove <container-id>
+```
 
-Workflow
+### Advanced Container Creation
 
-Task Submission
-	1.	The agentic runtime submits a task to the Quilt API.
-	2.	The task is added to the task queue.
+```bash
+# Container with environment variables and setup commands
+quilt-cli create \
+  --image /path/to/node-rootfs.tar.gz \
+  --env "NODE_ENV=production" \
+  --env "PORT=3000" \
+  --setup "npm: typescript @types/node" \
+  --memory-limit 512 \
+  --cpu-limit 50.0 \
+  --enable-all-namespaces \
+  -- node server.js
+```
 
-Task Scheduling
-	1.	The orchestrator picks up the task from the queue.
-	2.	It determines the appropriate container type (ephemeral or long-running) and schedules the task.
+### Runtime Environment Setup
 
-Container Creation
-	1.	The container engine creates a new container based on task requirements.
-	2.	The container is configured with the necessary environment and dependencies.
+The runtime supports dynamic package installation:
 
-Task Execution
-	1.	The container executes the task.
-	2.	The orchestrator monitors the container’s progress and captures the output.
+```bash
+# Node.js development environment
+quilt-cli create \
+  --image /path/to/base.tar.gz \
+  --setup "npm: typescript ts-node @types/node" \
+  -- ts-node app.ts
 
-State Management
-	•	For ephemeral containers, the container is stopped and removed after the task completes.
-	•	For long-running containers, the orchestrator manages the lifecycle and ensures the container remains active.
+# Python data science environment  
+quilt-cli create \
+  --image /path/to/python.tar.gz \
+  --setup "pip: pandas numpy matplotlib" \
+  -- python analysis.py
 
-Result Handling
-	•	The orchestrator processes the task result and sends it back to the agentic runtime.
+# Multi-runtime environment
+quilt-cli create \
+  --image /path/to/base.tar.gz \
+  --setup "npm: webpack" \
+  --setup "pip: flask" \
+  -- /bin/sh -c "npm run build && python app.py"
+```
 
-⸻
+## Implementation Details
 
-Example Use Case: Dynamic Language Support
+### Container Creation Process
 
-Scenario: Running a Python Script
-	1.	Task Submission: The agentic runtime receives a task that requires running a Python script.
-	2.	Environment Setup: The runtime spins up an Alpine container and then assesses requirements.
-	3.	Container Execution: The runtime dynamically downloads and sets up the Python environment with the necessary Python packages and runs the script.
-	4.	State Management: The runtime manages the state of the container, including starting, stopping, and monitoring.
-	5.	Result Handling: The runtime captures the output and handles the result.
+1. **Initialization**: Parse container configuration and validate inputs
+2. **Environment Setup**: The runtime assesses requirements and prepares the environment
+3. **Namespace Creation**: Set up Linux namespaces for isolation
+4. **Rootfs Setup**: Extract and prepare the container filesystem
+5. **Process Execution**: Execute the specified command within the container
+6. **Monitoring**: Track container state and capture logs
 
-⸻
+### Resource Management
 
-Example Code Snippet (Rust)
+Quilt uses Linux cgroups to enforce resource limits:
 
-use std::process::Command;
-use std::fs::File;
-use std::io::Write;
-use std::path::Path;
-use std::env;
-use nix::sched::{clone, CloneFlags};
-use nix::unistd::{fork, execvp, ForkResult};
-use std::ffi::CString;
+- **Memory Limits**: Configurable memory usage caps
+- **CPU Limits**: CPU share allocation and quotas  
+- **Process Limits**: Maximum number of processes/threads
+- **Automatic Cleanup**: Resources freed when containers terminate
 
-// Function to set up the Python environment
-fn setup_python_environment() -> Result<(), Box<dyn std::error::Error>> {
-    // Download and install Python
-    Command::new("apk")
-        .args(["add", "--no-cache", "python3", "py3-pip"])
-        .status()?;
-    Ok(())
-}
+### Security Model
 
+- **Namespace Isolation**: Each container runs in isolated namespaces
+- **Resource Containment**: Cgroups prevent resource exhaustion
+- **Minimal Attack Surface**: Lightweight runtime with focused functionality
+- **Process Isolation**: Containers cannot interfere with each other or the host
 
-⸻
+## Development
 
-Summary
+### Building from Source
 
-Quilt provides a robust foundation for running isolated, scalable, and dynamic task containers inside lightweight firmware environments. With an emphasis on efficiency, integration, and long-term maintainability, it enables a powerful runtime model for modern agentic workloads.
+```bash
+# Using Nix (recommended)
+nix develop
+cargo build --release
+
+# Or with standard Rust toolchain
+cargo build --release
+```
+
+### Running Tests
+
+```bash
+cargo test
+```
+
+### Development Environment
+
+Quilt includes a comprehensive Nix flake for development:
+
+```bash
+# Enter development shell
+nix develop
+
+# Build the runtime
+nix build .#quiltd
+
+# Build the CLI
+nix build .#quilt-cli
+```
+
+## License
+
+Quilt is released under the MIT License. See LICENSE file for details.

@@ -3,17 +3,32 @@ name = "quilt"
 version = "0.1.0"
 edition = "2021"
 
+# Binary targets
+[[bin]]
+name = "quilt"
+path = "src/main.rs"
+
+[[bin]]
+name = "cli"
+path = "src/cli/main.rs"
+
 [dependencies]
 tonic = "0.11"
 prost = "0.12"
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1.0", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
-nix = { version = "0.27", features = ["mount", "sched", "process", "signal", "fs", "hostname"] }
+nix = { version = "0.27", features = ["process", "signal", "sched", "mount", "user", "fs", "hostname"] }
 uuid = { version = "1", features = ["v4", "serde"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 tar = "0.4"
 flate2 = "1.0"
+axum = "0.7"
+tower = "0.4"
+# CLI-specific dependencies
+clap = { version = "4.0", features = ["derive"] }
+humantime = "2.1"
+regex = "1.10"
 
 [build-dependencies]
 tonic-build = "0.11"

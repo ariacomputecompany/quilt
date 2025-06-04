@@ -1,6 +1,7 @@
 use std::process::Command;
 use std::collections::HashMap;
-use crate::system_runtime::SystemRuntime;
+use crate::daemon::system::SystemRuntime;
+use crate::utils::{ConsoleLogger, CommandExecutor};
 
 #[derive(Debug, Clone)]
 pub enum Runtime {
@@ -65,7 +66,7 @@ impl RuntimeManager {
 
     /// Initialize the container environment and detect available package manager
     pub fn initialize_container(&mut self) -> Result<(), String> {
-        println!("🚀 Initializing container runtime environment...");
+        ConsoleLogger::progress("Initializing container runtime environment...");
 
         // First, initialize the basic system environment
         self.system_runtime.initialize_container_environment()?;
@@ -75,11 +76,11 @@ impl RuntimeManager {
             Ok(package_manager) => {
                 self.available_package_manager = Some(package_manager.clone());
                 self.system_runtime.prepare_for_package_installation(&package_manager)?;
-                println!("✅ Container runtime environment ready with package manager: {}", package_manager);
+                ConsoleLogger::success(&format!("Container runtime environment ready with package manager: {}", package_manager));
             }
             Err(e) => {
-                eprintln!("⚠️  Warning: {}", e);
-                eprintln!("    Setup commands will be skipped.");
+                ConsoleLogger::warning(&format!("Warning: {}", e));
+                ConsoleLogger::info("Setup commands will be skipped.");
                 self.available_package_manager = None;
             }
         }
@@ -137,9 +138,9 @@ impl RuntimeManager {
         };
 
         for command in commands {
-            println!("Executing setup command: Install {} packages: {}", 
+            ConsoleLogger::progress(&format!("Executing setup command: Install {} packages: {}", 
                     command.runtime.get_name(), 
-                    command.packages.join(", "));
+                    command.packages.join(", ")));
             
             if matches!(command.runtime, Runtime::Nix) {
                 self.handle_nix_packages(&command.packages)?;
@@ -154,24 +155,18 @@ impl RuntimeManager {
 
     /// Handle Nix package specifications
     fn handle_nix_packages(&self, packages: &[String]) -> Result<(), String> {
-        println!("🔧 Processing Nix packages: {:?}", packages);
+        ConsoleLogger::debug(&format!("Processing Nix packages: {:?}", packages));
         
         for package in packages {
-            if let Ok(output) = Command::new("/bin/sh")
-                .arg("-c")
-                .arg(&format!("command -v {} || which {} || ls /bin/{} || ls /usr/bin/{}", package, package, package, package))
-                .output() 
-            {
-                if output.status.success() {
-                    println!("  ✓ Nix package '{}' is available", package);
-                } else {
-                    println!("  ⚠ Nix package '{}' not found in standard locations", package);
-                    println!("    (This is normal for Nix packages - they may be available when needed)");
-                }
+            if CommandExecutor::is_command_available(package) {
+                ConsoleLogger::debug(&format!("Nix package '{}' is available", package));
+            } else {
+                ConsoleLogger::warning(&format!("Nix package '{}' not found in standard locations", package));
+                ConsoleLogger::info("(This is normal for Nix packages - they may be available when needed)");
             }
         }
         
-        println!("✅ Nix packages processed");
+        ConsoleLogger::success("Nix packages processed");
         Ok(())
     }
 
@@ -184,7 +179,7 @@ impl RuntimeManager {
         }
         
         if package_manager == "nix" || package_manager == "none" {
-            println!("  ℹ Runtime {} should be pre-available in this environment", runtime_name);
+            ConsoleLogger::info(&format!("Runtime {} should be pre-available in this environment", runtime_name));
             self.installed_runtimes.insert(runtime_name, runtime.clone());
             return Ok(());
         }
@@ -209,7 +204,7 @@ impl RuntimeManager {
                 self.install_php_runtime(package_manager)?;
             }
             Runtime::Nix => {
-                println!("  ℹ Nix runtime is environment-based, no installation needed");
+                ConsoleLogger::info("Nix runtime is environment-based, no installation needed");
             }
             Runtime::Custom(_) => {
                 return Err("Custom runtime installation not implemented".to_string());
@@ -221,9 +216,8 @@ impl RuntimeManager {
     }
 
     fn install_nodejs_runtime(&self, package_manager: &str) -> Result<(), String> {
-        println!("Installing runtime NodeJs");
+        ConsoleLogger::progress("Installing runtime NodeJs");
         let packages = match package_manager {
-            "apk" => vec!["nodejs", "npm"],
             "apt" => vec!["nodejs", "npm"],
             "yum" | "dnf" => vec!["nodejs", "npm"],
             _ => return Err(format!("NodeJs installation not supported for package manager: {}", package_manager)),
@@ -233,9 +227,8 @@ impl RuntimeManager {
     }
 
     fn install_python_runtime(&self, package_manager: &str) -> Result<(), String> {
-        println!("Installing runtime Python");
+        ConsoleLogger::progress("Installing runtime Python");
         let packages = match package_manager {
-            "apk" => vec!["python3", "py3-pip"],
             "apt" => vec!["python3", "python3-pip"],
             "yum" | "dnf" => vec!["python3", "python3-pip"],
             _ => return Err(format!("Python installation not supported for package manager: {}", package_manager)),
@@ -245,9 +238,8 @@ impl RuntimeManager {
     }
 
     fn install_ruby_runtime(&self, package_manager: &str) -> Result<(), String> {
-        println!("Installing runtime Ruby");
+        ConsoleLogger::progress("Installing runtime Ruby");
         let packages = match package_manager {
-            "apk" => vec!["ruby", "ruby-dev", "ruby-bundler"],
             "apt" => vec!["ruby", "ruby-dev", "bundler"],
             "yum" | "dnf" => vec!["ruby", "ruby-devel", "rubygems"],
             _ => return Err(format!("Ruby installation not supported for package manager: {}", package_manager)),
@@ -257,9 +249,8 @@ impl RuntimeManager {
     }
 
     fn install_go_runtime(&self, package_manager: &str) -> Result<(), String> {
-        println!("Installing runtime Go");
+        ConsoleLogger::progress("Installing runtime Go");
         let packages = match package_manager {
-            "apk" => vec!["go"],
             "apt" => vec!["golang-go"],
             "yum" | "dnf" => vec!["golang"],
             _ => return Err(format!("Go installation not supported for package manager: {}", package_manager)),
@@ -269,9 +260,8 @@ impl RuntimeManager {
     }
 
     fn install_java_runtime(&self, package_manager: &str) -> Result<(), String> {
-        println!("Installing runtime Java");
+        ConsoleLogger::progress("Installing runtime Java");
         let packages = match package_manager {
-            "apk" => vec!["openjdk11", "maven"],
             "apt" => vec!["openjdk-11-jdk", "maven"],
             "yum" | "dnf" => vec!["java-11-openjdk-devel", "maven"],
             _ => return Err(format!("Java installation not supported for package manager: {}", package_manager)),
@@ -281,9 +271,8 @@ impl RuntimeManager {
     }
 
     fn install_php_runtime(&self, package_manager: &str) -> Result<(), String> {
-        println!("Installing runtime PHP");
+        ConsoleLogger::progress("Installing runtime PHP");
         let packages = match package_manager {
-            "apk" => vec!["php", "php-composer", "php-json"],
             "apt" => vec!["php", "composer", "php-json"],
             "yum" | "dnf" => vec!["php", "composer", "php-json"],
             _ => return Err(format!("PHP installation not supported for package manager: {}", package_manager)),
@@ -301,7 +290,7 @@ impl RuntimeManager {
             Runtime::Java => self.install_maven_packages(packages),
             Runtime::Php => self.install_composer_packages(packages),
             Runtime::Nix => {
-                println!("  ℹ Nix packages are pre-installed in environment");
+                ConsoleLogger::info("Nix packages are pre-installed in environment");
                 Ok(())
             }
             Runtime::Custom(_) => {
@@ -309,7 +298,7 @@ impl RuntimeManager {
                     let packages_str: Vec<&str> = packages.iter().map(|s| s.as_str()).collect();
                     self.system_runtime.install_runtime(package_manager, "custom", &packages_str)
                 } else {
-                    println!("  ℹ Custom packages cannot be installed - no package manager available");
+                    ConsoleLogger::info("Custom packages cannot be installed - no package manager available");
                     Ok(())
                 }
             }
@@ -321,7 +310,7 @@ impl RuntimeManager {
             return Ok(());
         }
 
-        println!("📦 Installing npm packages: {}", packages.join(", "));
+        ConsoleLogger::package_installing(packages, "npm");
         
         let mut cmd = Command::new("npm");
         cmd.arg("install").arg("-g");
@@ -330,10 +319,10 @@ impl RuntimeManager {
         match cmd.output() {
             Ok(output) => {
                 if output.status.success() {
-                    println!("✅ Successfully installed npm packages");
+                    ConsoleLogger::package_installed(packages, "npm");
                     let stdout = String::from_utf8_lossy(&output.stdout);
                     if !stdout.trim().is_empty() {
-                        println!("   npm output: {}", stdout.trim());
+                        ConsoleLogger::debug(&format!("npm output: {}", stdout.trim()));
                     }
                     Ok(())
                 } else {
@@ -350,7 +339,7 @@ impl RuntimeManager {
             return Ok(());
         }
 
-        println!("📦 Installing pip packages: {}", packages.join(", "));
+        ConsoleLogger::package_installing(packages, "pip");
         
         let mut cmd = Command::new("pip3");
         cmd.arg("install");
@@ -359,7 +348,7 @@ impl RuntimeManager {
         match cmd.output() {
             Ok(output) => {
                 if output.status.success() {
-                    println!("✅ Successfully installed pip packages");
+                    ConsoleLogger::package_installed(packages, "pip");
                     Ok(())
                 } else {
                     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -375,7 +364,7 @@ impl RuntimeManager {
             return Ok(());
         }
 
-        println!("📦 Installing gem packages: {}", packages.join(", "));
+        ConsoleLogger::package_installing(packages, "gem");
         
         for package in packages {
             let mut cmd = Command::new("gem");
@@ -392,7 +381,7 @@ impl RuntimeManager {
             }
         }
         
-        println!("✅ Successfully installed gem packages");
+        ConsoleLogger::package_installed(packages, "gem");
         Ok(())
     }
 
@@ -401,7 +390,7 @@ impl RuntimeManager {
             return Ok(());
         }
 
-        println!("📦 Installing Go packages: {}", packages.join(", "));
+        ConsoleLogger::package_installing(packages, "go");
         
         for package in packages {
             let mut cmd = Command::new("go");
@@ -418,13 +407,13 @@ impl RuntimeManager {
             }
         }
         
-        println!("✅ Successfully installed Go packages");
+        ConsoleLogger::package_installed(packages, "go");
         Ok(())
     }
 
     fn install_maven_packages(&self, packages: &[String]) -> Result<(), String> {
-        println!("📦 Java/Maven packages requested: {}", packages.join(", "));
-        println!("ℹ️  Java packages typically managed through project files (pom.xml, build.gradle)");
+        ConsoleLogger::debug(&format!("Java/Maven packages requested: {}", packages.join(", ")));
+        ConsoleLogger::info("Java packages typically managed through project files (pom.xml, build.gradle)");
         Ok(())
     }
 
@@ -433,7 +422,7 @@ impl RuntimeManager {
             return Ok(());
         }
 
-        println!("📦 Installing Composer packages: {}", packages.join(", "));
+        ConsoleLogger::package_installing(packages, "composer");
         
         let mut cmd = Command::new("composer");
         cmd.arg("global").arg("require");
@@ -442,7 +431,7 @@ impl RuntimeManager {
         match cmd.output() {
             Ok(output) => {
                 if output.status.success() {
-                    println!("✅ Successfully installed Composer packages");
+                    ConsoleLogger::package_installed(packages, "composer");
                     Ok(())
                 } else {
                     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -459,46 +448,54 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_npm_install_command() {
-        let cmd = SetupCommand::npm_install(vec!["typescript".to_string(), "ts-node".to_string()]);
-        assert_eq!(cmd.command, "npm");
-        assert_eq!(cmd.args, vec!["install", "-g", "typescript", "ts-node"]);
+    fn test_runtime_from_string() {
+        assert!(matches!(Runtime::from_string("nodejs").unwrap(), Runtime::NodeJs));
+        assert!(matches!(Runtime::from_string("python").unwrap(), Runtime::Python));
+        assert!(matches!(Runtime::from_string("nix").unwrap(), Runtime::Nix));
+        assert!(matches!(Runtime::from_string("custom").unwrap(), Runtime::Custom(_)));
     }
 
     #[test]
-    fn test_apk_add_command() {
-        let cmd = SetupCommand::apk_add(vec!["python3".to_string(), "pip".to_string()]);
-        assert_eq!(cmd.command, "apk");
-        assert_eq!(cmd.args, vec!["add", "--no-cache", "python3", "pip"]);
+    fn test_runtime_get_name() {
+        assert_eq!(Runtime::NodeJs.get_name(), "NodeJs");
+        assert_eq!(Runtime::Python.get_name(), "Python");
+        assert_eq!(Runtime::Nix.get_name(), "Nix");
+    }
+
+    #[test]
+    fn test_parse_setup_line() {
+        let manager = RuntimeManager::new();
+        
+        let command = manager.parse_setup_line("nodejs: typescript ts-node").unwrap();
+        assert!(matches!(command.runtime, Runtime::NodeJs));
+        assert_eq!(command.packages, vec!["typescript", "ts-node"]);
+        
+        let command = manager.parse_setup_line("python: requests flask").unwrap();
+        assert!(matches!(command.runtime, Runtime::Python));
+        assert_eq!(command.packages, vec!["requests", "flask"]);
     }
 
     #[test]
     fn test_parse_setup_spec() {
         let manager = RuntimeManager::new();
         let spec = r#"
-            # Install Node.js packages
-            npm: typescript ts-node
-            
-            # Install Python packages  
-            pip: requests beautifulsoup4
-            
-            # Install system packages
-            apk: curl wget
+            nodejs: typescript ts-node
+            python: requests flask
+            nix: curl wget
         "#;
 
         let commands = manager.parse_setup_spec(spec).unwrap();
         assert_eq!(commands.len(), 3);
         
-        assert_eq!(commands[0].command, "npm");
-        assert_eq!(commands[1].command, "pip");
-        assert_eq!(commands[2].command, "apk");
+        assert!(matches!(commands[0].runtime, Runtime::NodeJs));
+        assert!(matches!(commands[1].runtime, Runtime::Python));
+        assert!(matches!(commands[2].runtime, Runtime::Nix));
     }
 
     #[test]
     fn test_runtime_manager_creation() {
         let manager = RuntimeManager::new();
-        assert!(manager.runtime_configs.contains_key(&RuntimeType::NodeJs));
-        assert!(manager.runtime_configs.contains_key(&RuntimeType::Python));
-        assert!(manager.runtime_configs.contains_key(&RuntimeType::Rust));
+        assert!(manager.installed_runtimes.is_empty());
+        assert!(manager.available_package_manager.is_none());
     }
 } 

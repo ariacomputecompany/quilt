@@ -32,7 +32,7 @@ message CreateContainerRequest {
     string working_directory = 4;                  // Working directory inside container
     
     // Setup commands for dynamic runtime installation
-    repeated string setup_commands = 5;            // Setup commands (e.g., "npm: typescript", "apk: python3")
+    repeated string setup_commands = 5;            // Setup commands (e.g., "npm: typescript", "pip: requests")
     
     // Resource limits
     int32 memory_limit_mb = 6;                     // Memory limit in megabytes (0 = default)

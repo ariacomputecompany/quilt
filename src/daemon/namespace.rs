@@ -3,6 +3,7 @@ use nix::unistd::Pid;
 use nix::mount::{mount, MsFlags};
 use nix::sys::wait::{waitpid, WaitStatus};
 use std::path::Path;
+use crate::utils::{ConsoleLogger, ProcessUtils};
 
 #[derive(Debug, Clone)]
 pub struct NamespaceConfig {
@@ -43,7 +44,7 @@ impl NamespaceManager {
     {
         let clone_flags = self.build_clone_flags(config);
         
-        println!("Creating namespaced process with flags: {:?}", clone_flags);
+        ConsoleLogger::namespace_created(&format!("{:?}", clone_flags));
 
         // If no namespaces are requested, just use regular fork
         if clone_flags.is_empty() {
@@ -54,12 +55,12 @@ impl NamespaceManager {
         // If that fails, fall back to simple fork
         match self.try_create_with_namespaces(clone_flags, child_func) {
             Ok(pid) => {
-                println!("Successfully created namespaced process with PID: {}", pid);
+                ConsoleLogger::success(&format!("Successfully created namespaced process with PID: {}", ProcessUtils::pid_to_i32(pid)));
                 Ok(pid)
             }
             Err(e) => {
-                eprintln!("Namespace creation failed: {}", e);
-                eprintln!("Falling back to simple fork without namespaces...");
+                ConsoleLogger::warning(&format!("Namespace creation failed: {}", e));
+                ConsoleLogger::info("Falling back to simple fork without namespaces...");
                 
                 // Note: child_func was consumed in the failed attempt, so we create a simple process
                 // that will just exit cleanly
@@ -102,12 +103,12 @@ impl NamespaceManager {
     fn create_fallback_process(&self) -> Result<Pid, String> {
         match unsafe { nix::unistd::fork() } {
             Ok(nix::unistd::ForkResult::Parent { child }) => {
-                println!("Created fallback process with PID: {}", child);
+                ConsoleLogger::info(&format!("Created fallback process with PID: {}", ProcessUtils::pid_to_i32(child)));
                 Ok(child)
             }
             Ok(nix::unistd::ForkResult::Child) => {
                 // Child process - just exit with failure
-                eprintln!("Fallback process: namespace creation failed");
+                ConsoleLogger::error("Fallback process: namespace creation failed");
                 std::process::exit(1);
             }
             Err(e) => {
@@ -123,7 +124,7 @@ impl NamespaceManager {
     {
         match unsafe { nix::unistd::fork() } {
             Ok(nix::unistd::ForkResult::Parent { child }) => {
-                println!("Successfully created simple process with PID: {}", child);
+                ConsoleLogger::success(&format!("Successfully created simple process with PID: {}", ProcessUtils::pid_to_i32(child)));
                 Ok(child)
             }
             Ok(nix::unistd::ForkResult::Child) => {
@@ -162,7 +163,7 @@ impl NamespaceManager {
 
     /// Setup the mount namespace for a container
     pub fn setup_mount_namespace(&self, rootfs_path: &str) -> Result<(), String> {
-        println!("Setting up mount namespace for rootfs: {}", rootfs_path);
+        ConsoleLogger::debug(&format!("Setting up mount namespace for rootfs: {}", rootfs_path));
 
         // Make the mount namespace private to prevent propagation to host
         if let Err(e) = mount(
@@ -172,7 +173,7 @@ impl NamespaceManager {
             MsFlags::MS_REC | MsFlags::MS_PRIVATE,
             None::<&str>,
         ) {
-            eprintln!("Warning: Failed to make mount namespace private: {}", e);
+            ConsoleLogger::warning(&format!("Failed to make mount namespace private: {}", e));
             // Continue anyway - this might fail in restricted environments
         }
 
@@ -184,7 +185,7 @@ impl NamespaceManager {
             MsFlags::MS_BIND,
             None::<&str>,
         ) {
-            eprintln!("Warning: Failed to bind mount rootfs: {}", e);
+            ConsoleLogger::warning(&format!("Failed to bind mount rootfs: {}", e));
             // Continue anyway - this might fail in restricted environments
         }
 
@@ -199,9 +200,9 @@ impl NamespaceManager {
                 None::<&str>,
             ) {
                 // Non-fatal error - log and continue
-                eprintln!("Warning: Failed to mount /proc in container: {}", e);
+                ConsoleLogger::warning(&format!("Failed to mount /proc in container: {}", e));
             } else {
-                println!("Successfully mounted /proc in container");
+                ConsoleLogger::success("Successfully mounted /proc in container");
             }
         }
 
@@ -216,9 +217,9 @@ impl NamespaceManager {
                 None::<&str>,
             ) {
                 // Non-fatal error - log and continue
-                eprintln!("Warning: Failed to mount /sys in container: {}", e);
+                ConsoleLogger::warning(&format!("Failed to mount /sys in container: {}", e));
             } else {
-                println!("Successfully mounted /sys in container");
+                ConsoleLogger::success("Successfully mounted /sys in container");
             }
         }
 
@@ -233,9 +234,9 @@ impl NamespaceManager {
                 Some("newinstance,ptmxmode=0666"),
             ) {
                 // Non-fatal error - log and continue
-                eprintln!("Warning: Failed to mount /dev/pts in container: {}", e);
+                ConsoleLogger::warning(&format!("Failed to mount /dev/pts in container: {}", e));
             } else {
-                println!("Successfully mounted /dev/pts in container");
+                ConsoleLogger::success("Successfully mounted /dev/pts in container");
             }
         }
 
@@ -286,27 +287,29 @@ impl NamespaceManager {
         }
     }
 
-    /// Wait for a namespaced process to complete
+    /// Wait for a process to complete and return its exit code
     pub fn wait_for_process(&self, pid: Pid) -> Result<i32, String> {
+        ConsoleLogger::debug(&format!("Waiting for process {} to complete", ProcessUtils::pid_to_i32(pid)));
+
         match waitpid(pid, None) {
             Ok(WaitStatus::Exited(_, exit_code)) => {
-                println!("Namespaced process {} exited with code: {}", pid, exit_code);
+                ConsoleLogger::success(&format!("Process {} exited with code: {}", ProcessUtils::pid_to_i32(pid), exit_code));
                 Ok(exit_code)
             }
             Ok(WaitStatus::Signaled(_, signal, _)) => {
-                let error_msg = format!("Namespaced process {} killed by signal: {:?}", pid, signal);
-                eprintln!("{}", error_msg);
-                Err(error_msg)
+                let msg = format!("Process {} was terminated by signal: {:?}", ProcessUtils::pid_to_i32(pid), signal);
+                ConsoleLogger::warning(&msg);
+                Err(msg)
             }
             Ok(status) => {
-                let error_msg = format!("Namespaced process {} stopped with status: {:?}", pid, status);
-                eprintln!("{}", error_msg);
-                Err(error_msg)
+                let msg = format!("Process {} ended with unexpected status: {:?}", ProcessUtils::pid_to_i32(pid), status);
+                ConsoleLogger::warning(&msg);
+                Err(msg)
             }
             Err(e) => {
-                let error_msg = format!("Failed to wait for namespaced process {}: {}", pid, e);
-                eprintln!("{}", error_msg);
-                Err(error_msg)
+                let msg = format!("Failed to wait for process {}: {}", ProcessUtils::pid_to_i32(pid), e);
+                ConsoleLogger::error(&msg);
+                Err(msg)
             }
         }
     }
@@ -333,6 +336,7 @@ mod tests {
         
         // Test with all flags enabled
         config.pid = true;
+        config.uts = true;  // Enable UTS to test the flag
         config.ipc = true;
         config.network = true;
         
@@ -351,8 +355,9 @@ mod tests {
         let config = NamespaceConfig::default();
         let flags = manager.build_clone_flags(&config);
         
+        // With default config, only mount namespace is enabled
         assert!(flags.contains(CloneFlags::CLONE_NEWNS));
-        assert!(flags.contains(CloneFlags::CLONE_NEWUTS));
+        assert!(!flags.contains(CloneFlags::CLONE_NEWUTS));  // UTS is disabled by default
         assert!(!flags.contains(CloneFlags::CLONE_NEWPID));
         assert!(!flags.contains(CloneFlags::CLONE_NEWIPC));
         assert!(!flags.contains(CloneFlags::CLONE_NEWNET));

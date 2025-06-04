@@ -106,7 +106,7 @@ find_binaries() {
     log "Found server binary: $SERVER_BINARY"
     
     # Find CLI binary  
-    CLI_BINARY=$(find ./quilt-cli/target -name "quilt-cli" -type f -executable 2>/dev/null | head -1)
+    CLI_BINARY=$(find ./target -name "cli" -type f -executable 2>/dev/null | head -1)
     if [ -z "$CLI_BINARY" ]; then
         fail "CLI binary not found"
         return 1

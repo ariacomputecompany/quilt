@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::PathBuf;
 use nix::unistd::Pid;
+use crate::utils::{ConsoleLogger, ProcessUtils};
 
 #[derive(Debug, Clone)]
 pub struct CgroupLimits {
@@ -65,7 +66,7 @@ impl CgroupManager {
 
     /// Create cgroups for the container with specified limits
     pub fn create_cgroups(&self, limits: &CgroupLimits) -> Result<(), String> {
-        println!("Creating cgroups for container: {}", self.container_id);
+        ConsoleLogger::debug(&format!("Creating cgroups for container: {}", self.container_id));
 
         // Validate and adjust limits
         let validated_limits = limits.clone().validated();
@@ -83,7 +84,7 @@ impl CgroupManager {
 
     /// Create cgroup v2 (unified hierarchy)
     fn create_cgroup_v2(&self, limits: &CgroupLimits) -> Result<(), String> {
-        println!("Using cgroup v2 for container: {}", self.container_id);
+        ConsoleLogger::debug(&format!("Using cgroup v2 for container: {}", self.container_id));
 
         let container_cgroup = self.cgroup_root.join("quilt").join(&self.container_id);
         
@@ -97,7 +98,7 @@ impl CgroupManager {
         if parent_cgroup.exists() {
             let subtree_control = parent_cgroup.join("cgroup.subtree_control");
             if let Err(e) = fs::write(&subtree_control, "+memory +cpu +pids") {
-                eprintln!("Warning: Failed to enable controllers in parent cgroup: {}", e);
+                ConsoleLogger::warning(&format!("Failed to enable controllers in parent cgroup: {}", e));
             }
         }
 
@@ -107,19 +108,19 @@ impl CgroupManager {
             if let Some(memory_limit) = limits.memory_limit_bytes {
                 let memory_max = container_cgroup.join("memory.max");
                 if let Err(e) = fs::write(&memory_max, memory_limit.to_string()) {
-                    eprintln!("Warning: Failed to set memory limit: {}", e);
+                    ConsoleLogger::warning(&format!("Failed to set memory limit: {}", e));
                 } else {
-                    println!("Set memory limit to {} bytes", memory_limit);
+                    ConsoleLogger::resource_limit_set("memory", &format!("{} bytes", memory_limit));
                 }
 
                 // Set memory.swap.max to prevent swap thrashing
                 let memory_swap_max = container_cgroup.join("memory.swap.max");
                 if let Err(e) = fs::write(&memory_swap_max, "0") {
-                    eprintln!("Warning: Failed to disable swap: {}", e);
+                    ConsoleLogger::warning(&format!("Failed to disable swap: {}", e));
                 }
             }
         } else {
-            println!("Skipping memory limits during initialization to prevent fork failures");
+            ConsoleLogger::debug("Skipping memory limits during initialization to prevent fork failures");
         }
 
         // Set CPU limits (these are generally safe during initialization)
@@ -132,9 +133,9 @@ impl CgroupManager {
                     "max".to_string()
                 };
                 if let Err(e) = fs::write(&cpu_max, cpu_config) {
-                    eprintln!("Warning: Failed to set CPU limit: {}", e);
+                    ConsoleLogger::warning(&format!("Failed to set CPU limit: {}", e));
                 } else {
-                    println!("Set CPU quota to {} microseconds per {} microseconds", cpu_quota, cpu_period);
+                    ConsoleLogger::resource_limit_set("CPU quota", &format!("{} microseconds per {} microseconds", cpu_quota, cpu_period));
                 }
             }
         }
@@ -145,9 +146,9 @@ impl CgroupManager {
             // Convert shares to weight (shares 1024 = weight 100)
             let weight = (cpu_shares * 100) / 1024;
             if let Err(e) = fs::write(&cpu_weight, weight.to_string()) {
-                eprintln!("Warning: Failed to set CPU weight: {}", e);
+                ConsoleLogger::warning(&format!("Failed to set CPU weight: {}", e));
             } else {
-                println!("Set CPU weight to {}", weight);
+                ConsoleLogger::resource_limit_set("CPU weight", &weight.to_string());
             }
         }
 
@@ -160,9 +161,9 @@ impl CgroupManager {
                 pids_limit
             };
             if let Err(e) = fs::write(&pids_max, effective_pids_limit.to_string()) {
-                eprintln!("Warning: Failed to set PIDs limit: {}", e);
+                ConsoleLogger::warning(&format!("Failed to set PIDs limit: {}", e));
             } else {
-                println!("Set PIDs limit to {}", effective_pids_limit);
+                ConsoleLogger::resource_limit_set("PIDs limit", &effective_pids_limit.to_string());
             }
         }
 
@@ -171,7 +172,7 @@ impl CgroupManager {
 
     /// Create cgroup v1 (legacy hierarchy)
     fn create_cgroup_v1(&self, limits: &CgroupLimits) -> Result<(), String> {
-        println!("Using cgroup v1 for container: {}", self.container_id);
+        ConsoleLogger::debug(&format!("Using cgroup v1 for container: {}", self.container_id));
 
         // Skip memory cgroup creation during initialization to prevent fork failures
         if !self.initialization_mode {
@@ -179,38 +180,38 @@ impl CgroupManager {
             if let Some(memory_limit) = limits.memory_limit_bytes {
                 let memory_cgroup = self.cgroup_root.join("memory/quilt").join(&self.container_id);
                 if let Err(e) = fs::create_dir_all(&memory_cgroup) {
-                    eprintln!("Warning: Failed to create memory cgroup: {}", e);
+                    ConsoleLogger::warning(&format!("Failed to create memory cgroup: {}", e));
                 } else {
                     let memory_limit_file = memory_cgroup.join("memory.limit_in_bytes");
                     if let Err(e) = fs::write(&memory_limit_file, memory_limit.to_string()) {
-                        eprintln!("Warning: Failed to set memory limit: {}", e);
+                        ConsoleLogger::warning(&format!("Failed to set memory limit: {}", e));
                     } else {
-                        println!("Set memory limit to {} bytes", memory_limit);
+                        ConsoleLogger::resource_limit_set("memory", &format!("{} bytes", memory_limit));
                     }
 
                     // Disable memory swapping
                     let memory_swappiness = memory_cgroup.join("memory.swappiness");
                     if let Err(e) = fs::write(&memory_swappiness, "0") {
-                        eprintln!("Warning: Failed to set memory swappiness: {}", e);
+                        ConsoleLogger::warning(&format!("Failed to set memory swappiness: {}", e));
                     }
                 }
             }
         } else {
-            println!("Skipping memory cgroup during initialization to prevent fork failures");
+            ConsoleLogger::debug("Skipping memory cgroup during initialization to prevent fork failures");
         }
 
         // CPU cgroup (generally safe during initialization)
         let cpu_cgroup = self.cgroup_root.join("cpu/quilt").join(&self.container_id);
         if let Err(e) = fs::create_dir_all(&cpu_cgroup) {
-            eprintln!("Warning: Failed to create CPU cgroup: {}", e);
+            ConsoleLogger::warning(&format!("Failed to create CPU cgroup: {}", e));
         } else {
             // Set CPU shares
             if let Some(cpu_shares) = limits.cpu_shares {
                 let cpu_shares_file = cpu_cgroup.join("cpu.shares");
                 if let Err(e) = fs::write(&cpu_shares_file, cpu_shares.to_string()) {
-                    eprintln!("Warning: Failed to set CPU shares: {}", e);
+                    ConsoleLogger::warning(&format!("Failed to set CPU shares: {}", e));
                 } else {
-                    println!("Set CPU shares to {}", cpu_shares);
+                    ConsoleLogger::resource_limit_set("CPU shares", &cpu_shares.to_string());
                 }
             }
 
@@ -218,9 +219,9 @@ impl CgroupManager {
             if let Some(cpu_quota) = limits.cpu_quota {
                 let cpu_quota_file = cpu_cgroup.join("cpu.cfs_quota_us");
                 if let Err(e) = fs::write(&cpu_quota_file, cpu_quota.to_string()) {
-                    eprintln!("Warning: Failed to set CPU quota: {}", e);
+                    ConsoleLogger::warning(&format!("Failed to set CPU quota: {}", e));
                 } else {
-                    println!("Set CPU quota to {} microseconds", cpu_quota);
+                    ConsoleLogger::resource_limit_set("CPU quota", &format!("{} microseconds", cpu_quota));
                 }
             }
 
@@ -228,9 +229,9 @@ impl CgroupManager {
             if let Some(cpu_period) = limits.cpu_period {
                 let cpu_period_file = cpu_cgroup.join("cpu.cfs_period_us");
                 if let Err(e) = fs::write(&cpu_period_file, cpu_period.to_string()) {
-                    eprintln!("Warning: Failed to set CPU period: {}", e);
+                    ConsoleLogger::warning(&format!("Failed to set CPU period: {}", e));
                 } else {
-                    println!("Set CPU period to {} microseconds", cpu_period);
+                    ConsoleLogger::resource_limit_set("CPU period", &format!("{} microseconds", cpu_period));
                 }
             }
         }
@@ -239,7 +240,7 @@ impl CgroupManager {
         if let Some(pids_limit) = limits.pids_limit {
             let pids_cgroup = self.cgroup_root.join("pids/quilt").join(&self.container_id);
             if let Err(e) = fs::create_dir_all(&pids_cgroup) {
-                eprintln!("Warning: Failed to create PIDs cgroup: {}", e);
+                ConsoleLogger::warning(&format!("Failed to create PIDs cgroup: {}", e));
             } else {
                 let effective_pids_limit = if self.initialization_mode {
                     std::cmp::max(pids_limit, 512) // Ensure at least 512 PIDs during init
@@ -248,9 +249,9 @@ impl CgroupManager {
                 };
                 let pids_limit_file = pids_cgroup.join("pids.max");
                 if let Err(e) = fs::write(&pids_limit_file, effective_pids_limit.to_string()) {
-                    eprintln!("Warning: Failed to set PIDs limit: {}", e);
+                    ConsoleLogger::warning(&format!("Failed to set PIDs limit: {}", e));
                 } else {
-                    println!("Set PIDs limit to {}", effective_pids_limit);
+                    ConsoleLogger::resource_limit_set("PIDs limit", &effective_pids_limit.to_string());
                 }
             }
         }
@@ -264,7 +265,7 @@ impl CgroupManager {
             return Ok(()); // Already finalized
         }
 
-        println!("Finalizing cgroup limits for container: {}", self.container_id);
+        ConsoleLogger::debug(&format!("Finalizing cgroup limits for container: {}", self.container_id));
         self.initialization_mode = false;
 
         // Apply final memory limits without headroom
@@ -276,17 +277,17 @@ impl CgroupManager {
                 let container_cgroup = self.cgroup_root.join("quilt").join(&self.container_id);
                 let memory_max = container_cgroup.join("memory.max");
                 if let Err(e) = fs::write(&memory_max, memory_limit.to_string()) {
-                    eprintln!("Warning: Failed to finalize memory limit: {}", e);
+                    ConsoleLogger::warning(&format!("Failed to finalize memory limit: {}", e));
                 } else {
-                    println!("Finalized memory limit to {} bytes", memory_limit);
+                    ConsoleLogger::resource_limit_set("finalized memory", &format!("{} bytes", memory_limit));
                 }
             } else {
                 let memory_cgroup = self.cgroup_root.join("memory/quilt").join(&self.container_id);
                 let memory_limit_file = memory_cgroup.join("memory.limit_in_bytes");
                 if let Err(e) = fs::write(&memory_limit_file, memory_limit.to_string()) {
-                    eprintln!("Warning: Failed to finalize memory limit: {}", e);
+                    ConsoleLogger::warning(&format!("Failed to finalize memory limit: {}", e));
                 } else {
-                    println!("Finalized memory limit to {} bytes", memory_limit);
+                    ConsoleLogger::resource_limit_set("finalized memory", &format!("{} bytes", memory_limit));
                 }
             }
         }
@@ -296,7 +297,8 @@ impl CgroupManager {
 
     /// Add a process to the container's cgroups
     pub fn add_process(&self, pid: Pid) -> Result<(), String> {
-        println!("Adding process {} to cgroups for container: {}", pid, self.container_id);
+        ConsoleLogger::debug(&format!("Adding process {} to cgroups for container: {}", 
+                                    ProcessUtils::pid_to_i32(pid), self.container_id));
 
         let cgroup_v2_path = self.cgroup_root.join("cgroup.controllers");
         let use_cgroup_v2 = cgroup_v2_path.exists();
@@ -313,24 +315,24 @@ impl CgroupManager {
         let container_cgroup = self.cgroup_root.join("quilt").join(&self.container_id);
         let cgroup_procs = container_cgroup.join("cgroup.procs");
         
-        if let Err(e) = fs::write(&cgroup_procs, pid.to_string()) {
-            return Err(format!("Failed to add process {} to cgroup v2: {}", pid, e));
+        if let Err(e) = fs::write(&cgroup_procs, ProcessUtils::pid_to_i32(pid).to_string()) {
+            return Err(format!("Failed to add process {} to cgroup v2: {}", ProcessUtils::pid_to_i32(pid), e));
         }
 
-        println!("Successfully added process {} to cgroup v2", pid);
+        ConsoleLogger::debug(&format!("Successfully added process {} to cgroup v2", ProcessUtils::pid_to_i32(pid)));
         Ok(())
     }
 
     /// Add process to cgroup v1
     fn add_process_v1(&self, pid: Pid) -> Result<(), String> {
-        let pid_str = pid.to_string();
+        let pid_str = ProcessUtils::pid_to_i32(pid).to_string();
 
         // Add to memory cgroup
         let memory_cgroup = self.cgroup_root.join("memory/quilt").join(&self.container_id);
         if memory_cgroup.exists() {
             let memory_tasks = memory_cgroup.join("tasks");
             if let Err(e) = fs::write(&memory_tasks, &pid_str) {
-                eprintln!("Warning: Failed to add process to memory cgroup: {}", e);
+                ConsoleLogger::warning(&format!("Failed to add process to memory cgroup: {}", e));
             }
         }
 
@@ -339,7 +341,7 @@ impl CgroupManager {
         if cpu_cgroup.exists() {
             let cpu_tasks = cpu_cgroup.join("tasks");
             if let Err(e) = fs::write(&cpu_tasks, &pid_str) {
-                eprintln!("Warning: Failed to add process to CPU cgroup: {}", e);
+                ConsoleLogger::warning(&format!("Failed to add process to CPU cgroup: {}", e));
             }
         }
 
@@ -348,11 +350,11 @@ impl CgroupManager {
         if pids_cgroup.exists() {
             let pids_tasks = pids_cgroup.join("tasks");
             if let Err(e) = fs::write(&pids_tasks, &pid_str) {
-                eprintln!("Warning: Failed to add process to PIDs cgroup: {}", e);
+                ConsoleLogger::warning(&format!("Failed to add process to PIDs cgroup: {}", e));
             }
         }
 
-        println!("Successfully added process {} to cgroup v1", pid);
+        ConsoleLogger::debug(&format!("Successfully added process {} to cgroup v1", ProcessUtils::pid_to_i32(pid)));
         Ok(())
     }
 
@@ -384,7 +386,7 @@ impl CgroupManager {
 
     /// Remove the container's cgroups
     pub fn cleanup(&self) -> Result<(), String> {
-        println!("Cleaning up cgroups for container: {}", self.container_id);
+        ConsoleLogger::debug(&format!("Cleaning up cgroups for container: {}", self.container_id));
 
         let cgroup_v2_path = self.cgroup_root.join("cgroup.controllers");
         let use_cgroup_v2 = cgroup_v2_path.exists();
@@ -393,9 +395,9 @@ impl CgroupManager {
             let container_cgroup = self.cgroup_root.join("quilt").join(&self.container_id);
             if container_cgroup.exists() {
                 if let Err(e) = fs::remove_dir(&container_cgroup) {
-                    eprintln!("Warning: Failed to remove cgroup v2 directory: {}", e);
+                    ConsoleLogger::warning(&format!("Failed to remove cgroup v2 directory: {}", e));
                 } else {
-                    println!("Successfully removed cgroup v2 directory");
+                    ConsoleLogger::debug("Successfully removed cgroup v2 directory");
                 }
             }
         } else {
@@ -405,7 +407,7 @@ impl CgroupManager {
                 let cgroup_path = self.cgroup_root.join(format!("{}/quilt", cgroup_type)).join(&self.container_id);
                 if cgroup_path.exists() {
                     if let Err(e) = fs::remove_dir(&cgroup_path) {
-                        eprintln!("Warning: Failed to remove {} cgroup directory: {}", cgroup_type, e);
+                        ConsoleLogger::warning(&format!("Failed to remove {} cgroup directory: {}", cgroup_type, e));
                     }
                 }
             }

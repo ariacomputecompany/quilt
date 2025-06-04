@@ -1,12 +1,12 @@
-use crate::namespace::{NamespaceManager, NamespaceConfig};
-use crate::cgroup::{CgroupManager, CgroupLimits};
-use crate::runtime_manager::RuntimeManager;
+use crate::daemon::namespace::{NamespaceManager, NamespaceConfig};
+use crate::daemon::cgroup::{CgroupManager, CgroupLimits};
+use crate::daemon::manager::RuntimeManager;
+use crate::utils::{ConsoleLogger, FileSystemUtils, CommandExecutor, ProcessUtils};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::process::Command;
 use std::fs;
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
 use flate2::read::GzDecoder;
 use tar::Archive;
 use nix::unistd::{chroot, chdir, Pid, execv};
@@ -67,10 +67,7 @@ pub struct Container {
 
 impl Container {
     pub fn new(id: String, config: ContainerConfig) -> Self {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+        let timestamp = ProcessUtils::get_timestamp();
 
         Container {
             id: id.clone(),
@@ -84,10 +81,7 @@ impl Container {
     }
 
     pub fn add_log(&mut self, message: String) {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+        let timestamp = ProcessUtils::get_timestamp();
 
         self.logs.push(LogEntry {
             timestamp,
@@ -112,7 +106,7 @@ impl ContainerRuntime {
     }
 
     pub fn create_container(&self, id: String, config: ContainerConfig) -> Result<(), String> {
-        println!("Creating container: {}", id);
+        ConsoleLogger::progress(&format!("Creating container: {}", id));
 
         // Create container instance
         let container = Container::new(id.clone(), config);
@@ -129,12 +123,12 @@ impl ContainerRuntime {
         // Update state to PENDING
         self.update_container_state(&id, ContainerState::PENDING);
 
-        println!("✅ Container {} created successfully", id);
+        ConsoleLogger::container_created(&id);
         Ok(())
     }
 
     pub fn start_container(&self, id: &str) -> Result<(), String> {
-        println!("Starting container: {}", id);
+        ConsoleLogger::progress(&format!("Starting container: {}", id));
 
         // Get container config
         let (config, rootfs_path) = {
@@ -148,7 +142,7 @@ impl ContainerRuntime {
         let mut cgroup_manager = CgroupManager::new(id.to_string());
         if let Some(limits) = &config.resource_limits {
             if let Err(e) = cgroup_manager.create_cgroups(limits) {
-                eprintln!("Warning: Failed to create cgroups: {}", e);
+                ConsoleLogger::warning(&format!("Failed to create cgroups: {}", e));
             }
         }
 
@@ -302,17 +296,17 @@ impl ContainerRuntime {
         // Create the namespaced process
         match self.namespace_manager.create_namespaced_process(&namespace_config, child_func) {
             Ok(pid) => {
-                println!("Container {} started with PID: {}", id, pid);
+                ConsoleLogger::container_started(id, Some(ProcessUtils::pid_to_i32(pid)));
                 
                 // Add process to cgroups
                 if let Err(e) = cgroup_manager.add_process(pid) {
-                    eprintln!("Warning: Failed to add process to cgroups: {}", e);
+                    ConsoleLogger::warning(&format!("Failed to add process to cgroups: {}", e));
                 }
 
                 // Finalize cgroup limits after process is started
                 if let Some(limits) = &config.resource_limits {
                     if let Err(e) = cgroup_manager.finalize_limits(limits) {
-                        eprintln!("Warning: Failed to finalize cgroup limits: {}", e);
+                        ConsoleLogger::warning(&format!("Failed to finalize cgroup limits: {}", e));
                     }
                 }
 
@@ -335,7 +329,7 @@ impl ContainerRuntime {
                 tokio::spawn(async move {
                     match namespace_manager_clone.wait_for_process(pid) {
                         Ok(exit_code) => {
-                            println!("Container {} exited with code: {}", id_clone, exit_code);
+                            ConsoleLogger::success(&format!("Container {} exited with code: {}", id_clone, exit_code));
                             let mut containers = containers_clone.lock().unwrap();
                             if let Some(container) = containers.get_mut(&id_clone) {
                                 container.state = ContainerState::EXITED(exit_code);
@@ -344,7 +338,7 @@ impl ContainerRuntime {
                             }
                         }
                         Err(e) => {
-                            eprintln!("Container {} failed: {}", id_clone, e);
+                            ConsoleLogger::container_failed(&id_clone, &e);
                             let mut containers = containers_clone.lock().unwrap();
                             if let Some(container) = containers.get_mut(&id_clone) {
                                 container.state = ContainerState::FAILED(e.clone());
@@ -356,7 +350,7 @@ impl ContainerRuntime {
 
                     // Cleanup cgroups
                     if let Err(e) = cgroup_manager_clone.cleanup() {
-                        eprintln!("Warning: Failed to cleanup cgroups for {}: {}", id_clone, e);
+                        ConsoleLogger::warning(&format!("Failed to cleanup cgroups for {}: {}", id_clone, e));
                     }
                 });
 
@@ -377,15 +371,14 @@ impl ContainerRuntime {
         let rootfs_path = &container.rootfs_path;
         let image_path = &container.config.image_path;
 
-        println!("Setting up rootfs for container {} at {}", container_id, rootfs_path);
+        ConsoleLogger::progress(&format!("Setting up rootfs for container {} at {}", container_id, rootfs_path));
 
         // Create rootfs directory
-        fs::create_dir_all(rootfs_path)
-            .map_err(|e| format!("Failed to create rootfs directory: {}", e))?;
+        FileSystemUtils::create_dir_all_with_logging(rootfs_path, "container rootfs")?;
 
         // Extract image tarball to rootfs
-        if Path::new(image_path).exists() {
-            println!("Extracting image {} to {}", image_path, rootfs_path);
+        if FileSystemUtils::is_file(image_path) {
+            ConsoleLogger::progress(&format!("Extracting image {} to {}", image_path, rootfs_path));
             self.extract_image(image_path, rootfs_path)?;
         } else {
             return Err(format!("Image file not found: {}", image_path));
@@ -394,13 +387,13 @@ impl ContainerRuntime {
         // Fix broken symlinks and ensure working binaries
         self.fix_container_binaries(rootfs_path)?;
 
-        println!("✅ Rootfs setup completed for container {}", container_id);
+        ConsoleLogger::success(&format!("Rootfs setup completed for container {}", container_id));
         Ok(())
     }
 
     /// Fix broken symlinks in Nix-generated containers and ensure working binaries
     fn fix_container_binaries(&self, rootfs_path: &str) -> Result<(), String> {
-        println!("🔧 Fixing container binaries and symlinks...");
+        ConsoleLogger::debug("Fixing container binaries and symlinks...");
 
         // Essential binaries that must work
         let essential_binaries = vec![
@@ -417,35 +410,19 @@ impl ContainerRuntime {
             let container_binary_path = format!("{}/bin/{}", rootfs_path, binary_name);
             
             // Check if the binary exists and works in the container
-            if Path::new(&container_binary_path).exists() {
+            if FileSystemUtils::is_file(&container_binary_path) {
                 // Check if it's a broken symlink
-                if let Ok(target) = fs::read_link(&container_binary_path) {
-                    // It's a symlink, check if target exists
-                    let target_path = if target.is_absolute() {
-                        format!("{}{}", rootfs_path, target.display())
-                    } else {
-                        format!("{}/bin/{}", rootfs_path, target.display())
-                    };
-                    
-                    if !Path::new(&target_path).exists() {
-                        println!("  ⚠ Broken symlink found for {}: {} -> {}", binary_name, container_binary_path, target.display());
-                        self.fix_broken_binary(&container_binary_path, binary_name, &host_paths)?;
-                    } else {
-                        println!("  ✓ Symlink for {} is working", binary_name);
-                    }
+                if FileSystemUtils::is_broken_symlink(&container_binary_path) {
+                    ConsoleLogger::warning(&format!("Broken symlink found for {}: {}", binary_name, container_binary_path));
+                    self.fix_broken_binary(&container_binary_path, binary_name, &host_paths)?;
+                } else if !FileSystemUtils::is_executable(&container_binary_path) {
+                    ConsoleLogger::warning(&format!("Binary {} is not executable", binary_name));
+                    self.fix_broken_binary(&container_binary_path, binary_name, &host_paths)?;
                 } else {
-                    // It's a regular file, check if it's executable
-                    if let Ok(metadata) = fs::metadata(&container_binary_path) {
-                        if metadata.permissions().mode() & 0o111 == 0 {
-                            println!("  ⚠ Binary {} is not executable", binary_name);
-                            self.fix_broken_binary(&container_binary_path, binary_name, &host_paths)?;
-                        } else {
-                            println!("  ✓ Binary {} exists and is executable", binary_name);
-                        }
-                    }
+                    ConsoleLogger::debug(&format!("Binary {} exists and is executable", binary_name));
                 }
             } else {
-                println!("  ⚠ Missing binary: {}", binary_name);
+                ConsoleLogger::warning(&format!("Missing binary: {}", binary_name));
                 self.fix_broken_binary(&container_binary_path, binary_name, &host_paths)?;
             }
         }
@@ -456,7 +433,7 @@ impl ContainerRuntime {
         // Ensure basic shell works
         self.verify_container_shell(rootfs_path)?;
 
-        println!("✅ Container binaries fixed and verified");
+        ConsoleLogger::success("Container binaries fixed and verified");
         Ok(())
     }
 
@@ -469,8 +446,8 @@ impl ContainerRuntime {
         ];
 
         for dir in lib_dirs {
-            if let Err(e) = fs::create_dir_all(&dir) {
-                eprintln!("Warning: Failed to create library directory {}: {}", dir, e);
+            if let Err(e) = FileSystemUtils::create_dir_all_with_logging(&dir, "library directory") {
+                ConsoleLogger::warning(&format!("Failed to create library directory {}: {}", dir, e));
             }
         }
 
@@ -487,21 +464,15 @@ impl ContainerRuntime {
         ];
 
         for (host_lib, container_lib) in essential_libs {
-            if Path::new(host_lib).exists() {
+            if FileSystemUtils::is_file(host_lib) {
                 let container_lib_path = format!("{}/{}", rootfs_path, container_lib);
-                if let Some(parent) = Path::new(&container_lib_path).parent() {
-                    if let Err(e) = fs::create_dir_all(parent) {
-                        eprintln!("Warning: Failed to create lib directory: {}", e);
-                        continue;
-                    }
-                }
-
-                match fs::copy(host_lib, &container_lib_path) {
+                match FileSystemUtils::copy_file(host_lib, &container_lib_path) {
                     Ok(_) => {
-                        println!("  ✓ Copied library: {}", container_lib);
+                        ConsoleLogger::debug(&format!("Copied essential library: {}", container_lib));
                     }
                     Err(e) => {
-                        eprintln!("  ⚠ Failed to copy library {}: {}", host_lib, e);
+                        ConsoleLogger::warning(&format!("Failed to copy library {}: {}", host_lib, e));
+                        continue;
                     }
                 }
             }
@@ -512,57 +483,51 @@ impl ContainerRuntime {
 
     /// Fix a broken or missing binary by copying from host
     fn fix_broken_binary(&self, container_binary_path: &str, binary_name: &str, host_paths: &[&str]) -> Result<(), String> {
-        // Remove existing broken symlink or file
-        if Path::new(container_binary_path).exists() {
-            fs::remove_file(container_binary_path)
-                .map_err(|e| format!("Failed to remove broken binary {}: {}", binary_name, e))?;
+        ConsoleLogger::debug(&format!("Fixing broken binary: {}", binary_name));
+
+        // Remove the broken binary if it exists
+        if FileSystemUtils::is_file(container_binary_path) {
+            FileSystemUtils::remove_path(container_binary_path)?;
         }
 
-        // For critical binaries, try to create a shell script wrapper that's more likely to work
-        if binary_name == "sh" {
-            return self.create_robust_shell(container_binary_path);
-        }
-
-        if binary_name == "echo" {
-            return self.create_echo_script(container_binary_path);
-        }
-
-        // Try to find a working binary on the host
+        // Try to find a working host binary to copy
         for host_path in host_paths {
-            if Path::new(host_path).exists() {
-                // Check if it's executable
-                if let Ok(metadata) = fs::metadata(host_path) {
-                    if metadata.permissions().mode() & 0o111 != 0 {
-                        // For simple utilities, try copying first
-                        match fs::copy(host_path, container_binary_path) {
-                            Ok(_) => {
-                                // Make sure it's executable
-                                let mut perms = fs::metadata(container_binary_path)
-                                    .map_err(|e| format!("Failed to get permissions for copied binary: {}", e))?
-                                    .permissions();
-                                perms.set_mode(0o755);
-                                fs::set_permissions(container_binary_path, perms)
-                                    .map_err(|e| format!("Failed to set permissions: {}", e))?;
-                                
-                                println!("  ✅ Fixed {} by copying from {}", binary_name, host_path);
-                                return Ok(());
-                            }
-                            Err(e) => {
-                                eprintln!("  ⚠ Failed to copy {} from {}: {}", binary_name, host_path, e);
-                                continue;
-                            }
-                        }
+            if FileSystemUtils::is_file(host_path) && FileSystemUtils::is_executable(host_path) {
+                // Check if the host binary is Nix-linked (avoid problematic dependencies)
+                if CommandExecutor::is_nix_linked_binary(host_path) {
+                    ConsoleLogger::debug(&format!("Skipping Nix-linked binary: {}", host_path));
+                    continue;
+                }
+
+                // Copy the working binary
+                match FileSystemUtils::copy_file(host_path, container_binary_path) {
+                    Ok(_) => {
+                        // Make it executable
+                        FileSystemUtils::make_executable(container_binary_path)?;
+                        ConsoleLogger::success(&format!("Fixed binary {} by copying from {}", binary_name, host_path));
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        ConsoleLogger::warning(&format!("Failed to copy {} from {}: {}", binary_name, host_path, e));
+                        continue;
                     }
                 }
             }
         }
 
-        // If copying failed, create a simple script implementation
+        // If no suitable host binary found, create a custom shell
+        if binary_name == "sh" {
+            ConsoleLogger::progress("Creating custom shell binary as fallback");
+            return self.create_robust_shell(container_binary_path);
+        }
+
+        // For other binaries, create simple scripts
         match binary_name {
+            "echo" => self.create_echo_script(container_binary_path),
             "ls" => self.create_ls_script(container_binary_path),
             "cat" => self.create_cat_script(container_binary_path),
             _ => {
-                println!("  ⚠ Could not fix binary {}, container may not work properly", binary_name);
+                ConsoleLogger::warning(&format!("Cannot fix unknown binary: {}", binary_name));
                 Ok(())
             }
         }
@@ -570,82 +535,39 @@ impl ContainerRuntime {
 
     /// Create a robust shell script that works without external dependencies
     fn create_robust_shell(&self, shell_path: &str) -> Result<(), String> {
-        let container_root = Path::new(shell_path).parent().unwrap().parent().unwrap();
+        ConsoleLogger::debug("Creating robust shell binary");
         
-        // AVOID using Nix busybox - it has /nix/store dependencies that won't work after chroot
-        // Check if there's a busybox but verify it's not Nix-linked
-        let busybox_path = container_root.join("bin/busybox");
-        if busybox_path.exists() {
-            // Check if it's Nix-linked by looking for /nix/store in its dependencies
-            if let Ok(output) = Command::new("ldd").arg(&busybox_path).output() {
-                let ldd_output = String::from_utf8_lossy(&output.stdout);
-                if ldd_output.contains("/nix/store") {
-                    println!("  ⚠ Busybox is Nix-linked, avoiding it");
-                } else {
-                    // It's a good busybox, use it
-                    match fs::copy(&busybox_path, shell_path) {
-                Ok(_) => {
-                    let mut perms = fs::metadata(shell_path)
-                        .map_err(|e| format!("Failed to get shell permissions: {}", e))?
-                        .permissions();
-                    perms.set_mode(0o755);
-                    fs::set_permissions(shell_path, perms)
-                        .map_err(|e| format!("Failed to set shell permissions: {}", e))?;
-                            println!("  ✅ Created shell using non-Nix busybox");
-                            return Ok(());
-                        }
-                        Err(e) => {
-                            println!("  ⚠ Failed to copy busybox: {}", e);
-                        }
-                    }
+        // Check if we're dealing with a Nix-linked shell using CommandExecutor
+        let shell_candidates = vec!["/bin/sh", "/bin/bash"];
+        let mut usable_shell = None;
+        
+        for shell in &shell_candidates {
+            if FileSystemUtils::is_file(shell) && FileSystemUtils::is_executable(shell) {
+                // Use CommandExecutor to check if it's Nix-linked
+                if !CommandExecutor::is_nix_linked_binary(shell) {
+                    usable_shell = Some(*shell);
+                    break;
                 }
             }
         }
 
-        // Try to create a statically linked shell binary first
-        if let Ok(()) = self.create_minimal_shell_binary(shell_path) {
+        if let Some(shell_binary) = usable_shell {
+            // Copy the working shell
+            match FileSystemUtils::copy_file(shell_binary, shell_path) {
+                Ok(_) => {
+                    FileSystemUtils::make_executable(shell_path)?;
+                    ConsoleLogger::success(&format!("Created shell by copying from {}", shell_binary));
                     return Ok(());
                 }
-
-        // Try copying minimal shells from host that are more likely to be portable
-        let minimal_shells = ["/bin/dash", "/bin/ash", "/usr/bin/dash"];
-        for shell in &minimal_shells {
-            if Path::new(shell).exists() {
-                // Check if it's statically linked or has reasonable dependencies
-                if let Ok(output) = Command::new("ldd").arg(shell).output() {
-                    let ldd_output = String::from_utf8_lossy(&output.stdout);
-                    if ldd_output.contains("not a dynamic executable") || 
-                       (!ldd_output.contains("/nix/store") && ldd_output.contains("libc.so.6")) {
-                        // It's either static or has standard dependencies
-                        match fs::copy(shell, shell_path) {
-                            Ok(_) => {
-                                // Copy standard system libraries
-                                self.copy_shell_dependencies(shell, container_root.to_str().unwrap())?;
-                                
-                                let mut perms = fs::metadata(shell_path)
-                                    .map_err(|e| format!("Failed to get shell permissions: {}", e))?
-                                    .permissions();
-                                perms.set_mode(0o755);
-                                fs::set_permissions(shell_path, perms)
-                                    .map_err(|e| format!("Failed to set shell permissions: {}", e))?;
-                                
-                                println!("  ✅ Created shell by copying {}", shell);
-                                return Ok(());
-                            }
-                            Err(e) => {
-                                println!("  ⚠ Failed to copy {}: {}", shell, e);
-                                continue;
-                            }
-                        }
-                    } else {
-                        println!("  ⚠ Shell {} has complex dependencies, skipping", shell);
-                    }
+                Err(e) => {
+                    ConsoleLogger::warning(&format!("Failed to copy shell from {}: {}", shell_binary, e));
                 }
             }
         }
 
-        // Final fallback - create a shell script
-        self.create_shell_script(shell_path)
+        // Fallback: create a minimal shell binary using C code
+        ConsoleLogger::progress("Creating minimal C shell binary");
+        self.create_minimal_shell_binary(shell_path)
     }
 
     /// Copy essential libraries for a shell binary
@@ -906,14 +828,7 @@ int main(int argc, char *argv[]) {
             .args(&["-static", "-o", temp_binary, temp_c_file])
             .output();
 
-        // If static compilation fails, try dynamic with musl if available
-        if compile_result.is_err() || !compile_result.as_ref().unwrap().status.success() {
-            compile_result = Command::new("musl-gcc")
-                .args(&["-static", "-o", temp_binary, temp_c_file])
-                .output();
-        }
-
-        // If still fails, try regular dynamic compilation
+        // If static compilation fails, try regular dynamic compilation
         if compile_result.is_err() || !compile_result.as_ref().unwrap().status.success() {
             compile_result = Command::new("gcc")
                 .args(&["-o", temp_binary, temp_c_file])
@@ -1101,36 +1016,33 @@ done
     fn verify_container_shell(&self, rootfs_path: &str) -> Result<(), String> {
         let shell_path = format!("{}/bin/sh", rootfs_path);
         
-        if !Path::new(&shell_path).exists() {
-            return Err("No shell binary found in container".to_string());
+        if !FileSystemUtils::is_file(&shell_path) {
+            ConsoleLogger::warning("No shell found in container, basic commands may not work");
+            return Ok(());
         }
 
-        // Try to execute a simple command in the container environment
-        // We can't easily test chroot here, but we can at least verify the binary exists and is executable
-        match fs::metadata(&shell_path) {
-            Ok(metadata) => {
-                if metadata.permissions().mode() & 0o111 != 0 {
-                    println!("  ✓ Shell binary is executable: {}", shell_path);
-                    Ok(())
-                } else {
-                    Err(format!("Shell binary is not executable: {}", shell_path))
-                }
-            }
-            Err(e) => Err(format!("Cannot access shell binary: {}", e))
+        if !FileSystemUtils::is_executable(&shell_path) {
+            ConsoleLogger::warning("Shell exists but is not executable");
+            return Ok(());
         }
+
+        ConsoleLogger::success("Container shell verification completed");
+        Ok(())
     }
 
     fn extract_image(&self, image_path: &str, rootfs_path: &str) -> Result<(), String> {
-        let file = fs::File::open(image_path)
+        // Open and decompress the tar file
+        let tar_file = std::fs::File::open(image_path)
             .map_err(|e| format!("Failed to open image file: {}", e))?;
-
-        let decoder = GzDecoder::new(file);
-        let mut archive = Archive::new(decoder);
-
+        
+        let tar = GzDecoder::new(tar_file);
+        let mut archive = Archive::new(tar);
+        
+        // Extract to rootfs directory
         archive.unpack(rootfs_path)
             .map_err(|e| format!("Failed to extract image: {}", e))?;
 
-        println!("✅ Successfully extracted image to {}", rootfs_path);
+        ConsoleLogger::success(&format!("Successfully extracted image to {}", rootfs_path));
         Ok(())
     }
 
@@ -1158,7 +1070,7 @@ done
     }
 
     pub fn stop_container(&self, container_id: &str) -> Result<(), String> {
-        println!("Stopping container: {}", container_id);
+        ConsoleLogger::progress(&format!("Stopping container: {}", container_id));
 
         let pid = {
             let containers = self.containers.lock().unwrap();
@@ -1166,40 +1078,59 @@ done
                 .ok_or_else(|| format!("Container {} not found", container_id))?;
             
             match container.pid {
-                Some(pid) => pid,
-                None => return Err(format!("Container {} is not running", container_id)),
+                Some(pid) => {
+                    // Check if process is still running
+                    if ProcessUtils::is_process_running(pid) {
+                        pid
+                    } else {
+                        ConsoleLogger::info(&format!("Container {} process is already stopped", container_id));
+                        return Ok(());
+                    }
+                }
+                None => {
+                    ConsoleLogger::info(&format!("Container {} has no running process", container_id));
+                    return Ok(());
+                }
             }
         };
 
-        // Send SIGTERM to the container process
-        match nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGTERM) {
+        // Terminate the process gracefully with 10 second timeout
+        match ProcessUtils::terminate_process(pid, 10) {
             Ok(()) => {
-                println!("Sent SIGTERM to container {} (PID: {})", container_id, pid);
-                
                 // Update container state
-                self.update_container_state(container_id, ContainerState::EXITED(143)); // 128 + 15 (SIGTERM)
-                
+                {
+                    let mut containers = self.containers.lock().unwrap();
+                    if let Some(container) = containers.get_mut(container_id) {
+                        container.state = ContainerState::EXITED(0);
+                        container.pid = None;
+                        container.add_log("Container stopped by user request".to_string());
+                    }
+                }
+
                 // Cleanup cgroups
                 let cgroup_manager = CgroupManager::new(container_id.to_string());
                 if let Err(e) = cgroup_manager.cleanup() {
-                    eprintln!("Warning: Failed to cleanup cgroups: {}", e);
+                    ConsoleLogger::warning(&format!("Failed to cleanup cgroups: {}", e));
                 }
-                
+
+                ConsoleLogger::container_stopped(container_id);
                 Ok(())
             }
-            Err(e) => Err(format!("Failed to stop container {}: {}", container_id, e)),
+            Err(e) => {
+                Err(format!("Failed to stop container {}: {}", container_id, e))
+            }
         }
     }
 
     pub fn remove_container(&self, container_id: &str) -> Result<(), String> {
-        println!("Removing container: {}", container_id);
+        ConsoleLogger::progress(&format!("Removing container: {}", container_id));
 
-        // First stop the container if it's running
-        if let Ok(()) = self.stop_container(container_id) {
-            // Give it a moment to stop
-            std::thread::sleep(std::time::Duration::from_millis(100));
+        // Stop the container first if it's running
+        if let Err(e) = self.stop_container(container_id) {
+            ConsoleLogger::warning(&format!("Error stopping container before removal: {}", e));
         }
 
+        // Remove container from registry and get rootfs path
         let rootfs_path = {
             let mut containers = self.containers.lock().unwrap();
             let container = containers.remove(container_id)
@@ -1207,19 +1138,18 @@ done
             container.rootfs_path
         };
 
-        // Remove rootfs directory
-        if Path::new(&rootfs_path).exists() {
-            fs::remove_dir_all(&rootfs_path)
-                .map_err(|e| format!("Failed to remove rootfs directory: {}", e))?;
+        // Cleanup rootfs directory
+        if let Err(e) = FileSystemUtils::remove_path(&rootfs_path) {
+            ConsoleLogger::warning(&format!("Failed to remove rootfs {}: {}", rootfs_path, e));
         }
 
-        // Cleanup cgroups (just in case)
+        // Final cgroup cleanup
         let cgroup_manager = CgroupManager::new(container_id.to_string());
         if let Err(e) = cgroup_manager.cleanup() {
-            eprintln!("Warning: Failed to cleanup cgroups during removal: {}", e);
+            ConsoleLogger::warning(&format!("Failed to cleanup cgroups: {}", e));
         }
 
-        println!("✅ Container {} removed successfully", container_id);
+        ConsoleLogger::container_removed(container_id);
         Ok(())
     }
 
@@ -1231,21 +1161,28 @@ done
 
     pub fn get_container_stats(&self, container_id: &str) -> Result<HashMap<String, String>, String> {
         let mut stats = HashMap::new();
-        
+
+        let containers = self.containers.lock().unwrap();
+        let container = containers.get(container_id)
+            .ok_or_else(|| format!("Container {} not found", container_id))?;
+
         // Get memory usage from cgroups
         let cgroup_manager = CgroupManager::new(container_id.to_string());
         if let Ok(memory_usage) = cgroup_manager.get_memory_usage() {
             stats.insert("memory_usage_bytes".to_string(), memory_usage.to_string());
         }
 
-        // Get container info
-        if let Some(container) = self.get_container_info(container_id) {
-            stats.insert("state".to_string(), format!("{:?}", container.state));
-            stats.insert("created_at".to_string(), container.created_at.to_string());
-            if let Some(pid) = container.pid {
-                stats.insert("pid".to_string(), pid.to_string());
-            }
-            stats.insert("rootfs_path".to_string(), container.rootfs_path);
+        // Get container state
+        match &container.state {
+            ContainerState::PENDING => stats.insert("state".to_string(), "pending".to_string()),
+            ContainerState::RUNNING => stats.insert("state".to_string(), "running".to_string()),
+            ContainerState::EXITED(code) => stats.insert("state".to_string(), format!("exited({})", code)),
+            ContainerState::FAILED(msg) => stats.insert("state".to_string(), format!("failed: {}", msg)),
+        };
+
+        // Get PID if available
+        if let Some(pid) = container.pid {
+            stats.insert("pid".to_string(), ProcessUtils::pid_to_i32(pid).to_string());
         }
 
         Ok(stats)
