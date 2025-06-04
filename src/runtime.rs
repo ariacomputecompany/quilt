@@ -180,7 +180,7 @@ impl ContainerRuntime {
         let environment_clone = config.environment.clone();
         let rootfs_path_clone = rootfs_path.clone();
         let setup_commands_clone = setup_commands.clone();
-        
+
         // Create new lightweight runtime manager for child (not clone of existing)
         let child_func = move || -> i32 {
             // This runs in the child process with new namespaces
@@ -264,7 +264,7 @@ impl ContainerRuntime {
                     return 1;
                 }
             };
-
+                    
             // Prepare all arguments as CStrings with proper lifetime management
             let mut all_args = vec![final_program];
             all_args.extend(final_args);
@@ -276,7 +276,7 @@ impl ContainerRuntime {
                 Err(e) => {
                     eprintln!("Failed to prepare command arguments: {}", e);
                     return 1;
-                }
+                            }
             };
 
             // Create references with proper lifetime (after cstrings is owned)
@@ -726,7 +726,109 @@ int main(int argc, char *argv[]) {
     if (argc >= 3 && strcmp(argv[1], "-c") == 0) {
         char *command = argv[2];
         
-        // Handle simple built-in commands to avoid dependency on other binaries
+        // Handle compound commands internally by splitting on semicolons
+        if (strstr(command, ";")) {
+            // Split command on semicolons and execute each part
+            char cmd_copy[1024];
+            strncpy(cmd_copy, command, sizeof(cmd_copy)-1);
+            cmd_copy[sizeof(cmd_copy)-1] = '\0';
+            
+            char *cmd_part = strtok(cmd_copy, ";");
+            int overall_exit_code = 0;
+            
+            while (cmd_part != NULL) {
+                // Trim leading/trailing whitespace
+                while (*cmd_part == ' ' || *cmd_part == '\t') cmd_part++;
+                char *end = cmd_part + strlen(cmd_part) - 1;
+                while (end > cmd_part && (*end == ' ' || *end == '\t')) {
+                    *end = '\0';
+                    end--;
+                }
+                
+                if (strlen(cmd_part) > 0) {
+                    // Execute this individual command
+                    int exit_code = 0;
+                    
+                    // Handle built-in commands
+                    if (strncmp(cmd_part, "echo ", 5) == 0) {
+                        printf("%s\n", cmd_part + 5);
+                    } else if (strcmp(cmd_part, "echo") == 0) {
+                        printf("\n");
+                    } else if (strcmp(cmd_part, "pwd") == 0) {
+                        char cwd[1024];
+                        if (getcwd(cwd, sizeof(cwd)) != NULL) {
+                            printf("%s\n", cwd);
+                        } else {
+                            exit_code = 1;
+                        }
+                    } else if (strncmp(cmd_part, "echo '", 6) == 0 || strncmp(cmd_part, "echo \"", 6) == 0) {
+                        // Handle quoted echo - strip quotes and print content
+                        char *start = cmd_part + 6;
+                        char *end_quote = strchr(start, cmd_part[5]);
+                        if (end_quote) {
+                            *end_quote = '\0';
+                            printf("%s\n", start);
+                        } else {
+                            printf("%s\n", start);
+                        }
+                    } else {
+                        // For other commands, try to execute directly with fork+exec
+                        pid_t pid = fork();
+                        if (pid == 0) {
+                            // Child process - parse and exec the command
+                            char *args[64];
+                            char single_cmd_copy[256];
+                            int arg_count = 0;
+                            
+                            strncpy(single_cmd_copy, cmd_part, sizeof(single_cmd_copy)-1);
+                            single_cmd_copy[sizeof(single_cmd_copy)-1] = '\0';
+                            
+                            char *token = strtok(single_cmd_copy, " ");
+                            while (token != NULL && arg_count < 63) {
+                                args[arg_count++] = token;
+                                token = strtok(NULL, " ");
+                            }
+                            args[arg_count] = NULL;
+                            
+                            if (arg_count > 0) {
+                                // Try to execute the command directly
+                                execvp(args[0], args);
+                                // If execvp fails, try with full path
+                                char full_path[512];
+                                snprintf(full_path, sizeof(full_path), "/bin/%s", args[0]);
+                                execv(full_path, args);
+                                snprintf(full_path, sizeof(full_path), "/usr/bin/%s", args[0]);
+                                execv(full_path, args);
+                            }
+                            
+                            fprintf(stderr, "Command not found: %s\n", cmd_part);
+                            exit(127);
+                        } else if (pid > 0) {
+                            // Parent process - wait for child
+                            int status;
+                            waitpid(pid, &status, 0);
+                            exit_code = WEXITSTATUS(status);
+                        } else {
+                            // Fork failed
+                            fprintf(stderr, "Failed to fork for command: %s\n", cmd_part);
+                            exit_code = 1;
+                        }
+                    }
+                    
+                    // Update overall exit code (last non-zero wins)
+                    if (exit_code != 0) {
+                        overall_exit_code = exit_code;
+                    }
+                }
+                
+                // Get next command part
+                cmd_part = strtok(NULL, ";");
+            }
+            
+            return overall_exit_code;
+        }
+        
+        // Handle simple commands (no semicolons)
         if (strncmp(command, "echo ", 5) == 0) {
             return builtin_echo(command + 5);
         } else if (strcmp(command, "echo") == 0) {
@@ -744,23 +846,10 @@ int main(int argc, char *argv[]) {
             }
         }
         
-        // For ALL commands (simple and complex), delegate to the system shell
-        // This is the proper way to handle shell commands with operators
+        // For other simple commands, try direct execution
         pid_t pid = fork();
         if (pid == 0) {
-            // Child process - use system shell to execute the command
-            // Look for available shells in order of preference
-            char *shells[] = {"/bin/bash", "/bin/dash", "/bin/ash", "/bin/sh", NULL};
-            
-            for (int i = 0; shells[i] != NULL; i++) {
-                if (access(shells[i], X_OK) == 0) {
-                    // Found an executable shell, use it
-                    execl(shells[i], shells[i], "-c", command, (char *)NULL);
-                    break;
-                }
-            }
-            
-            // If no standard shell found, try to parse and execute simple commands
+            // Child process - parse and execute
             char *args[64];
             char cmd_copy[1024];
             int arg_count = 0;
@@ -768,7 +857,6 @@ int main(int argc, char *argv[]) {
             strncpy(cmd_copy, command, sizeof(cmd_copy)-1);
             cmd_copy[sizeof(cmd_copy)-1] = '\0';
             
-            // Simple tokenization for basic commands
             char *token = strtok(cmd_copy, " ");
             while (token != NULL && arg_count < 63) {
                 args[arg_count++] = token;
@@ -778,10 +866,15 @@ int main(int argc, char *argv[]) {
             
             if (arg_count > 0) {
                 execvp(args[0], args);
+                // Try with full paths if execvp fails
+                char full_path[512];
+                snprintf(full_path, sizeof(full_path), "/bin/%s", args[0]);
+                execv(full_path, args);
+                snprintf(full_path, sizeof(full_path), "/usr/bin/%s", args[0]);
+                execv(full_path, args);
             }
             
-            // If all exec attempts fail
-            fprintf(stderr, "Failed to execute command: %s\n", command);
+            fprintf(stderr, "Command not found: %s\n", command);
             exit(127);
         } else if (pid > 0) {
             // Parent process - wait for child
