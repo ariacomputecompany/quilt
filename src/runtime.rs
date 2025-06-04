@@ -9,10 +9,9 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 use flate2::read::GzDecoder;
 use tar::Archive;
-use nix::unistd::{chroot, chdir, Pid, fork, ForkResult, execv};
+use nix::unistd::{chroot, chdir, Pid, execv};
 use std::os::unix::fs::PermissionsExt;
 use std::ffi::CString;
-use nix::sys::wait::{waitpid, WaitStatus};
 
 #[derive(Debug, Clone)]
 pub enum ContainerState {
@@ -163,16 +162,29 @@ impl ContainerRuntime {
 
         // Create namespaced process for container execution
         let namespace_config = config.namespace_config.unwrap_or_default();
-        let containers_clone = Arc::clone(&self.containers);
-        let id_clone = id.to_string();
+        
+        // Reduce memory footprint - prepare everything needed outside the closure
+        let id_for_logs = id.to_string();
+        let command_for_logs = format!("{:?}", config.command);
+        
+        // Log start before entering child process to avoid memory allocation in child
+        {
+            let mut containers = self.containers.lock().unwrap();
+            if let Some(container) = containers.get_mut(id) {
+                container.add_log(format!("Starting container execution with command: {}", command_for_logs));
+            }
+        }
+        
+        // Prepare all data needed by child process (avoid heavy captures)
         let command_clone = config.command.clone();
         let environment_clone = config.environment.clone();
         let rootfs_path_clone = rootfs_path.clone();
         let setup_commands_clone = setup_commands.clone();
-        let mut runtime_manager_clone = RuntimeManager::new(); // Create new instance for child process
-
+        
+        // Create new lightweight runtime manager for child (not clone of existing)
         let child_func = move || -> i32 {
             // This runs in the child process with new namespaces
+            // Keep memory allocation to minimum in child process
             
             // Setup mount namespace
             let namespace_manager = NamespaceManager::new();
@@ -188,7 +200,7 @@ impl ContainerRuntime {
             }
 
             // Set container hostname
-            if let Err(e) = namespace_manager.set_container_hostname(&id_clone) {
+            if let Err(e) = namespace_manager.set_container_hostname(&id_for_logs) {
                 eprintln!("Failed to set container hostname: {}", e);
                 // Non-fatal, continue
             }
@@ -206,30 +218,17 @@ impl ContainerRuntime {
             }
 
             // Initialize container system environment first
-            if let Err(e) = runtime_manager_clone.initialize_container() {
+            let mut runtime_manager = RuntimeManager::new(); // Create fresh instance
+            if let Err(e) = runtime_manager.initialize_container() {
                 eprintln!("Failed to initialize container environment: {}", e);
-                // Add error to container logs
-                if let Ok(mut containers) = containers_clone.lock() {
-                    if let Some(container) = containers.get_mut(&id_clone) {
-                        container.add_log(format!("Environment initialization failed: {}", e));
-                        container.state = ContainerState::FAILED(e.clone());
-                    }
-                }
                 return 1;
             }
 
             // Execute setup commands inside the container
             if !setup_commands_clone.is_empty() {
-                println!("Executing {} setup commands in container {}", setup_commands_clone.len(), id_clone);
-                if let Err(e) = runtime_manager_clone.execute_setup_commands(&setup_commands_clone) {
+                println!("Executing {} setup commands in container {}", setup_commands_clone.len(), id_for_logs);
+                if let Err(e) = runtime_manager.execute_setup_commands(&setup_commands_clone) {
                     eprintln!("Setup commands failed: {}", e);
-                    // Add error to container logs
-                    if let Ok(mut containers) = containers_clone.lock() {
-                        if let Some(container) = containers.get_mut(&id_clone) {
-                            container.add_log(format!("Setup failed: {}", e));
-                            container.state = ContainerState::FAILED(e.clone());
-                        }
-                    }
                     return 1;
                 }
             }
@@ -239,16 +238,16 @@ impl ContainerRuntime {
                 std::env::set_var(key, value);
             }
 
-            // Execute the main command with better logging
+            // Execute the main command with reduced memory overhead
             println!("Executing main command in container: {:?}", command_clone);
             
-            // Handle command execution more intelligently
-            let (shell_cmd, shell_args) = if command_clone.len() >= 3 
+            // Prepare the final command to execute
+            let (final_program, final_args) = if command_clone.len() >= 3 
                 && (command_clone[0].ends_with("/sh") || command_clone[0].ends_with("/bash"))
                 && command_clone[1] == "-c" {
                 // Command is already a shell command like ["/bin/sh", "-c", "actual command"]
-                // Extract the actual command to avoid double-shell wrapping
-                ("/bin/sh".to_string(), vec!["-c".to_string(), command_clone[2..].join(" ")])
+                // Use it directly to avoid double-shell wrapping
+                (command_clone[0].clone(), command_clone[1..].to_vec())
             } else if command_clone.len() == 1 {
                 // Single command - execute it through shell
                 ("/bin/sh".to_string(), vec!["-c".to_string(), command_clone[0].clone()])
@@ -257,86 +256,44 @@ impl ContainerRuntime {
                 ("/bin/sh".to_string(), vec!["-c".to_string(), command_clone.join(" ")])
             };
 
-            // Write command info to container log (before chroot changes access)
-            if let Ok(mut containers) = containers_clone.lock() {
-                if let Some(container) = containers.get_mut(&id_clone) {
-                    container.add_log(format!("Executing command: {:?}", command_clone));
+            // Convert to CString for exec (do this once, outside any fork)
+            let program_cstring = match CString::new(final_program.clone()) {
+                Ok(cs) => cs,
+                Err(e) => {
+                    eprintln!("Failed to create program CString: {}", e);
+                    return 1;
                 }
-            }
+            };
 
-            // Use simple fork+exec approach that works after chroot
-            match unsafe { fork() } {
-                Ok(ForkResult::Child) => {
-                    // In child process - exec the command
-                    
-                    // Prepare arguments for exec
-                    let mut exec_args = vec![shell_cmd.clone()];
-                    exec_args.extend(shell_args);
-                    
-                    // Convert to CString
-                    let program = CString::new(shell_cmd).unwrap();
-                    let args: Result<Vec<CString>, _> = exec_args.iter()
-                        .map(|s| CString::new(s.clone()))
-                        .collect();
-                    
-                    match args {
-                        Ok(arg_cstrings) => {
-                            let arg_refs: Vec<&CString> = arg_cstrings.iter().collect();
-                            
-                            // Try execv - this should replace the child process
-                            let e = execv(&program, &arg_refs).unwrap_err();
-                            eprintln!("Failed to exec in child: {}", e);
-                            std::process::exit(1);
-                        }
-                        Err(e) => {
-                            eprintln!("Failed to prepare arguments: {}", e);
-                            std::process::exit(1);
-                        }
-                    }
+            // Prepare all arguments as CStrings with proper lifetime management
+            let mut all_args = vec![final_program];
+            all_args.extend(final_args);
+            
+            let args_cstrings: Vec<CString> = match all_args.iter()
+                .map(|s| CString::new(s.clone()))
+                .collect::<Result<Vec<CString>, _>>() {
+                Ok(cstrings) => cstrings,
+                Err(e) => {
+                    eprintln!("Failed to prepare command arguments: {}", e);
+                    return 1;
                 }
-                Ok(ForkResult::Parent { child, .. }) => {
-                    // In parent process - wait for child to complete
-                    let exit_code = match waitpid(child, None) {
-                        Ok(WaitStatus::Exited(_, code)) => {
-                            println!("Command completed with exit code: {}", code);
-                            code as i32
-                        }
-                        Ok(WaitStatus::Signaled(_, signal, _)) => {
-                            println!("Command terminated by signal: {:?}", signal);
-                            128 + signal as i32
-                        }
-                        Ok(status) => {
-                            println!("Command completed with status: {:?}", status);
-                            1
-                        }
-                        Err(e) => {
-                            eprintln!("Failed to wait for command: {}", e);
-                            1
-                        }
-                    };
-                    
-                    // Add completion log to container
-                    if let Ok(mut containers) = containers_clone.lock() {
-                        if let Some(container) = containers.get_mut(&id_clone) {
-                            if exit_code == 0 {
-                                container.add_log("Command completed successfully".to_string());
-                            } else {
-                                container.add_log(format!("Command failed with exit code: {}", exit_code));
-                            }
-                        }
-                    }
-                    
-                    exit_code
+            };
+
+            // Create references with proper lifetime (after cstrings is owned)
+            let arg_refs: Vec<&CString> = args_cstrings.iter().collect();
+
+            // Direct exec without nested fork - this replaces the current process
+            println!("Executing: {} {:?}", program_cstring.to_string_lossy(), 
+                     arg_refs.iter().map(|cs| cs.to_string_lossy()).collect::<Vec<_>>());
+            
+            // This will replace the current process entirely
+            match execv(&program_cstring, &arg_refs) {
+                Ok(_) => {
+                    // This should never be reached if exec succeeds
+                    0
                 }
                 Err(e) => {
-                    eprintln!("Failed to fork: {}", e);
-                    
-                    if let Ok(mut containers) = containers_clone.lock() {
-                        if let Some(container) = containers.get_mut(&id_clone) {
-                            container.add_log(format!("Failed to fork: {}", e));
-                        }
-                    }
-                    
+                    eprintln!("Failed to exec command: {}", e);
                     1
                 }
             }
@@ -787,39 +744,45 @@ int main(int argc, char *argv[]) {
             }
         }
         
-        // For complex commands, use fork+exec to avoid system() issues
+        // For ALL commands (simple and complex), delegate to the system shell
+        // This is the proper way to handle shell commands with operators
         pid_t pid = fork();
         if (pid == 0) {
-            // Child process - try to execute with sh directly
-            // First try our own shell recursively for simple commands
-            if (strstr(command, ";") || strstr(command, "&&") || strstr(command, "||") || strstr(command, "|")) {
-                // Complex command with operators - just try to run individual parts
-                printf("Complex command execution not fully supported in minimal shell\n");
-                exit(1);
-            } else {
-                // Simple command - try to execute it directly
-                char *args[64];
-                char *token;
-                char cmd_copy[1024];
-                int i = 0;
-                
-                strncpy(cmd_copy, command, sizeof(cmd_copy)-1);
-                cmd_copy[sizeof(cmd_copy)-1] = '\0';
-                
-                token = strtok(cmd_copy, " ");
-                while (token != NULL && i < 63) {
-                    args[i++] = token;
-                    token = strtok(NULL, " ");
+            // Child process - use system shell to execute the command
+            // Look for available shells in order of preference
+            char *shells[] = {"/bin/bash", "/bin/dash", "/bin/ash", "/bin/sh", NULL};
+            
+            for (int i = 0; shells[i] != NULL; i++) {
+                if (access(shells[i], X_OK) == 0) {
+                    // Found an executable shell, use it
+                    execl(shells[i], shells[i], "-c", command, (char *)NULL);
+                    break;
                 }
-                args[i] = NULL;
-                
-                if (i > 0) {
-                    execvp(args[0], args);
-                }
-                
-                // If execvp fails, exit with error
-                exit(127);
             }
+            
+            // If no standard shell found, try to parse and execute simple commands
+            char *args[64];
+            char cmd_copy[1024];
+            int arg_count = 0;
+            
+            strncpy(cmd_copy, command, sizeof(cmd_copy)-1);
+            cmd_copy[sizeof(cmd_copy)-1] = '\0';
+            
+            // Simple tokenization for basic commands
+            char *token = strtok(cmd_copy, " ");
+            while (token != NULL && arg_count < 63) {
+                args[arg_count++] = token;
+                token = strtok(NULL, " ");
+            }
+            args[arg_count] = NULL;
+            
+            if (arg_count > 0) {
+                execvp(args[0], args);
+            }
+            
+            // If all exec attempts fail
+            fprintf(stderr, "Failed to execute command: %s\n", command);
+            exit(127);
         } else if (pid > 0) {
             // Parent process - wait for child
             int status;
@@ -827,6 +790,7 @@ int main(int argc, char *argv[]) {
             return WEXITSTATUS(status);
         } else {
             // Fork failed
+            fprintf(stderr, "Failed to fork process\n");
             return 1;
         }
     }
