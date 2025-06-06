@@ -128,13 +128,13 @@ impl QuiltService for QuiltServiceImpl {
                 };
 
                 // 2. Store network configuration in container
-                if let Err(e) = runtime.set_container_network(&container_id, network_config) {
+                if let Err(e) = runtime.set_container_network(&container_id, network_config.clone()) {
                     ConsoleLogger::error(&format!("Failed to store network config: {}", e));
                     return Err(Status::internal(format!("Failed to store network config: {}", e)));
                 }
 
-                // 3. Start container with network namespaces enabled
-                match runtime.start_container(&container_id, None) {
+                // 3. Start container with network configuration passed for ResourceManager tracking
+                match runtime.start_container(&container_id, Some(network_config.clone())) {
                     Ok(()) => {
                         // 4. Set up the container's network interface now that it's running
                         if let Err(e) = runtime.setup_container_network_post_start(&container_id, &*network_manager) {

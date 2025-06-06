@@ -174,69 +174,47 @@ impl NetworkManager {
     
     fn configure_container_interface(&self, config: &ContainerNetworkConfig, container_pid: i32) -> Result<(), String> {
         let ns_exec = format!("nsenter -t {} -n", container_pid);
-        let mut interface_name = "eth0".to_string();
-
+        
+        // Use consistent interface naming to avoid eth0 conflicts
+        let interface_name = format!("quilt{}", &config.container_id[..8]);
+        
+        ConsoleLogger::debug(&format!("Configuring container interface for {}", config.container_id));
+        
+        // Rename the veth interface to our custom name
         let rename_result = CommandExecutor::execute_shell(&format!("{} ip link set {} name {}", ns_exec, config.veth_container_name, interface_name))?;
         if !rename_result.success {
-             // It's possible the interface couldn't be renamed because an 'eth0' already exists.
-             // This is a common scenario in some environments. We'll try to delete it and retry.
-            let check_eth0_cmd = format!("{} ip link show {}", ns_exec, interface_name);
-            if let Ok(result) = CommandExecutor::execute_shell(&check_eth0_cmd) {
-                if result.success {
-                    ConsoleLogger::debug("eth0 interface already exists, removing it first");
-                    let delete_cmd = format!("{} ip link delete {}", ns_exec, interface_name);
-                    if let Ok(del_res) = CommandExecutor::execute_shell(&delete_cmd) {
-                        if !del_res.success {
-                            ConsoleLogger::warning(&format!("Could not delete existing eth0: {}", del_res.stderr));
-                            
-                            // If we can't delete eth0, use a fallback interface name
-                            interface_name = format!("qnet{}", &config.container_id[..8]);
-                            ConsoleLogger::debug(&format!("Using fallback interface name: {}", interface_name));
-                            
-                            let fallback_rename = CommandExecutor::execute_shell(&format!("{} ip link set {} name {}", ns_exec, config.veth_container_name, interface_name))?;
-                            if !fallback_rename.success {
-                                return Err(format!("Failed to rename veth to {}: {}", interface_name, fallback_rename.stderr));
-                            }
-                        } else {
-                            // Successfully deleted eth0, retry with eth0
-                            let retry_rename = CommandExecutor::execute_shell(&format!("{} ip link set {} name {}", ns_exec, config.veth_container_name, interface_name))?;
-                            if !retry_rename.success {
-                                return Err(format!("Failed to rename veth to eth0 on retry: {}", retry_rename.stderr));
-                            }
-                        }
-                    }
-                } else {
-                    return Err(format!("Failed to rename veth to eth0: {}", rename_result.stderr));
-                }
-            } else {
-                 return Err(format!("Failed to rename veth to eth0: {}", rename_result.stderr));
-            }
+            return Err(format!("Failed to rename veth to {}: {}", interface_name, rename_result.stderr));
         }
 
+        // Assign IP address
         let ip_with_mask = format!("{}/{}", config.ip_address, config.subnet_mask);
         let ip_result = CommandExecutor::execute_shell(&format!("{} ip addr add {} dev {}", ns_exec, ip_with_mask, interface_name))?;
         if !ip_result.success {
             return Err(format!("Failed to assign IP: {}", ip_result.stderr));
         }
 
+        // Bring interface up
         let up_result = CommandExecutor::execute_shell(&format!("{} ip link set {} up", ns_exec, interface_name))?;
         if !up_result.success {
             return Err(format!("Failed to bring {} up: {}", interface_name, up_result.stderr));
         }
 
+        // Ensure loopback is up
         let lo_result = CommandExecutor::execute_shell(&format!("{} ip link set lo up", ns_exec))?;
         if !lo_result.success {
             ConsoleLogger::warning(&format!("Failed to bring loopback up: {}", lo_result.stderr));
         }
 
-        let route_check_result = CommandExecutor::execute_shell(&format!("{} ip route show default", ns_exec))?;
-        if !route_check_result.success || route_check_result.stdout.trim().is_empty() {
-            let route_result = CommandExecutor::execute_shell(&format!("{} ip route add default via {}", ns_exec, config.gateway_ip))?;
-            if !route_result.success {
+        // Add default route
+        let route_result = CommandExecutor::execute_shell(&format!("{} ip route add default via {} dev {}", ns_exec, config.gateway_ip, interface_name))?;
+        if !route_result.success {
+            // Check if route already exists
+            let route_check = CommandExecutor::execute_shell(&format!("{} ip route show default", ns_exec))?;
+            if route_check.success && !route_check.stdout.trim().is_empty() {
                 ConsoleLogger::debug("Default route already exists, skipping");
+            } else {
+                ConsoleLogger::warning(&format!("Failed to add default route: {}", route_result.stderr));
             }
-        } else {
-            ConsoleLogger::debug("Default route already exists, skipping");
         }
         
         ConsoleLogger::success(&format!("Container interface configured: {} = {}/{}", interface_name, config.ip_address, config.subnet_mask));
