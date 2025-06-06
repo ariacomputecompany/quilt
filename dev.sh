@@ -41,8 +41,8 @@ generate_nixos_rootfs() {
     log "Generating self-contained rootfs: $rootfs_name (using robust manual approach)"
     
     # Use the manual approach for reliability
-    create_minimal_rootfs "$output_path"
-    return 0
+        create_minimal_rootfs "$output_path"
+        return 0
 }
 
 # Create a minimal rootfs manually as fallback
@@ -97,7 +97,7 @@ create_minimal_rootfs() {
     for lib in "$temp_dir"/lib/ld-linux*.so.*; do
         if [ -f "$lib" ]; then
             ln -sf "../lib/$(basename "$lib")" "$temp_dir/lib64/$(basename "$lib")" 2>/dev/null || true
-        fi
+    fi
     done
     
     # Create essential files

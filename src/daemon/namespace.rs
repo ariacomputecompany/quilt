@@ -4,6 +4,8 @@ use nix::mount::{mount, MsFlags};
 use nix::sys::wait::{waitpid, WaitStatus};
 use std::path::Path;
 use crate::utils::{ConsoleLogger, ProcessUtils};
+use crate::utils::CommandExecutor;
+use crate::icc::network::ContainerNetworkConfig;
 
 #[derive(Debug, Clone)]
 pub struct NamespaceConfig {
@@ -21,7 +23,7 @@ impl Default for NamespaceConfig {
             mount: true,    // Keep mount namespace for basic isolation
             uts: false,     // UTS can cause issues in some environments
             ipc: false,     // IPC namespace disabled for compatibility
-            network: false, // Network namespace disabled for compatibility
+            network: true,  // Enable network namespace for ICC
         }
     }
 }
@@ -243,27 +245,53 @@ impl NamespaceManager {
         Ok(())
     }
 
+    /// Setup the network for a container with a veth pair
+    pub fn setup_container_network(&self, config: &ContainerNetworkConfig) -> Result<(), String> {
+        ConsoleLogger::debug(&format!("Configuring container network for {}", config.container_id));
+        
+        // Move veth peer into container's network namespace
+        CommandExecutor::execute_shell(&format!("ip link set {} netns {}", 
+            config.veth_container_name,
+            ProcessUtils::pid_to_i32(nix::unistd::getpid())
+        ))?;
+        
+        // Rename veth peer to eth0 inside container
+        CommandExecutor::execute_shell(&format!("ip link set dev {} name eth0", config.veth_container_name))?;
+        
+        // Assign IP address to eth0
+        CommandExecutor::execute_shell(&format!("ip addr add {} dev eth0", config.ip_address))?;
+        
+        // Bring up eth0
+        CommandExecutor::execute_shell("ip link set eth0 up")?;
+        
+        // Bring up loopback interface
+        CommandExecutor::execute_shell("ip link set lo up")?;
+        
+        // Set default route
+        CommandExecutor::execute_shell("ip route add default via 10.42.0.1")?;
+
+        ConsoleLogger::success("Container network configured successfully");
+        Ok(())
+    }
+
     /// Setup basic loopback networking in the network namespace
     pub fn setup_network_namespace(&self) -> Result<(), String> {
-        println!("Setting up basic loopback networking");
+        ConsoleLogger::debug("Setting up basic loopback networking");
         
         // Bring up the loopback interface
-        // This is a simplified implementation - in practice you'd use netlink
+        // This is a simplified implementation - in production you'd want to use netlink
         // For now, we'll use the `ip` command if available
-        match std::process::Command::new("ip")
-            .args(["link", "set", "lo", "up"])
-            .output()
+        match CommandExecutor::execute_shell("ip link set lo up")
         {
             Ok(output) => {
-                if output.status.success() {
-                    println!("Successfully brought up loopback interface");
+                if output.success {
+                    ConsoleLogger::success("Successfully brought up loopback interface");
                 } else {
-                    eprintln!("Warning: Failed to bring up loopback interface: {}", 
-                             String::from_utf8_lossy(&output.stderr));
+                    ConsoleLogger::warning(&format!("Failed to bring up loopback interface: {}", output.stderr));
                 }
             }
             Err(e) => {
-                eprintln!("Warning: Failed to execute ip command: {}", e);
+                ConsoleLogger::warning(&format!("Failed to execute ip command: {}", e));
             }
         }
 
@@ -326,7 +354,7 @@ mod tests {
         assert!(config.mount);
         assert!(!config.uts);     // Updated to match actual default
         assert!(!config.ipc);     // Updated to match actual default
-        assert!(!config.network); // Updated to match actual default
+        assert!(config.network); // Updated to match actual default
     }
 
     #[test]

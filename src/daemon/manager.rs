@@ -160,7 +160,7 @@ impl RuntimeManager {
         for package in packages {
             if CommandExecutor::is_command_available(package) {
                 ConsoleLogger::debug(&format!("Nix package '{}' is available", package));
-            } else {
+                } else {
                 ConsoleLogger::warning(&format!("Nix package '{}' not found in standard locations", package));
                 ConsoleLogger::info("(This is normal for Nix packages - they may be available when needed)");
             }

@@ -62,9 +62,9 @@ impl SystemRuntime {
         
         for shell in &shell_candidates {
             if FileSystemUtils::is_file(shell) && FileSystemUtils::is_executable(shell) {
-                working_shell = Some(shell);
+                            working_shell = Some(shell);
                 ConsoleLogger::debug(&format!("Found executable shell: {}", shell));
-                break;
+                            break;
             }
         }
 
@@ -242,7 +242,7 @@ impl SystemRuntime {
                 for package in packages {
                     if CommandExecutor::is_command_available(package) {
                         ConsoleLogger::debug(&format!("Package '{}' available", package));
-                    } else {
+                        } else {
                         ConsoleLogger::warning(&format!("Package '{}' not found in PATH", package));
                     }
                 }

@@ -2,6 +2,7 @@ use crate::daemon::namespace::{NamespaceManager, NamespaceConfig};
 use crate::daemon::cgroup::{CgroupManager, CgroupLimits};
 use crate::daemon::manager::RuntimeManager;
 use crate::utils::{ConsoleLogger, FileSystemUtils, CommandExecutor, ProcessUtils};
+use crate::icc::network::{ContainerNetworkConfig, NetworkManager};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::process::Command;
@@ -63,6 +64,7 @@ pub struct Container {
     pub pid: Option<Pid>,
     pub rootfs_path: String,
     pub created_at: u64,
+    pub network_config: Option<ContainerNetworkConfig>,
 }
 
 impl Container {
@@ -77,6 +79,7 @@ impl Container {
             pid: None,
             rootfs_path: format!("/tmp/quilt-containers/{}", id),
             created_at: timestamp,
+            network_config: None,
         }
     }
 
@@ -127,7 +130,7 @@ impl ContainerRuntime {
         Ok(())
     }
 
-    pub fn start_container(&self, id: &str) -> Result<(), String> {
+    pub fn start_container(&self, id: &str, network_config: Option<ContainerNetworkConfig>) -> Result<(), String> {
         ConsoleLogger::progress(&format!("Starting container: {}", id));
 
         // Get container config
@@ -188,7 +191,12 @@ impl ContainerRuntime {
             }
 
             // Setup network namespace (basic loopback)
-            if let Err(e) = namespace_manager.setup_network_namespace() {
+            if let Some(config) = &network_config {
+                if let Err(e) = namespace_manager.setup_container_network(config) {
+                    eprintln!("Failed to setup container network: {}", e);
+                    return 1;
+                }
+            } else if let Err(e) = namespace_manager.setup_network_namespace() {
                 eprintln!("Failed to setup network namespace: {}", e);
                 // Non-fatal, continue
             }
@@ -414,11 +422,11 @@ impl ContainerRuntime {
                 // Check if it's a broken symlink
                 if FileSystemUtils::is_broken_symlink(&container_binary_path) {
                     ConsoleLogger::warning(&format!("Broken symlink found for {}: {}", binary_name, container_binary_path));
-                    self.fix_broken_binary(&container_binary_path, binary_name, &host_paths)?;
+                        self.fix_broken_binary(&container_binary_path, binary_name, &host_paths)?;
                 } else if !FileSystemUtils::is_executable(&container_binary_path) {
                     ConsoleLogger::warning(&format!("Binary {} is not executable", binary_name));
-                    self.fix_broken_binary(&container_binary_path, binary_name, &host_paths)?;
-                } else {
+                            self.fix_broken_binary(&container_binary_path, binary_name, &host_paths)?;
+                        } else {
                     ConsoleLogger::debug(&format!("Binary {} exists and is executable", binary_name));
                 }
             } else {
@@ -501,19 +509,19 @@ impl ContainerRuntime {
 
                 // Copy the working binary
                 match FileSystemUtils::copy_file(host_path, container_binary_path) {
-                    Ok(_) => {
+                            Ok(_) => {
                         // Make it executable
                         FileSystemUtils::make_executable(container_binary_path)?;
                         ConsoleLogger::success(&format!("Fixed binary {} by copying from {}", binary_name, host_path));
-                        return Ok(());
-                    }
-                    Err(e) => {
+                                return Ok(());
+                            }
+                            Err(e) => {
                         ConsoleLogger::warning(&format!("Failed to copy {} from {}: {}", binary_name, host_path, e));
-                        continue;
+                                continue;
+                            }
+                        }
                     }
                 }
-            }
-        }
 
         // If no suitable host binary found, create a custom shell
         if binary_name == "sh" {
@@ -554,12 +562,12 @@ impl ContainerRuntime {
         if let Some(shell_binary) = usable_shell {
             // Copy the working shell
             match FileSystemUtils::copy_file(shell_binary, shell_path) {
-                Ok(_) => {
+                            Ok(_) => {
                     FileSystemUtils::make_executable(shell_path)?;
                     ConsoleLogger::success(&format!("Created shell by copying from {}", shell_binary));
-                    return Ok(());
-                }
-                Err(e) => {
+                                return Ok(());
+                            }
+                            Err(e) => {
                     ConsoleLogger::warning(&format!("Failed to copy shell from {}: {}", shell_binary, e));
                 }
             }
@@ -1027,17 +1035,17 @@ done
         }
 
         ConsoleLogger::success("Container shell verification completed");
-        Ok(())
+                    Ok(())
     }
 
     fn extract_image(&self, image_path: &str, rootfs_path: &str) -> Result<(), String> {
         // Open and decompress the tar file
         let tar_file = std::fs::File::open(image_path)
             .map_err(|e| format!("Failed to open image file: {}", e))?;
-        
+
         let tar = GzDecoder::new(tar_file);
         let mut archive = Archive::new(tar);
-        
+
         // Extract to rootfs directory
         archive.unpack(rootfs_path)
             .map_err(|e| format!("Failed to extract image: {}", e))?;
@@ -1106,13 +1114,13 @@ done
                         container.add_log("Container stopped by user request".to_string());
                     }
                 }
-
+                
                 // Cleanup cgroups
                 let cgroup_manager = CgroupManager::new(container_id.to_string());
                 if let Err(e) = cgroup_manager.cleanup() {
                     ConsoleLogger::warning(&format!("Failed to cleanup cgroups: {}", e));
                 }
-
+                
                 ConsoleLogger::container_stopped(container_id);
                 Ok(())
             }
@@ -1160,16 +1168,18 @@ done
     }
 
     pub fn get_container_stats(&self, container_id: &str) -> Result<HashMap<String, String>, String> {
-        let mut stats = HashMap::new();
-
         let containers = self.containers.lock().unwrap();
         let container = containers.get(container_id)
             .ok_or_else(|| format!("Container {} not found", container_id))?;
 
-        // Get memory usage from cgroups
-        let cgroup_manager = CgroupManager::new(container_id.to_string());
-        if let Ok(memory_usage) = cgroup_manager.get_memory_usage() {
-            stats.insert("memory_usage_bytes".to_string(), memory_usage.to_string());
+        let mut stats = HashMap::new();
+        
+        if let Some(pid) = container.pid {
+            // Get memory usage from cgroups
+            let cgroup_manager = CgroupManager::new(container_id.to_string());
+            if let Ok(memory_usage) = cgroup_manager.get_memory_usage() {
+                stats.insert("memory_usage_bytes".to_string(), memory_usage.to_string());
+            }
         }
 
         // Get container state
@@ -1181,10 +1191,50 @@ done
         };
 
         // Get PID if available
-        if let Some(pid) = container.pid {
+            if let Some(pid) = container.pid {
             stats.insert("pid".to_string(), ProcessUtils::pid_to_i32(pid).to_string());
         }
 
         Ok(stats)
+    }
+
+    /// Set the network configuration for a container
+    pub fn set_container_network(&self, container_id: &str, network_config: ContainerNetworkConfig) -> Result<(), String> {
+        let mut containers = self.containers.lock().unwrap();
+        let container = containers.get_mut(container_id)
+            .ok_or_else(|| format!("Container {} not found", container_id))?;
+        
+        container.network_config = Some(network_config);
+        Ok(())
+    }
+
+    /// Get the network configuration for a container
+    pub fn get_container_network(&self, container_id: &str) -> Option<ContainerNetworkConfig> {
+        let containers = self.containers.lock().unwrap();
+        containers.get(container_id)?.network_config.clone()
+    }
+
+    /// Configure network for a running container
+    pub fn setup_container_network_post_start(&self, container_id: &str, network_manager: &NetworkManager) -> Result<(), String> {
+        // Get container PID
+        let container_pid = {
+            let containers = self.containers.lock().unwrap();
+            let container = containers.get(container_id)
+                .ok_or_else(|| format!("Container {} not found", container_id))?;
+            
+            container.pid
+                .ok_or_else(|| format!("Container {} is not running", container_id))?
+        };
+
+        // Get network configuration
+        let network_config = self.get_container_network(container_id)
+            .ok_or_else(|| format!("No network configuration for container {}", container_id))?;
+
+        // Setup network interface
+        network_manager.setup_container_network(&network_config, ProcessUtils::pid_to_i32(container_pid))?;
+
+        ConsoleLogger::success(&format!("Network configured for container {} at {}", 
+            container_id, network_config.ip_address));
+        Ok(())
     }
 } 

@@ -217,6 +217,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if res.exit_code != 0 || status_enum == ContainerStatus::Exited { Some(res.exit_code) } else { None },
                         &res.error_message,
                         if res.memory_usage_bytes > 0 { Some(res.memory_usage_bytes) } else { None },
+                        if !res.ip_address.is_empty() { Some(&res.ip_address) } else { None },
                     );
                 }
                 Err(e) => {
@@ -243,7 +244,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let timestamp = log_entry.timestamp;
                             let message = log_entry.message;
                             
-                            // Convert timestamp to human readable format  
+                            // Convert timestamp to human readable format
                             let formatted_time = utils::process::ProcessUtils::format_timestamp(timestamp);
                             
                             println!("[{}] {}", formatted_time, message);

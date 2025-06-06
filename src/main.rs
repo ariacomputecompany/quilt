@@ -1,8 +1,10 @@
 mod daemon;
 mod utils;
+mod icc;
 
 use daemon::{ContainerRuntime, ContainerConfig, ContainerState, CgroupLimits, NamespaceConfig};
 use utils::console::ConsoleLogger;
+use icc::network::NetworkManager;
 
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -26,12 +28,17 @@ use quilt::{
 
 pub struct QuiltServiceImpl {
     runtime: Arc<Mutex<ContainerRuntime>>,
+    network_manager: Arc<Mutex<NetworkManager>>,
 }
 
 impl QuiltServiceImpl {
     pub fn new() -> Self {
+        let network_manager = NetworkManager::new("quilt0", "10.42.0.0/16").unwrap();
+        network_manager.ensure_bridge_ready().unwrap();
+
         Self {
             runtime: Arc::new(Mutex::new(ContainerRuntime::new())),
+            network_manager: Arc::new(Mutex::new(network_manager)),
         }
     }
 }
@@ -96,15 +103,37 @@ impl QuiltService for QuiltServiceImpl {
         let runtime = self.runtime.lock().await;
         match runtime.create_container(container_id.clone(), config) {
             Ok(()) => {
-                println!("✅ Container {} created successfully", container_id);
+                ConsoleLogger::container_created(&container_id);
                 
-                // Automatically start the container
-                match runtime.start_container(&container_id) {
+                // 1. Allocate network configuration for the container
+                let network_manager = self.network_manager.lock().await;
+                let network_config = match network_manager.allocate_container_network(&container_id) {
+                    Ok(config) => config,
+                    Err(e) => {
+                        ConsoleLogger::error(&format!("Failed to allocate network for container: {}", e));
+                        return Err(Status::internal(format!("Failed to allocate network: {}", e)));
+                    }
+                };
+
+                // 2. Store network configuration in container
+                if let Err(e) = runtime.set_container_network(&container_id, network_config) {
+                    ConsoleLogger::error(&format!("Failed to store network config: {}", e));
+                    return Err(Status::internal(format!("Failed to store network config: {}", e)));
+                }
+
+                // 3. Start container with network namespaces enabled
+                match runtime.start_container(&container_id, None) {
                     Ok(()) => {
-                        println!("✅ Container {} started successfully", container_id);
+                        // 4. Set up the container's network interface now that it's running
+                        if let Err(e) = runtime.setup_container_network_post_start(&container_id, &*network_manager) {
+                            ConsoleLogger::error(&format!("Failed to configure container network: {}", e));
+                            return Err(Status::internal(format!("Failed to configure container network: {}", e)));
+                        }
+
+                        ConsoleLogger::container_started(&container_id, None);
                     }
                     Err(e) => {
-                        eprintln!("❌ Failed to start container {}: {}", container_id, e);
+                        ConsoleLogger::container_failed(&container_id, &e);
                         return Err(Status::internal(format!("Failed to start container: {}", e)));
                     }
                 }
@@ -116,7 +145,7 @@ impl QuiltService for QuiltServiceImpl {
                 }))
             }
             Err(e) => {
-                eprintln!("❌ Failed to create container: {}", e);
+                ConsoleLogger::error(&format!("Failed to create container: {}", e));
                 Ok(Response::new(CreateContainerResponse {
                     container_id: String::new(),
                     success: false,
@@ -157,7 +186,7 @@ impl QuiltService for QuiltServiceImpl {
                     .unwrap_or_default();
 
                 Ok(Response::new(GetContainerStatusResponse {
-                    container_id: req.container_id,
+                    container_id: req.container_id.clone(),
                     status: status as i32,
                     exit_code,
                     error_message,
@@ -167,6 +196,10 @@ impl QuiltService for QuiltServiceImpl {
                         .and_then(|s| s.parse().ok())
                         .unwrap_or(0),
                     rootfs_path: container.rootfs_path,
+                    ip_address: container.network_config
+                        .as_ref()
+                        .map(|nc| nc.ip_address.clone())
+                        .unwrap_or_else(|| "No IP assigned".to_string()),
                 }))
             }
             None => Err(Status::not_found(format!("Container {} not found", req.container_id))),

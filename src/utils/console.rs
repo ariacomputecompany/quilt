@@ -195,6 +195,7 @@ impl ConsoleLogger {
         exit_code: Option<i32>,
         error_message: &str,
         memory_usage: Option<u64>,
+        ip_address: Option<&str>,
     ) {
         println!("📋 Container Status:");
         println!("   ID: {}", container_id);
@@ -204,6 +205,12 @@ impl ConsoleLogger {
         
         if let Some(pid) = pid {
             println!("   PID: {}", pid);
+        }
+        
+        if let Some(ip) = ip_address {
+            if !ip.is_empty() && ip != "No IP assigned" {
+                println!("   IP: {}", ip);
+            }
         }
         
         if let Some(exit_code) = exit_code {
