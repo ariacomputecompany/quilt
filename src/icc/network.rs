@@ -3,6 +3,7 @@
 
 use crate::utils::{CommandExecutor, ConsoleLogger};
 use std::sync::{Arc, Mutex};
+use std::os::unix::net::UnixStream;
 
 #[derive(Debug, Clone)]
 pub struct NetworkConfig {
@@ -242,53 +243,29 @@ impl NetworkManager {
             return Err(format!("Failed to list interfaces: {}", interfaces_result.stderr));
         }
         
-        // Use standard eth0 interface name (Docker/Podman convention)
-        let container_interface = "eth0";
-        
-        // Check if eth0 already exists and remove it if necessary
-        let check_eth0_result = CommandExecutor::execute_shell(&format!("{} ip link show {}", ns_exec, container_interface));
-        if let Ok(result) = check_eth0_result {
-            if result.success {
-                ConsoleLogger::debug("eth0 interface already exists, removing it first");
-                // Try to delete the existing interface (may fail if it's essential)
-                let delete_result = CommandExecutor::execute_shell(&format!("{} ip link delete {}", ns_exec, container_interface));
-                if let Ok(del_res) = delete_result {
-                    if !del_res.success {
-                        ConsoleLogger::warning(&format!("Could not delete existing eth0: {}", del_res.stderr));
-                        // If we can't delete eth0, use a unique name as fallback
-                        let fallback_interface = format!("qnet{}", &config.container_id[..8]);
-                        ConsoleLogger::debug(&format!("Using fallback interface name: {}", fallback_interface));
-                        return self.configure_with_interface_name(config, container_pid, &fallback_interface, &ns_exec);
-                    } else {
-                        ConsoleLogger::debug("Successfully removed existing eth0");
-                    }
+        // Before creating the new interface, check if an interface with the same
+        // name already exists. If so, delete it to avoid conflicts.
+        if Link::get_by_name("eth0", ns_exec).is_ok() {
+            ConsoleLogger::debug("eth0 interface already exists, removing it first");
+            if let Err(e) = Link::del("eth0", ns_exec) {
+                // Ignore "Operation not supported" which can happen in some environments
+                if !e.to_string().contains("Operation not supported") {
+                    ConsoleLogger::warning(&format!("Could not delete existing eth0: {}", e));
                 }
             }
         }
-        
-        // Rename veth to eth0
-        let rename_result = CommandExecutor::execute_shell(&format!("{} ip link set {} name {}", 
-            ns_exec, config.veth_container_name, container_interface))?;
-        if !rename_result.success {
-            // If rename to eth0 fails, try with unique name
-            let fallback_interface = format!("qnet{}", &config.container_id[..8]);
-            ConsoleLogger::warning(&format!("Failed to rename to eth0: {}, trying {}", rename_result.stderr, fallback_interface));
-            return self.configure_with_interface_name(config, container_pid, &fallback_interface, &ns_exec);
-        }
-        
-        self.configure_interface_details(config, container_pid, container_interface, &ns_exec)
-    }
 
-    // Helper method to configure interface with a specific name
-    fn configure_with_interface_name(&self, config: &ContainerNetworkConfig, container_pid: i32, interface_name: &str, ns_exec: &str) -> Result<(), String> {
+        // Use a unique name for the container-side interface
+        let temp_interface_name = format!("qnet{}", &config.container_id[..8]);
+        
         // Rename veth to the specified interface name
         let rename_result = CommandExecutor::execute_shell(&format!("{} ip link set {} name {}", 
-            ns_exec, config.veth_container_name, interface_name))?;
+            ns_exec, config.veth_container_name, temp_interface_name))?;
         if !rename_result.success {
-            return Err(format!("Failed to rename interface to {}: {}", interface_name, rename_result.stderr));
+            return Err(format!("Failed to rename interface to {}: {}", temp_interface_name, rename_result.stderr));
         }
         
-        self.configure_interface_details(config, container_pid, interface_name, ns_exec)
+        self.configure_interface_details(config, container_pid, temp_interface_name, &ns_exec)
     }
 
     // Helper method to configure interface IP, routes, etc.

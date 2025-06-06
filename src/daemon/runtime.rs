@@ -110,20 +110,25 @@ impl ContainerRuntime {
 
     pub fn create_container(&self, id: String, config: ContainerConfig) -> Result<(), String> {
         ConsoleLogger::progress(&format!("Creating container: {}", id));
-
-        // Create container instance
+        
         let container = Container::new(id.clone(), config);
 
-        // Add to containers map
+        ConsoleLogger::debug(&format!("[CREATE] Locking containers map for {}", id));
         {
             let mut containers = self.containers.lock().unwrap();
             containers.insert(id.clone(), container);
         }
+        ConsoleLogger::debug(&format!("[CREATE] Unlocked containers map for {}", id));
 
         // Setup rootfs
-        self.setup_rootfs(&id)?;
+        if let Err(e) = self.setup_rootfs(&id) {
+            ConsoleLogger::error(&format!("[CREATE] Rootfs setup failed for {}: {}", id, e));
+            // Rollback: remove container from map
+            let mut containers = self.containers.lock().unwrap();
+            containers.remove(&id);
+            return Err(e);
+        }
 
-        // Update state to PENDING
         self.update_container_state(&id, ContainerState::PENDING);
 
         ConsoleLogger::container_created(&id);
@@ -131,15 +136,16 @@ impl ContainerRuntime {
     }
 
     pub fn start_container(&self, id: &str, network_config: Option<ContainerNetworkConfig>) -> Result<(), String> {
-        ConsoleLogger::progress(&format!("Starting container: {}", id));
+        ConsoleLogger::progress(&format!("[START] Starting container: {}", id));
 
-        // Get container config
+        ConsoleLogger::debug(&format!("[START] Locking containers map to get config for {}", id));
         let (config, rootfs_path) = {
             let containers = self.containers.lock().unwrap();
             let container = containers.get(id)
                 .ok_or_else(|| format!("Container {} not found", id))?;
             (container.config.clone(), container.rootfs_path.clone())
         };
+        ConsoleLogger::debug(&format!("[START] Unlocked containers map for {}", id));
 
         // Create cgroups
         let mut cgroup_manager = CgroupManager::new(id.to_string());
@@ -164,13 +170,14 @@ impl ContainerRuntime {
         let id_for_logs = id.to_string();
         let command_for_logs = format!("{:?}", config.command);
         
-        // Log start before entering child process to avoid memory allocation in child
+        ConsoleLogger::debug(&format!("[START] Locking containers map to add log for {}", id));
         {
             let mut containers = self.containers.lock().unwrap();
             if let Some(container) = containers.get_mut(id) {
                 container.add_log(format!("Starting container execution with command: {}", command_for_logs));
             }
         }
+        ConsoleLogger::debug(&format!("[START] Unlocked containers map for {}", id));
         
         // Prepare all data needed by child process (avoid heavy captures)
         let command_clone = config.command.clone();
@@ -318,6 +325,7 @@ impl ContainerRuntime {
                     }
                 }
 
+                ConsoleLogger::debug(&format!("[START] Locking containers map to update state for {}", id));
                 // Update container state
                 {
                     let mut containers = self.containers.lock().unwrap();
@@ -327,37 +335,42 @@ impl ContainerRuntime {
                         container.add_log(format!("Container started with PID: {}", pid));
                     }
                 }
+                ConsoleLogger::debug(&format!("[START] Unlocked containers map for {}", id));
 
                 // Wait for process completion in a separate task
                 let containers_clone = Arc::clone(&self.containers);
                 let id_clone = id.to_string();
-                let namespace_manager_clone = NamespaceManager::new();
-                let cgroup_manager_clone = CgroupManager::new(id.to_string());
                 
                 tokio::spawn(async move {
-                    match namespace_manager_clone.wait_for_process(pid) {
+                    let exit_code = match NamespaceManager::new().wait_for_process(pid) {
                         Ok(exit_code) => {
                             ConsoleLogger::success(&format!("Container {} exited with code: {}", id_clone, exit_code));
-                            let mut containers = containers_clone.lock().unwrap();
-                            if let Some(container) = containers.get_mut(&id_clone) {
-                                container.state = ContainerState::EXITED(exit_code);
-                                container.add_log(format!("Container exited with code: {}", exit_code));
-                                container.pid = None;
-                            }
+                            Some(exit_code)
                         }
                         Err(e) => {
                             ConsoleLogger::container_failed(&id_clone, &e);
-                            let mut containers = containers_clone.lock().unwrap();
-                            if let Some(container) = containers.get_mut(&id_clone) {
-                                container.state = ContainerState::FAILED(e.clone());
-                                container.add_log(format!("Container failed: {}", e));
-                                container.pid = None;
-                            }
+                            None
                         }
-                    }
+                    };
 
-                    // Cleanup cgroups
-                    if let Err(e) = cgroup_manager_clone.cleanup() {
+                    // Now, lock the container list to update the state
+                    ConsoleLogger::debug(&format!("[WAIT] Locking containers map to update state for {}", id_clone));
+                    let mut containers = containers_clone.lock().unwrap();
+                    if let Some(container) = containers.get_mut(&id_clone) {
+                        if let Some(code) = exit_code {
+                            container.state = ContainerState::EXITED(code);
+                            container.add_log(format!("Container exited with code: {}", code));
+                        } else {
+                            container.state = ContainerState::FAILED("Process wait failed".to_string());
+                             container.add_log("Container process wait failed".to_string());
+                        }
+                        container.pid = None;
+                    }
+                    ConsoleLogger::debug(&format!("[WAIT] Unlocked containers map for {}", id_clone));
+
+                    // Cleanup cgroups after the process has fully exited
+                    let cgroup_manager = CgroupManager::new(id_clone.to_string());
+                    if let Err(e) = cgroup_manager.cleanup() {
                         ConsoleLogger::warning(&format!("Failed to cleanup cgroups for {}: {}", id_clone, e));
                     }
                 });
@@ -372,12 +385,14 @@ impl ContainerRuntime {
     }
 
     fn setup_rootfs(&self, container_id: &str) -> Result<(), String> {
+        ConsoleLogger::debug(&format!("[ROOTFS] Locking containers map for {}", container_id));
         let containers = self.containers.lock().unwrap();
         let container = containers.get(container_id)
             .ok_or_else(|| format!("Container {} not found", container_id))?;
 
         let rootfs_path = &container.rootfs_path;
         let image_path = &container.config.image_path;
+        ConsoleLogger::debug(&format!("[ROOTFS] Unlocked containers map for {}", container_id));
 
         ConsoleLogger::progress(&format!("Setting up rootfs for container {} at {}", container_id, rootfs_path));
 
@@ -1055,26 +1070,37 @@ done
     }
 
     fn update_container_state(&self, container_id: &str, new_state: ContainerState) {
+        ConsoleLogger::debug(&format!("[STATE] Locking containers map to update state for {}", container_id));
         let mut containers = self.containers.lock().unwrap();
         if let Some(container) = containers.get_mut(container_id) {
             container.state = new_state;
         }
+        ConsoleLogger::debug(&format!("[STATE] Unlocked containers map for {}", container_id));
     }
 
     #[allow(dead_code)]
     pub fn get_container_state(&self, container_id: &str) -> Option<ContainerState> {
+        ConsoleLogger::debug(&format!("[GET] Locking containers map to get state for {}", container_id));
         let containers = self.containers.lock().unwrap();
-        containers.get(container_id).map(|c| c.state.clone())
+        let state = containers.get(container_id).map(|c| c.state.clone());
+        ConsoleLogger::debug(&format!("[GET] Unlocked containers map for {}", container_id));
+        state
     }
 
     pub fn get_container_logs(&self, container_id: &str) -> Option<Vec<LogEntry>> {
+        ConsoleLogger::debug(&format!("[GET] Locking containers map to get logs for {}", container_id));
         let containers = self.containers.lock().unwrap();
-        containers.get(container_id).map(|c| c.logs.clone())
+        let logs = containers.get(container_id).map(|c| c.logs.clone());
+        ConsoleLogger::debug(&format!("[GET] Unlocked containers map for {}", container_id));
+        logs
     }
 
     pub fn get_container_info(&self, container_id: &str) -> Option<Container> {
+        ConsoleLogger::debug(&format!("[GET] Locking containers map to get info for {}", container_id));
         let containers = self.containers.lock().unwrap();
-        containers.get(container_id).cloned()
+        let info = containers.get(container_id).cloned();
+        ConsoleLogger::debug(&format!("[GET] Unlocked containers map for {}", container_id));
+        info
     }
 
     // Internal method that doesn't lock - for use when runtime is already locked
@@ -1115,21 +1141,27 @@ done
 
     // Public method for external use that handles locking
     pub fn get_container_stats(&self, container_id: &str) -> Result<HashMap<String, String>, String> {
+        ConsoleLogger::debug(&format!("[GET] Locking containers map to get stats for {}", container_id));
         let containers = self.containers.lock().unwrap();
-        self.get_container_stats_unlocked(&containers, container_id)
+        let stats = self.get_container_stats_unlocked(&containers, container_id);
+        ConsoleLogger::debug(&format!("[GET] Unlocked containers map for {}", container_id));
+        stats
     }
 
     // Combined method for getting both info and stats efficiently
     pub fn get_container_info_and_stats(&self, container_id: &str) -> (Option<Container>, Result<HashMap<String, String>, String>) {
+        ConsoleLogger::debug(&format!("[GET] Locking containers map for info and stats for {}", container_id));
         let containers = self.containers.lock().unwrap();
         let container_info = self.get_container_info_unlocked(&containers, container_id);
         let container_stats = self.get_container_stats_unlocked(&containers, container_id);
+        ConsoleLogger::debug(&format!("[GET] Unlocked containers map for {}", container_id));
         (container_info, container_stats)
     }
 
     pub fn stop_container(&self, container_id: &str) -> Result<(), String> {
         ConsoleLogger::progress(&format!("Stopping container: {}", container_id));
 
+        ConsoleLogger::debug(&format!("[STOP] Locking containers map to get PID for {}", container_id));
         let pid = {
             let containers = self.containers.lock().unwrap();
             let container = containers.get(container_id)
@@ -1151,11 +1183,13 @@ done
                 }
             }
         };
+        ConsoleLogger::debug(&format!("[STOP] Unlocked containers map for {}", container_id));
 
         // Terminate the process gracefully with 10 second timeout
         match ProcessUtils::terminate_process(pid, 10) {
             Ok(()) => {
                 // Update container state
+                ConsoleLogger::debug(&format!("[STOP] Locking containers map to update state for {}", container_id));
                 {
                     let mut containers = self.containers.lock().unwrap();
                     if let Some(container) = containers.get_mut(container_id) {
@@ -1164,6 +1198,7 @@ done
                         container.add_log("Container stopped by user request".to_string());
                     }
                 }
+                ConsoleLogger::debug(&format!("[STOP] Unlocked containers map for {}", container_id));
                 
                 // Cleanup cgroups
                 let cgroup_manager = CgroupManager::new(container_id.to_string());
@@ -1189,12 +1224,14 @@ done
         }
 
         // Remove container from registry and get rootfs path
+        ConsoleLogger::debug(&format!("[REMOVE] Locking containers map to remove {}", container_id));
         let rootfs_path = {
             let mut containers = self.containers.lock().unwrap();
             let container = containers.remove(container_id)
                 .ok_or_else(|| format!("Container {} not found", container_id))?;
             container.rootfs_path
         };
+        ConsoleLogger::debug(&format!("[REMOVE] Unlocked containers map for {}", container_id));
 
         // Cleanup rootfs directory
         if let Err(e) = FileSystemUtils::remove_path(&rootfs_path) {
@@ -1213,28 +1250,37 @@ done
 
     #[allow(dead_code)]
     pub fn list_containers(&self) -> Vec<String> {
+        ConsoleLogger::debug("[LIST] Locking containers map");
         let containers = self.containers.lock().unwrap();
-        containers.keys().cloned().collect()
+        let keys = containers.keys().cloned().collect();
+        ConsoleLogger::debug("[LIST] Unlocked containers map");
+        keys
     }
 
     /// Set the network configuration for a container
     pub fn set_container_network(&self, container_id: &str, network_config: ContainerNetworkConfig) -> Result<(), String> {
+        ConsoleLogger::debug(&format!("[SET-NET] Locking containers map for {}", container_id));
         let mut containers = self.containers.lock().unwrap();
         let container = containers.get_mut(container_id)
             .ok_or_else(|| format!("Container {} not found", container_id))?;
         
         container.network_config = Some(network_config);
+        ConsoleLogger::debug(&format!("[SET-NET] Unlocked containers map for {}", container_id));
         Ok(())
     }
 
     /// Get the network configuration for a container
     pub fn get_container_network(&self, container_id: &str) -> Option<ContainerNetworkConfig> {
+        ConsoleLogger::debug(&format!("[GET-NET] Locking containers map for {}", container_id));
         let containers = self.containers.lock().unwrap();
-        containers.get(container_id)?.network_config.clone()
+        let config = containers.get(container_id)?.network_config.clone();
+        ConsoleLogger::debug(&format!("[GET-NET] Unlocked containers map for {}", container_id));
+        config
     }
 
     /// Configure network for a running container
     pub fn setup_container_network_post_start(&self, container_id: &str, network_manager: &NetworkManager) -> Result<(), String> {
+        ConsoleLogger::debug(&format!("[SETUP-NET] Locking containers map for {}", container_id));
         let (network_config, pid) = {
             let containers = self.containers.lock().unwrap();
             let container = containers.get(container_id)
@@ -1249,6 +1295,7 @@ done
             
             (network_config.clone(), pid)
         };
+        ConsoleLogger::debug(&format!("[SETUP-NET] Unlocked containers map for {}", container_id));
 
         // Setup the container's network interface using the network manager
         network_manager.setup_container_network(&network_config, pid.as_raw())?;

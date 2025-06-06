@@ -314,13 +314,27 @@ impl CgroupManager {
     fn add_process_v2(&self, pid: Pid) -> Result<(), String> {
         let container_cgroup = self.cgroup_root.join("quilt").join(&self.container_id);
         let cgroup_procs = container_cgroup.join("cgroup.procs");
-        
-        if let Err(e) = fs::write(&cgroup_procs, ProcessUtils::pid_to_i32(pid).to_string()) {
-            return Err(format!("Failed to add process {} to cgroup v2: {}", ProcessUtils::pid_to_i32(pid), e));
-        }
 
-        ConsoleLogger::debug(&format!("Successfully added process {} to cgroup v2", ProcessUtils::pid_to_i32(pid)));
-        Ok(())
+        // Retry mechanism to handle potential race conditions during cgroup creation
+        for attempt in 1..=5 {
+            if let Err(e) = fs::write(&cgroup_procs, ProcessUtils::pid_to_i32(pid).to_string()) {
+                if e.kind() == std::io::ErrorKind::NotFound && attempt < 5 {
+                    ConsoleLogger::warning(&format!(
+                        "Cgroup not ready for pid {}, retrying (attempt {}/5)...",
+                        ProcessUtils::pid_to_i32(pid),
+                        attempt
+                    ));
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    continue;
+                }
+                return Err(format!("Failed to add process {} to cgroup v2: {}", ProcessUtils::pid_to_i32(pid), e));
+            } else {
+                ConsoleLogger::debug(&format!("Successfully added process {} to cgroup v2", ProcessUtils::pid_to_i32(pid)));
+                return Ok(());
+            }
+        }
+        
+        Err(format!("Failed to add process {} to cgroup v2 after multiple attempts", ProcessUtils::pid_to_i32(pid)))
     }
 
     /// Add process to cgroup v1
