@@ -154,8 +154,8 @@ main() {
     log "Waiting for containers to get IP addresses..."
     sleep 5 
     
-    IP_A=$(timeout 10 $CLI_BINARY status $CONTAINER_A_ID | grep "IP" | awk '{print $2}')
-    IP_B=$(timeout 10 $CLI_BINARY status $CONTAINER_B_ID | grep "IP" | awk '{print $2}')
+    IP_A=$(timeout 10 $CLI_BINARY status $CONTAINER_A_ID | grep "IP:" | awk '{print $2}')
+    IP_B=$(timeout 10 $CLI_BINARY status $CONTAINER_B_ID | grep "IP:" | awk '{print $2}')
     
     if [ -z "$IP_A" ] || [ -z "$IP_B" ]; then
         log "Failed to get container IPs. Container A status:"

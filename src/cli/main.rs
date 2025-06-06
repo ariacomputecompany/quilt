@@ -1,10 +1,15 @@
 use clap::{Parser, Subcommand};
 use std::collections::HashMap;
 
-// Import ICC commands and shared protobuf definitions
+// Import protobuf definitions directly
+pub mod quilt {
+    tonic::include_proto!("quilt");
+}
+
+// Import CLI modules
 #[path = "../cli/mod.rs"]
 mod cli;
-use cli::{ICCCommands, quilt};
+use cli::IccCommands;
 
 use quilt::quilt_service_client::QuiltServiceClient;
 use quilt::{
@@ -112,7 +117,7 @@ enum Commands {
     
     /// Inter-Container Communication commands
     #[clap(subcommand)]
-    Icc(ICCCommands),
+    Icc(IccCommands),
 }
 
 #[tokio::main]
@@ -203,10 +208,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             match client.get_container_status(request).await {
                 Ok(response) => {
                     let res: GetContainerStatusResponse = response.into_inner();
-                    let status_enum = ContainerStatus::try_from(res.status).unwrap_or(ContainerStatus::Failed);
+                    let status_enum = match res.status {
+                        1 => ContainerStatus::Pending,
+                        2 => ContainerStatus::Running,
+                        3 => ContainerStatus::Exited,
+                        _ => ContainerStatus::Failed,
+                    };
                     let status_str = match status_enum {
                         ContainerStatus::Pending => "PENDING",
-                        ContainerStatus::Running => "RUNNING", 
+                        ContainerStatus::Running => "RUNNING",
                         ContainerStatus::Exited => "EXITED",
                         ContainerStatus::Failed => "FAILED",
                     };
@@ -311,13 +321,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         
         Commands::Icc(icc_cmd) => {
-            match cli::handle_icc_command(icc_cmd, client).await {
-                Ok(()) => {},
-                Err(e) => {
-                    eprintln!("❌ ICC command failed: {}", e);
-                    std::process::exit(1);
-                }
-            }
+            cli::icc::handle_icc_command(icc_cmd, client).await?
         }
     }
 

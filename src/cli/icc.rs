@@ -5,9 +5,9 @@ use clap::{Parser, Subcommand};
 use std::collections::HashMap;
 use tonic::transport::Channel;
 
-// Use the parent module's protobuf definitions
-use super::quilt::quilt_service_client::QuiltServiceClient;
-use super::quilt::{
+// Use protobuf definitions from parent
+use crate::quilt::quilt_service_client::QuiltServiceClient;
+use crate::quilt::{
     GetContainerStatusRequest, GetContainerStatusResponse,
     ExecContainerRequest, ExecContainerResponse,
     ContainerStatus,
@@ -15,21 +15,21 @@ use super::quilt::{
 
 #[derive(Debug, Clone)]
 pub enum ConnectionType {
-    TCP { port: u16 },
-    UDP { port: u16 },
+    Tcp { port: u16 },
+    Udp { port: u16 },
     WebSocket { path: String },
     Database { pool_size: u32, db_type: DatabaseType },
     MessageQueue { queue_name: String },
-    HTTP { method: String },
-    gRPC { service: String },
+    Http { method: String },
+    Grpc { service: String },
 }
 
 #[derive(Debug, Clone)]
 pub enum DatabaseType {
-    PostgreSQL,
-    MySQL,
+    PostgreSql,
+    MySql,
     Redis,
-    MongoDB,
+    MongoDb,
 }
 
 #[derive(Debug, Clone)]
@@ -51,7 +51,7 @@ pub enum ConnectionStatus {
 }
 
 #[derive(Subcommand, Debug)]
-pub enum ICCCommands {
+pub enum IccCommands {
     /// Test connectivity between containers
     Ping {
         #[clap(help = "Source container ID")]
@@ -202,12 +202,12 @@ pub enum NetworkAction {
 }
 
 // Implementation functions (to be implemented)
-pub async fn handle_icc_command(cmd: ICCCommands, mut client: QuiltServiceClient<Channel>) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn handle_icc_command(cmd: IccCommands, mut client: QuiltServiceClient<Channel>) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
-        ICCCommands::Ping { from_container, target, count, timeout } => {
+        IccCommands::Ping { from_container, target, count, timeout } => {
             handle_ping_command(from_container, target, count, timeout, &mut client).await
         },
-        ICCCommands::Connect { 
+        IccCommands::Connect { 
             from_container, 
             to_container, 
             connection_type, 
@@ -231,16 +231,16 @@ pub async fn handle_icc_command(cmd: ICCCommands, mut client: QuiltServiceClient
                 &mut client
             ).await
         },
-        ICCCommands::Disconnect { from_container, to_container, connection_id, force, all } => {
+        IccCommands::Disconnect { from_container, to_container, connection_id, force, all } => {
             handle_disconnect_command(from_container, to_container, connection_id, force, all, &mut client).await
         },
-        ICCCommands::Connections { action } => {
+        IccCommands::Connections { action } => {
             handle_connections_command(action, &mut client).await
         },
-        ICCCommands::Exec { container_id, workdir, env, command } => {
+        IccCommands::Exec { container_id, workdir, env, command } => {
             handle_exec_command(container_id, workdir, env, command, &mut client).await
         },
-        ICCCommands::Network { action } => {
+        IccCommands::Network { action } => {
             handle_network_command(action, &mut client).await
         },
     }
@@ -264,7 +264,12 @@ async fn handle_ping_command(
     match client.get_container_status(status_request).await {
         Ok(response) => {
             let status = response.into_inner();
-            let container_status = ContainerStatus::try_from(status.status).unwrap_or(ContainerStatus::Failed);
+            let container_status = match status.status {
+                1 => ContainerStatus::Pending,
+                2 => ContainerStatus::Running,
+                3 => ContainerStatus::Exited,
+                _ => ContainerStatus::Failed,
+            };
             
             if !matches!(container_status, ContainerStatus::Running) {
                 return Err(format!("Source container {} is not running", from_container).into());
@@ -288,7 +293,12 @@ async fn handle_ping_command(
         match client.get_container_status(target_status_request).await {
             Ok(response) => {
                 let status = response.into_inner();
-                let container_status = ContainerStatus::try_from(status.status).unwrap_or(ContainerStatus::Failed);
+                let container_status = match status.status {
+                    1 => ContainerStatus::Pending,
+                    2 => ContainerStatus::Running,
+                    3 => ContainerStatus::Exited,
+                    _ => ContainerStatus::Failed,
+                };
                 
                 if !matches!(container_status, ContainerStatus::Running) {
                     return Err(format!("Target container {} is not running", target).into());
@@ -353,9 +363,9 @@ async fn handle_connect_command(
     to_container: String,
     connection_type: String,
     port: Option<u16>,
-    pool_size: Option<u32>,
-    path: Option<String>,
-    queue: Option<String>,
+    _pool_size: Option<u32>,
+    _path: Option<String>,
+    _queue: Option<String>,
     persistent: bool,
     auto_reconnect: bool,
     client: &mut QuiltServiceClient<Channel>

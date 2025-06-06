@@ -13,6 +13,9 @@ use tar::Archive;
 use nix::unistd::{chroot, chdir, Pid, execv};
 use std::os::unix::fs::PermissionsExt;
 use std::ffi::CString;
+use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
+use crate::daemon::resource::ResourceManager;
 
 #[derive(Debug, Clone)]
 pub enum ContainerState {
@@ -97,6 +100,7 @@ pub struct ContainerRuntime {
     containers: Arc<Mutex<HashMap<String, Container>>>,
     namespace_manager: NamespaceManager,
     runtime_manager: RuntimeManager,
+    resource_manager: ResourceManager,
 }
 
 impl ContainerRuntime {
@@ -105,6 +109,7 @@ impl ContainerRuntime {
             containers: Arc::new(Mutex::new(HashMap::new())),
             namespace_manager: NamespaceManager::new(),
             runtime_manager: RuntimeManager::new(),
+            resource_manager: ResourceManager::new(),
         }
     }
 
@@ -138,6 +143,7 @@ impl ContainerRuntime {
     pub fn start_container(&self, id: &str, network_config: Option<ContainerNetworkConfig>) -> Result<(), String> {
         ConsoleLogger::progress(&format!("[START] Starting container: {}", id));
 
+        // Get container configuration
         ConsoleLogger::debug(&format!("[START] Locking containers map to get config for {}", id));
         let (config, rootfs_path) = {
             let containers = self.containers.lock().unwrap();
@@ -146,6 +152,21 @@ impl ContainerRuntime {
             (container.config.clone(), container.rootfs_path.clone())
         };
         ConsoleLogger::debug(&format!("[START] Unlocked containers map for {}", id));
+
+        // Register mounts with ResourceManager
+        let mount_points = vec![
+            format!("{}/proc", rootfs_path),
+            format!("{}/sys", rootfs_path),
+            format!("{}/dev/pts", rootfs_path),
+            rootfs_path.clone(),
+        ];
+        let resource_manager = ResourceManager::global();
+        resource_manager.register_mounts(id, mount_points);
+
+        // Register network config with ResourceManager if available
+        if let Some(ref net_config) = network_config {
+            resource_manager.register_network(id, net_config.clone());
+        }
 
         // Create cgroups
         let mut cgroup_manager = CgroupManager::new(id.to_string());
@@ -353,25 +374,27 @@ impl ContainerRuntime {
                         }
                     };
 
-                    // Now, lock the container list to update the state
+                    // Update container state first
                     ConsoleLogger::debug(&format!("[WAIT] Locking containers map to update state for {}", id_clone));
-                    let mut containers = containers_clone.lock().unwrap();
-                    if let Some(container) = containers.get_mut(&id_clone) {
-                        if let Some(code) = exit_code {
-                            container.state = ContainerState::EXITED(code);
-                            container.add_log(format!("Container exited with code: {}", code));
-                        } else {
-                            container.state = ContainerState::FAILED("Process wait failed".to_string());
-                             container.add_log("Container process wait failed".to_string());
+                    {
+                        let mut containers = containers_clone.lock().unwrap();
+                        if let Some(container) = containers.get_mut(&id_clone) {
+                            if let Some(code) = exit_code {
+                                container.state = ContainerState::EXITED(code);
+                                container.add_log(format!("Container exited with code: {}", code));
+                            } else {
+                                container.state = ContainerState::FAILED("Process wait failed".to_string());
+                                container.add_log("Container process wait failed".to_string());
+                            }
+                            container.pid = None;
                         }
-                        container.pid = None;
                     }
                     ConsoleLogger::debug(&format!("[WAIT] Unlocked containers map for {}", id_clone));
 
-                    // Cleanup cgroups after the process has fully exited
-                    let cgroup_manager = CgroupManager::new(id_clone.to_string());
-                    if let Err(e) = cgroup_manager.cleanup() {
-                        ConsoleLogger::warning(&format!("Failed to cleanup cgroups for {}: {}", id_clone, e));
+                    // Comprehensive resource cleanup using ResourceManager
+                    let resource_manager = ResourceManager::global();
+                    if let Err(e) = resource_manager.cleanup_container_resources(&id_clone, Some(pid)) {
+                        ConsoleLogger::warning(&format!("Resource cleanup failed for {}: {}", id_clone, e));
                     }
                 });
 
@@ -1200,10 +1223,10 @@ done
                 }
                 ConsoleLogger::debug(&format!("[STOP] Unlocked containers map for {}", container_id));
                 
-                // Cleanup cgroups
-                let cgroup_manager = CgroupManager::new(container_id.to_string());
-                if let Err(e) = cgroup_manager.cleanup() {
-                    ConsoleLogger::warning(&format!("Failed to cleanup cgroups: {}", e));
+                // Comprehensive resource cleanup using ResourceManager
+                let resource_manager = ResourceManager::global();
+                if let Err(e) = resource_manager.cleanup_container_resources(container_id, Some(pid)) {
+                    ConsoleLogger::warning(&format!("Resource cleanup failed for {}: {}", container_id, e));
                 }
                 
                 ConsoleLogger::container_stopped(container_id);
@@ -1218,30 +1241,34 @@ done
     pub fn remove_container(&self, container_id: &str) -> Result<(), String> {
         ConsoleLogger::progress(&format!("Removing container: {}", container_id));
 
+        // Get container PID before stopping if it's running
+        let container_pid = {
+            let containers = self.containers.lock().unwrap();
+            containers.get(container_id).and_then(|c| c.pid)
+        };
+
         // Stop the container first if it's running
         if let Err(e) = self.stop_container(container_id) {
             ConsoleLogger::warning(&format!("Error stopping container before removal: {}", e));
         }
 
-        // Remove container from registry and get rootfs path
+        // Remove container from registry
         ConsoleLogger::debug(&format!("[REMOVE] Locking containers map to remove {}", container_id));
-        let rootfs_path = {
+        {
             let mut containers = self.containers.lock().unwrap();
-            let container = containers.remove(container_id)
+            containers.remove(container_id)
                 .ok_or_else(|| format!("Container {} not found", container_id))?;
-            container.rootfs_path
-        };
+        }
         ConsoleLogger::debug(&format!("[REMOVE] Unlocked containers map for {}", container_id));
 
-        // Cleanup rootfs directory
-        if let Err(e) = FileSystemUtils::remove_path(&rootfs_path) {
-            ConsoleLogger::warning(&format!("Failed to remove rootfs {}: {}", rootfs_path, e));
-        }
-
-        // Final cgroup cleanup
-        let cgroup_manager = CgroupManager::new(container_id.to_string());
-        if let Err(e) = cgroup_manager.cleanup() {
-            ConsoleLogger::warning(&format!("Failed to cleanup cgroups: {}", e));
+        // Use ResourceManager for comprehensive cleanup
+        let resource_manager = ResourceManager::global();
+        if let Err(e) = resource_manager.cleanup_container_resources(container_id, container_pid) {
+            ConsoleLogger::warning(&format!("Resource cleanup failed during removal: {}", e));
+            // Try emergency cleanup as fallback
+            if let Err(e2) = resource_manager.emergency_cleanup(container_id) {
+                return Err(format!("Failed to remove container {}: {} (emergency cleanup also failed: {})", container_id, e, e2));
+            }
         }
 
         ConsoleLogger::container_removed(container_id);

@@ -13,12 +13,12 @@ name = "cli"
 path = "src/cli/main.rs"
 
 [dependencies]
-tonic = "0.11"
-prost = "0.12"
-tokio = { version = "1.0", features = ["full"] }
+tonic = "0.8"
+prost = "0.11"
+tokio = { version = "1.21.2", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
-nix = { version = "0.27", features = ["process", "signal", "sched", "mount", "user", "fs", "hostname"] }
-uuid = { version = "1", features = ["v4", "serde"] }
+nix = "0.26.1"
+uuid = { version = "1.1.2", features = ["v4"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tar = "0.4"
@@ -29,9 +29,11 @@ tower = "0.4"
 clap = { version = "4.0", features = ["derive"] }
 humantime = "2.1"
 regex = "1.10"
+anyhow = "1.0.75"
+rtnetlink = "0.13.0"
 
 [build-dependencies]
-tonic-build = "0.11"
+tonic-build = "0.8"
 
 # Added to reduce debug symbols for dev builds to help with OOM linker errors
 [profile.dev]

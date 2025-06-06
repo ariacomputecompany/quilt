@@ -205,7 +205,12 @@ pub async fn handle_container_command(
             match client.get_container_status(request).await {
                 Ok(response) => {
                     let res: GetContainerStatusResponse = response.into_inner();
-                    let status_enum = ContainerStatus::try_from(res.status).unwrap_or(ContainerStatus::Failed);
+                    let status_enum = match res.status {
+                        1 => ContainerStatus::Pending,
+                        2 => ContainerStatus::Running,
+                        3 => ContainerStatus::Exited,
+                        _ => ContainerStatus::Failed,
+                    };
                     let status_str = match status_enum {
                         ContainerStatus::Pending => "PENDING",
                         ContainerStatus::Running => "RUNNING", 
