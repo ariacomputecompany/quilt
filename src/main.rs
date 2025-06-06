@@ -23,6 +23,7 @@ use quilt::{
     GetContainerLogsRequest, GetContainerLogsResponse,
     StopContainerRequest, StopContainerResponse,
     RemoveContainerRequest, RemoveContainerResponse,
+    ExecContainerRequest, ExecContainerResponse,
     LogEntry, ContainerStatus,
 };
 
@@ -33,8 +34,19 @@ pub struct QuiltServiceImpl {
 
 impl QuiltServiceImpl {
     pub fn new() -> Self {
-        let network_manager = NetworkManager::new("quilt0", "10.42.0.0/16").unwrap();
-        network_manager.ensure_bridge_ready().unwrap();
+        let network_manager = match NetworkManager::new("quilt0", "10.42.0.0/16") {
+            Ok(nm) => nm,
+            Err(e) => {
+                eprintln!("Failed to create network manager: {}", e);
+                std::process::exit(1);
+            }
+        };
+        
+        // Initialize bridge in background - don't fail startup if this fails
+        if let Err(e) = network_manager.ensure_bridge_ready() {
+            eprintln!("Warning: Failed to initialize bridge during startup: {}", e);
+            eprintln!("Bridge will be created when first container is started");
+        }
 
         Self {
             runtime: Arc::new(Mutex::new(ContainerRuntime::new())),
@@ -160,9 +172,14 @@ impl QuiltService for QuiltServiceImpl {
         request: Request<GetContainerStatusRequest>,
     ) -> Result<Response<GetContainerStatusResponse>, Status> {
         let req = request.into_inner();
-        let runtime = self.runtime.lock().await;
+        
+        // Use the deadlock-free combined method
+        let (container, stats_result) = {
+            let runtime = self.runtime.lock().await;
+            runtime.get_container_info_and_stats(&req.container_id)
+        }; // Lock is released here
 
-        match runtime.get_container_info(&req.container_id) {
+        match container {
             Some(container) => {
                 let status = match container.state {
                     ContainerState::PENDING => ContainerStatus::Pending,
@@ -181,9 +198,8 @@ impl QuiltService for QuiltServiceImpl {
                     _ => String::new(),
                 };
 
-                // Get container stats
-                let stats = runtime.get_container_stats(&req.container_id)
-                    .unwrap_or_default();
+                // Use the stats we got from the combined call
+                let stats = stats_result.unwrap_or_default();
 
                 Ok(Response::new(GetContainerStatusResponse {
                     container_id: req.container_id.clone(),
@@ -276,6 +292,43 @@ impl QuiltService for QuiltServiceImpl {
                 eprintln!("❌ Failed to remove container {}: {}", req.container_id, e);
                 Ok(Response::new(RemoveContainerResponse {
                     success: false,
+                    error_message: e,
+                }))
+            }
+        }
+    }
+
+    async fn exec_container(
+        &self,
+        request: Request<ExecContainerRequest>,
+    ) -> Result<Response<ExecContainerResponse>, Status> {
+        let req = request.into_inner();
+        let runtime = self.runtime.lock().await;
+
+        match runtime.exec_container(
+            &req.container_id,
+            req.command,
+            if req.working_directory.is_empty() { None } else { Some(req.working_directory) },
+            req.environment,
+            req.capture_output,
+        ) {
+            Ok((exit_code, stdout, stderr)) => {
+                ConsoleLogger::success(&format!("Executed command in container {} with exit code: {}", req.container_id, exit_code));
+                Ok(Response::new(ExecContainerResponse {
+                    success: exit_code == 0,
+                    exit_code,
+                    stdout,
+                    stderr,
+                    error_message: String::new(),
+                }))
+            }
+            Err(e) => {
+                eprintln!("❌ Failed to execute command in container {}: {}", req.container_id, e);
+                Ok(Response::new(ExecContainerResponse {
+                    success: false,
+                    exit_code: -1,
+                    stdout: String::new(),
+                    stderr: String::new(),
                     error_message: e,
                 }))
             }

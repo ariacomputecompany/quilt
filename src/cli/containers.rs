@@ -1,10 +1,14 @@
+// src/cli/containers.rs
+// Container management CLI commands
+
 use clap::{Parser, Subcommand};
 use std::collections::HashMap;
+use tonic::transport::Channel;
 
-// Import ICC commands and shared protobuf definitions
-#[path = "../cli/mod.rs"]
-mod cli;
-use cli::{ICCCommands, quilt};
+// Import the protobuf definitions
+pub mod quilt {
+    tonic::include_proto!("quilt");
+}
 
 use quilt::quilt_service_client::QuiltServiceClient;
 use quilt::{
@@ -13,6 +17,7 @@ use quilt::{
     GetContainerLogsRequest, GetContainerLogsResponse,
     StopContainerRequest, StopContainerResponse,
     RemoveContainerRequest, RemoveContainerResponse,
+    ExecContainerRequest, ExecContainerResponse,
     ContainerStatus,
 };
 
@@ -22,18 +27,8 @@ mod utils;
 use utils::validation::InputValidator;
 use utils::console::ConsoleLogger;
 
-#[derive(Parser, Debug)]
-#[clap(author, version, about, long_about = None)]
-#[clap(propagate_version = true)]
-struct Cli {
-    #[clap(subcommand)]
-    command: Commands,
-    #[clap(short, long, value_parser, default_value = "http://127.0.0.1:50051")]
-    server_addr: String,
-}
-
 #[derive(Subcommand, Debug)]
-enum Commands {
+pub enum ContainerCommands {
     /// Create a new container with advanced features
     Create {
         #[clap(long, help = "Path to the container image tarball")]
@@ -110,24 +105,31 @@ enum Commands {
         force: bool,
     },
     
-    /// Inter-Container Communication commands
-    #[clap(subcommand)]
-    Icc(ICCCommands),
+    /// Execute a command inside a running container
+    Exec {
+        #[clap(help = "ID of the container to execute command in")]
+        container_id: String,
+        
+        #[clap(long, help = "Working directory inside container")]
+        workdir: Option<String>,
+        
+        #[clap(long, help = "Environment variables in KEY=VALUE format", action = clap::ArgAction::Append)]
+        env: Vec<String>,
+        
+        #[clap(long, help = "Capture and return command output")]
+        capture_output: bool,
+        
+        #[clap(help = "Command and arguments to execute", required = true, num_args = 1..)]
+        command: Vec<String>,
+    },
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let cli = Cli::parse();
-
-    let mut client = QuiltServiceClient::connect(cli.server_addr.clone()).await
-        .map_err(|e| {
-            eprintln!("❌ Failed to connect to server at {}: {}", cli.server_addr, e);
-            eprintln!("   Make sure quiltd is running: ./dev.sh server-bg");
-            e
-        })?;
-
-    match cli.command {
-        Commands::Create { 
+pub async fn handle_container_command(
+    cmd: ContainerCommands,
+    mut client: QuiltServiceClient<Channel>
+) -> Result<(), Box<dyn std::error::Error>> {
+    match cmd {
+        ContainerCommands::Create { 
             image_path, 
             env, 
             setup,
@@ -197,7 +199,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         
-        Commands::Status { container_id } => {
+        ContainerCommands::Status { container_id } => {
             println!("📊 Getting status for container {}...", container_id);
             let request = tonic::Request::new(GetContainerStatusRequest { container_id }); 
             match client.get_container_status(request).await {
@@ -232,7 +234,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         
-        Commands::Logs { container_id } => {
+        ContainerCommands::Logs { container_id } => {
             println!("📜 Getting logs for container {}...", container_id);
             let request = tonic::Request::new(GetContainerLogsRequest { container_id: container_id.clone() });
             match client.get_container_logs(request).await {
@@ -264,7 +266,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         
-        Commands::Stop { container_id } => {
+        ContainerCommands::Stop { container_id } => {
             println!("🛑 Stopping container {}...", container_id);
             let request = tonic::Request::new(StopContainerRequest { 
                 container_id: container_id.clone(), 
@@ -287,7 +289,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         
-        Commands::Remove { container_id, force } => {
+        ContainerCommands::Remove { container_id, force } => {
             println!("🗑️  Removing container {}...", container_id);
             let request = tonic::Request::new(RemoveContainerRequest { 
                 container_id: container_id.clone(), 
@@ -310,11 +312,60 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         
-        Commands::Icc(icc_cmd) => {
-            match cli::handle_icc_command(icc_cmd, client).await {
-                Ok(()) => {},
+        ContainerCommands::Exec { container_id, workdir, env, capture_output, command } => {
+            println!("🚀 Executing command inside container {}...", container_id);
+            
+            // Parse environment variables
+            let mut environment = HashMap::new();
+            for env_var in env {
+                match InputValidator::parse_key_val(&env_var) {
+                    Ok((key, value)) => {
+                        environment.insert(key, value);
+                    }
+                    Err(e) => {
+                        eprintln!("❌ Invalid environment variable format '{}': {}", env_var, e);
+                        std::process::exit(1);
+                    }
+                }
+            }
+            
+            let request = tonic::Request::new(ExecContainerRequest {
+                container_id: container_id.clone(),
+                command,
+                working_directory: workdir.unwrap_or_default(),
+                environment,
+                capture_output,
+            });
+
+            match client.exec_container(request).await {
+                Ok(response) => {
+                    let res: ExecContainerResponse = response.into_inner();
+                    println!("🔄 Command completed with exit code: {}", res.exit_code);
+                    
+                    if capture_output {
+                        if !res.stdout.is_empty() {
+                            println!("📤 Standard Output:");
+                            ConsoleLogger::separator();
+                            println!("{}", res.stdout);
+                            ConsoleLogger::separator();
+                        }
+                        if !res.stderr.is_empty() {
+                            println!("📤 Standard Error:");
+                            ConsoleLogger::separator();
+                            println!("{}", res.stderr);
+                            ConsoleLogger::separator();
+                        }
+                    }
+                    
+                    if res.success {
+                        println!("✅ Command executed successfully!");
+                    } else {
+                        println!("❌ Command failed: {}", res.error_message);
+                        std::process::exit(res.exit_code);
+                    }
+                }
                 Err(e) => {
-                    eprintln!("❌ ICC command failed: {}", e);
+                    eprintln!("❌ Error executing command: {}", e.message());
                     std::process::exit(1);
                 }
             }

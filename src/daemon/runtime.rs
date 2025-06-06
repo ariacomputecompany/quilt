@@ -1077,6 +1077,56 @@ done
         containers.get(container_id).cloned()
     }
 
+    // Internal method that doesn't lock - for use when runtime is already locked
+    fn get_container_info_unlocked(&self, containers: &HashMap<String, Container>, container_id: &str) -> Option<Container> {
+        containers.get(container_id).cloned()
+    }
+
+    // Internal method that doesn't lock - for use when runtime is already locked  
+    fn get_container_stats_unlocked(&self, containers: &HashMap<String, Container>, container_id: &str) -> Result<HashMap<String, String>, String> {
+        let container = containers.get(container_id)
+            .ok_or_else(|| format!("Container {} not found", container_id))?;
+
+        let mut stats = HashMap::new();
+        
+        if let Some(pid) = container.pid {
+            // Get memory usage from cgroups
+            let cgroup_manager = CgroupManager::new(container_id.to_string());
+            if let Ok(memory_usage) = cgroup_manager.get_memory_usage() {
+                stats.insert("memory_usage_bytes".to_string(), memory_usage.to_string());
+            }
+        }
+
+        // Get container state
+        match &container.state {
+            ContainerState::PENDING => stats.insert("state".to_string(), "pending".to_string()),
+            ContainerState::RUNNING => stats.insert("state".to_string(), "running".to_string()),
+            ContainerState::EXITED(code) => stats.insert("state".to_string(), format!("exited({})", code)),
+            ContainerState::FAILED(msg) => stats.insert("state".to_string(), format!("failed: {}", msg)),
+        };
+
+        // Get PID if available
+        if let Some(pid) = container.pid {
+            stats.insert("pid".to_string(), ProcessUtils::pid_to_i32(pid).to_string());
+        }
+
+        Ok(stats)
+    }
+
+    // Public method for external use that handles locking
+    pub fn get_container_stats(&self, container_id: &str) -> Result<HashMap<String, String>, String> {
+        let containers = self.containers.lock().unwrap();
+        self.get_container_stats_unlocked(&containers, container_id)
+    }
+
+    // Combined method for getting both info and stats efficiently
+    pub fn get_container_info_and_stats(&self, container_id: &str) -> (Option<Container>, Result<HashMap<String, String>, String>) {
+        let containers = self.containers.lock().unwrap();
+        let container_info = self.get_container_info_unlocked(&containers, container_id);
+        let container_stats = self.get_container_stats_unlocked(&containers, container_id);
+        (container_info, container_stats)
+    }
+
     pub fn stop_container(&self, container_id: &str) -> Result<(), String> {
         ConsoleLogger::progress(&format!("Stopping container: {}", container_id));
 
@@ -1167,37 +1217,6 @@ done
         containers.keys().cloned().collect()
     }
 
-    pub fn get_container_stats(&self, container_id: &str) -> Result<HashMap<String, String>, String> {
-        let containers = self.containers.lock().unwrap();
-        let container = containers.get(container_id)
-            .ok_or_else(|| format!("Container {} not found", container_id))?;
-
-        let mut stats = HashMap::new();
-        
-        if let Some(pid) = container.pid {
-            // Get memory usage from cgroups
-            let cgroup_manager = CgroupManager::new(container_id.to_string());
-            if let Ok(memory_usage) = cgroup_manager.get_memory_usage() {
-                stats.insert("memory_usage_bytes".to_string(), memory_usage.to_string());
-            }
-        }
-
-        // Get container state
-        match &container.state {
-            ContainerState::PENDING => stats.insert("state".to_string(), "pending".to_string()),
-            ContainerState::RUNNING => stats.insert("state".to_string(), "running".to_string()),
-            ContainerState::EXITED(code) => stats.insert("state".to_string(), format!("exited({})", code)),
-            ContainerState::FAILED(msg) => stats.insert("state".to_string(), format!("failed: {}", msg)),
-        };
-
-        // Get PID if available
-            if let Some(pid) = container.pid {
-            stats.insert("pid".to_string(), ProcessUtils::pid_to_i32(pid).to_string());
-        }
-
-        Ok(stats)
-    }
-
     /// Set the network configuration for a container
     pub fn set_container_network(&self, container_id: &str, network_config: ContainerNetworkConfig) -> Result<(), String> {
         let mut containers = self.containers.lock().unwrap();
@@ -1216,25 +1235,110 @@ done
 
     /// Configure network for a running container
     pub fn setup_container_network_post_start(&self, container_id: &str, network_manager: &NetworkManager) -> Result<(), String> {
-        // Get container PID
-        let container_pid = {
+        let (network_config, pid) = {
             let containers = self.containers.lock().unwrap();
             let container = containers.get(container_id)
                 .ok_or_else(|| format!("Container {} not found", container_id))?;
             
-            container.pid
-                .ok_or_else(|| format!("Container {} is not running", container_id))?
+            let network_config = container.network_config
+                .as_ref()
+                .ok_or_else(|| format!("No network config for container {}", container_id))?;
+            
+            let pid = container.pid
+                .ok_or_else(|| format!("Container {} is not running", container_id))?;
+            
+            (network_config.clone(), pid)
         };
 
-        // Get network configuration
-        let network_config = self.get_container_network(container_id)
-            .ok_or_else(|| format!("No network configuration for container {}", container_id))?;
-
-        // Setup network interface
-        network_manager.setup_container_network(&network_config, ProcessUtils::pid_to_i32(container_pid))?;
-
-        ConsoleLogger::success(&format!("Network configured for container {} at {}", 
-            container_id, network_config.ip_address));
+        // Setup the container's network interface using the network manager
+        network_manager.setup_container_network(&network_config, pid.as_raw())?;
         Ok(())
+    }
+
+    /// Execute a command in a running container
+    pub fn exec_container(
+        &self,
+        container_id: &str,
+        command: Vec<String>,
+        working_directory: Option<String>,
+        environment: HashMap<String, String>,
+        capture_output: bool,
+    ) -> Result<(i32, String, String), String> {
+        ConsoleLogger::progress(&format!("Executing command in container {}: {:?}", container_id, command));
+
+        let pid = {
+            let containers = self.containers.lock().unwrap();
+            let container = containers.get(container_id)
+                .ok_or_else(|| format!("Container {} not found", container_id))?;
+            
+            // Check if container is running
+            match container.state {
+                ContainerState::RUNNING => {},
+                _ => return Err(format!("Container {} is not running", container_id)),
+            }
+            
+            container.pid
+                .ok_or_else(|| format!("Container {} has no PID", container_id))?
+        };
+
+        // Prepare the command to execute
+        let cmd_str = if command.len() == 1 {
+            command[0].clone()
+        } else {
+            command.join(" ")
+        };
+
+        // Build nsenter command to enter container's namespaces
+        let mut nsenter_cmd = vec![
+            "nsenter".to_string(),
+            "-t".to_string(), pid.as_raw().to_string(),
+            "-p".to_string(), "-m".to_string(), "-n".to_string(), "-u".to_string(), "-i".to_string(),
+        ];
+
+        // Add working directory if specified
+        if let Some(workdir) = working_directory {
+            nsenter_cmd.extend(vec!["--wd".to_string(), workdir]);
+        }
+
+        // Add environment variables
+        for (key, value) in environment {
+            nsenter_cmd.extend(vec!["-E".to_string(), format!("{}={}", key, value)]);
+        }
+
+        // Add the actual command
+        nsenter_cmd.extend(vec!["--".to_string(), "/bin/sh".to_string(), "-c".to_string(), cmd_str]);
+
+        ConsoleLogger::debug(&format!("Executing nsenter command: {:?}", nsenter_cmd));
+
+        // Execute the command
+        if capture_output {
+            match Command::new(&nsenter_cmd[0])
+                .args(&nsenter_cmd[1..])
+                .output()
+            {
+                Ok(output) => {
+                    let exit_code = output.status.code().unwrap_or(-1);
+                    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+                    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                    
+                    ConsoleLogger::debug(&format!("Command completed with exit code: {}", exit_code));
+                    Ok((exit_code, stdout, stderr))
+                }
+                Err(e) => Err(format!("Failed to execute command: {}", e)),
+            }
+        } else {
+            // Execute without capturing output (for interactive commands)
+            match Command::new(&nsenter_cmd[0])
+                .args(&nsenter_cmd[1..])
+                .status()
+            {
+                Ok(status) => {
+                    let exit_code = status.code().unwrap_or(-1);
+                    ConsoleLogger::debug(&format!("Command completed with exit code: {}", exit_code));
+                    Ok((exit_code, String::new(), String::new()))
+                }
+                Err(e) => Err(format!("Failed to execute command: {}", e)),
+            }
+        }
     }
 } 

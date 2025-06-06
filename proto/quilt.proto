@@ -14,6 +14,8 @@ service QuiltService {
     rpc StopContainer (StopContainerRequest) returns (StopContainerResponse);
     // Removes a container
     rpc RemoveContainer (RemoveContainerRequest) returns (RemoveContainerResponse);
+    // Executes a command in a running container
+    rpc ExecContainer (ExecContainerRequest) returns (ExecContainerResponse);
 }
 
 // Container status enumeration
@@ -100,4 +102,20 @@ message RemoveContainerRequest {
 message RemoveContainerResponse {
     bool success = 1;                             // Whether removal was successful
     string error_message = 2;                     // Error message if removal failed
+}
+
+message ExecContainerRequest {
+    string container_id = 1;                      // Container ID to execute command in
+    repeated string command = 2;                  // Command and arguments to execute
+    string working_directory = 3;                 // Working directory (optional)
+    map<string, string> environment = 4;          // Additional environment variables
+    bool capture_output = 5;                      // Whether to capture and return output
+}
+
+message ExecContainerResponse {
+    bool success = 1;                             // Whether execution was successful
+    int32 exit_code = 2;                         // Exit code of the executed command
+    string stdout = 3;                            // Standard output (if capture_output=true)
+    string stderr = 4;                            // Standard error (if capture_output=true)
+    string error_message = 5;                     // Error message if execution failed
 } 

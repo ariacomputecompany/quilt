@@ -129,12 +129,19 @@ impl NetworkManager {
     // Private implementation methods
     
     fn bridge_exists(&self) -> bool {
-        CommandExecutor::execute_shell(&format!("ip link show {}", self.config.bridge_name)).is_ok()
+        match CommandExecutor::execute_shell(&format!("ip link show {}", self.config.bridge_name)) {
+            Ok(result) => result.success,
+            Err(_) => false,
+        }
     }
     
     fn create_bridge(&self) -> Result<(), String> {
         ConsoleLogger::debug(&format!("Creating bridge: {}", self.config.bridge_name));
-        CommandExecutor::execute_shell(&format!("ip link add name {} type bridge", self.config.bridge_name))?;
+        let result = CommandExecutor::execute_shell(&format!("ip link add name {} type bridge", self.config.bridge_name))?;
+        if !result.success {
+            return Err(format!("Failed to create bridge: {}", result.stderr));
+        }
+        ConsoleLogger::success(&format!("Bridge {} created successfully", self.config.bridge_name));
         Ok(())
     }
     
@@ -144,17 +151,30 @@ impl NetworkManager {
         
         // Check if IP is already assigned
         let check_cmd = format!("ip addr show {} | grep {}", self.config.bridge_name, self.config.bridge_ip);
-        if CommandExecutor::execute_shell(&check_cmd).is_ok() {
-            return Ok(());
+        match CommandExecutor::execute_shell(&check_cmd) {
+            Ok(result) if result.success => {
+                ConsoleLogger::debug("Bridge IP already configured");
+                return Ok(());
+            }
+            _ => {} // Continue to assign IP
         }
         
         ConsoleLogger::debug(&format!("Assigning IP {} to bridge", bridge_cidr));
-        CommandExecutor::execute_shell(&format!("ip addr add {} dev {}", bridge_cidr, self.config.bridge_name))?;
+        let result = CommandExecutor::execute_shell(&format!("ip addr add {} dev {}", bridge_cidr, self.config.bridge_name))?;
+        if !result.success {
+            return Err(format!("Failed to assign IP to bridge: {}", result.stderr));
+        }
+        ConsoleLogger::success(&format!("Bridge IP {} assigned successfully", bridge_cidr));
         Ok(())
     }
     
     fn bring_bridge_up(&self) -> Result<(), String> {
-        CommandExecutor::execute_shell(&format!("ip link set {} up", self.config.bridge_name))?;
+        ConsoleLogger::debug(&format!("Bringing bridge {} up", self.config.bridge_name));
+        let result = CommandExecutor::execute_shell(&format!("ip link set {} up", self.config.bridge_name))?;
+        if !result.success {
+            return Err(format!("Failed to bring bridge up: {}", result.stderr));
+        }
+        ConsoleLogger::success(&format!("Bridge {} is now up", self.config.bridge_name));
         Ok(())
     }
     
@@ -172,48 +192,144 @@ impl NetworkManager {
     
     fn create_veth_pair(&self, host_name: &str, container_name: &str) -> Result<(), String> {
         ConsoleLogger::debug(&format!("Creating veth pair: {} <-> {}", host_name, container_name));
-        CommandExecutor::execute_shell(&format!("ip link add {} type veth peer name {}", 
+        let result = CommandExecutor::execute_shell(&format!("ip link add {} type veth peer name {}", 
             host_name, container_name))?;
+        if !result.success {
+            return Err(format!("Failed to create veth pair: {}", result.stderr));
+        }
+        ConsoleLogger::success(&format!("Veth pair created: {} <-> {}", host_name, container_name));
         Ok(())
     }
     
     fn connect_veth_to_bridge(&self, veth_name: &str) -> Result<(), String> {
         ConsoleLogger::debug(&format!("Connecting {} to bridge {}", veth_name, self.config.bridge_name));
-        CommandExecutor::execute_shell(&format!("ip link set {} master {}", veth_name, self.config.bridge_name))?;
-        CommandExecutor::execute_shell(&format!("ip link set {} up", veth_name))?;
+        
+        // Set veth as master to bridge
+        let master_result = CommandExecutor::execute_shell(&format!("ip link set {} master {}", veth_name, self.config.bridge_name))?;
+        if !master_result.success {
+            return Err(format!("Failed to connect {} to bridge: {}", veth_name, master_result.stderr));
+        }
+        
+        // Bring veth up
+        let up_result = CommandExecutor::execute_shell(&format!("ip link set {} up", veth_name))?;
+        if !up_result.success {
+            return Err(format!("Failed to bring {} up: {}", veth_name, up_result.stderr));
+        }
+        
+        ConsoleLogger::success(&format!("Veth {} connected to bridge and brought up", veth_name));
         Ok(())
     }
     
     fn move_veth_to_container(&self, veth_name: &str, container_pid: i32) -> Result<(), String> {
         ConsoleLogger::debug(&format!("Moving {} to container PID {}", veth_name, container_pid));
-        CommandExecutor::execute_shell(&format!("ip link set {} netns {}", veth_name, container_pid))?;
+        let result = CommandExecutor::execute_shell(&format!("ip link set {} netns {}", veth_name, container_pid))?;
+        if !result.success {
+            return Err(format!("Failed to move {} to container: {}", veth_name, result.stderr));
+        }
+        ConsoleLogger::success(&format!("Veth {} moved to container PID {}", veth_name, container_pid));
         Ok(())
     }
     
     fn configure_container_interface(&self, config: &ContainerNetworkConfig, container_pid: i32) -> Result<(), String> {
-        let ip_with_mask = format!("{}/{}", config.ip_address, config.subnet_mask);
+        ConsoleLogger::debug(&format!("Configuring container interface for {}", config.container_id));
         
         // Execute commands in container's network namespace
         let ns_exec = format!("nsenter -t {} -n", container_pid);
         
+        // Check what interfaces exist in the container
+        let interfaces_result = CommandExecutor::execute_shell(&format!("{} ip link show", ns_exec))?;
+        if !interfaces_result.success {
+            return Err(format!("Failed to list interfaces: {}", interfaces_result.stderr));
+        }
+        
+        // Use standard eth0 interface name (Docker/Podman convention)
+        let container_interface = "eth0";
+        
+        // Check if eth0 already exists and remove it if necessary
+        let check_eth0_result = CommandExecutor::execute_shell(&format!("{} ip link show {}", ns_exec, container_interface));
+        if let Ok(result) = check_eth0_result {
+            if result.success {
+                ConsoleLogger::debug("eth0 interface already exists, removing it first");
+                // Try to delete the existing interface (may fail if it's essential)
+                let delete_result = CommandExecutor::execute_shell(&format!("{} ip link delete {}", ns_exec, container_interface));
+                if let Ok(del_res) = delete_result {
+                    if !del_res.success {
+                        ConsoleLogger::warning(&format!("Could not delete existing eth0: {}", del_res.stderr));
+                        // If we can't delete eth0, use a unique name as fallback
+                        let fallback_interface = format!("qnet{}", &config.container_id[..8]);
+                        ConsoleLogger::debug(&format!("Using fallback interface name: {}", fallback_interface));
+                        return self.configure_with_interface_name(config, container_pid, &fallback_interface, &ns_exec);
+                    } else {
+                        ConsoleLogger::debug("Successfully removed existing eth0");
+                    }
+                }
+            }
+        }
+        
         // Rename veth to eth0
-        CommandExecutor::execute_shell(&format!("{} ip link set {} name eth0", 
-            ns_exec, config.veth_container_name))?;
+        let rename_result = CommandExecutor::execute_shell(&format!("{} ip link set {} name {}", 
+            ns_exec, config.veth_container_name, container_interface))?;
+        if !rename_result.success {
+            // If rename to eth0 fails, try with unique name
+            let fallback_interface = format!("qnet{}", &config.container_id[..8]);
+            ConsoleLogger::warning(&format!("Failed to rename to eth0: {}, trying {}", rename_result.stderr, fallback_interface));
+            return self.configure_with_interface_name(config, container_pid, &fallback_interface, &ns_exec);
+        }
+        
+        self.configure_interface_details(config, container_pid, container_interface, &ns_exec)
+    }
+
+    // Helper method to configure interface with a specific name
+    fn configure_with_interface_name(&self, config: &ContainerNetworkConfig, container_pid: i32, interface_name: &str, ns_exec: &str) -> Result<(), String> {
+        // Rename veth to the specified interface name
+        let rename_result = CommandExecutor::execute_shell(&format!("{} ip link set {} name {}", 
+            ns_exec, config.veth_container_name, interface_name))?;
+        if !rename_result.success {
+            return Err(format!("Failed to rename interface to {}: {}", interface_name, rename_result.stderr));
+        }
+        
+        self.configure_interface_details(config, container_pid, interface_name, ns_exec)
+    }
+
+    // Helper method to configure interface IP, routes, etc.
+    fn configure_interface_details(&self, config: &ContainerNetworkConfig, container_pid: i32, interface_name: &str, ns_exec: &str) -> Result<(), String> {
+        let ip_with_mask = format!("{}/{}", config.ip_address, config.subnet_mask);
         
         // Assign IP address
-        CommandExecutor::execute_shell(&format!("{} ip addr add {} dev eth0", 
-            ns_exec, ip_with_mask))?;
+        let ip_result = CommandExecutor::execute_shell(&format!("{} ip addr add {} dev {}", 
+            ns_exec, ip_with_mask, interface_name))?;
+        if !ip_result.success {
+            return Err(format!("Failed to assign IP: {}", ip_result.stderr));
+        }
         
         // Bring interface up
-        CommandExecutor::execute_shell(&format!("{} ip link set eth0 up", ns_exec))?;
+        let up_result = CommandExecutor::execute_shell(&format!("{} ip link set {} up", ns_exec, interface_name))?;
+        if !up_result.success {
+            return Err(format!("Failed to bring {} up: {}", interface_name, up_result.stderr));
+        }
         
         // Set up loopback
-        CommandExecutor::execute_shell(&format!("{} ip link set lo up", ns_exec))?;
+        let lo_result = CommandExecutor::execute_shell(&format!("{} ip link set lo up", ns_exec))?;
+        if !lo_result.success {
+            ConsoleLogger::warning(&format!("Failed to bring loopback up: {}", lo_result.stderr));
+        }
         
-        // Add default route
-        CommandExecutor::execute_shell(&format!("{} ip route add default via {}", 
-            ns_exec, config.gateway_ip))?;
+        // Add default route (check if it already exists first)
+        let route_check_result = CommandExecutor::execute_shell(&format!("{} ip route show default", ns_exec))?;
+        if !route_check_result.success || route_check_result.stdout.trim().is_empty() {
+            // No default route exists, add one
+            let route_result = CommandExecutor::execute_shell(&format!("{} ip route add default via {}", 
+                ns_exec, config.gateway_ip))?;
+            if !route_result.success {
+                ConsoleLogger::warning(&format!("Failed to add default route: {}", route_result.stderr));
+            } else {
+                ConsoleLogger::debug("Default route added successfully");
+            }
+        } else {
+            ConsoleLogger::debug("Default route already exists, skipping");
+        }
         
+        ConsoleLogger::success(&format!("Container interface configured: {} = {}", interface_name, ip_with_mask));
         Ok(())
     }
 } 
