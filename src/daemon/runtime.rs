@@ -218,13 +218,8 @@ impl ContainerRuntime {
                 return 1;
             }
 
-            // Setup network namespace (basic loopback)
-            if let Some(config) = &network_config {
-                if let Err(e) = namespace_manager.setup_container_network(config) {
-                    eprintln!("Failed to setup container network: {}", e);
-                    return 1;
-                }
-            } else if let Err(e) = namespace_manager.setup_network_namespace() {
+            // Setup basic network namespace (loopback only) - actual network setup happens from host
+            if let Err(e) = namespace_manager.setup_network_namespace() {
                 eprintln!("Failed to setup network namespace: {}", e);
                 // Non-fatal, continue
             }
@@ -316,6 +311,12 @@ impl ContainerRuntime {
             println!("Executing: {} {:?}", program_cstring.to_string_lossy(), 
                      arg_refs.iter().map(|cs| cs.to_string_lossy()).collect::<Vec<_>>());
             
+            // Log the actual command details for debugging
+            let exec_start = std::time::SystemTime::now();
+            println!("🕐 [EXEC] Command execution started at: {:?}", exec_start);
+            println!("🕐 [EXEC] Full command: {} {}", program_cstring.to_string_lossy(), 
+                     arg_refs[1..].iter().map(|cs| cs.to_string_lossy()).collect::<Vec<_>>().join(" "));
+            
             // This will replace the current process entirely
             match execv(&program_cstring, &arg_refs) {
                 Ok(_) => {
@@ -361,15 +362,24 @@ impl ContainerRuntime {
                 // Wait for process completion in a separate task
                 let containers_clone = Arc::clone(&self.containers);
                 let id_clone = id.to_string();
+                let start_time = std::time::SystemTime::now();
                 
                 tokio::spawn(async move {
+                    ConsoleLogger::debug(&format!("🕐 [TIMING] Started waiting for process {} at {:?}", ProcessUtils::pid_to_i32(pid), start_time));
+                    
                     let exit_code = match NamespaceManager::new().wait_for_process(pid) {
                         Ok(exit_code) => {
-                            ConsoleLogger::success(&format!("Container {} exited with code: {}", id_clone, exit_code));
+                            let elapsed = start_time.elapsed().unwrap_or_default();
+                            ConsoleLogger::success(&format!("Container {} exited with code: {} after {:?}", id_clone, exit_code, elapsed));
+                            if elapsed.as_secs() < 10 {
+                                ConsoleLogger::warning(&format!("⚠️ Container {} exited suspiciously quickly (in {:?})", id_clone, elapsed));
+                            }
                             Some(exit_code)
                         }
                         Err(e) => {
+                            let elapsed = start_time.elapsed().unwrap_or_default();
                             ConsoleLogger::container_failed(&id_clone, &e);
+                            ConsoleLogger::warning(&format!("Process wait failed after {:?}", elapsed));
                             None
                         }
                     };
@@ -1339,21 +1349,36 @@ done
         capture_output: bool,
     ) -> Result<(i32, String, String), String> {
         ConsoleLogger::progress(&format!("Executing command in container {}: {:?}", container_id, command));
+        ConsoleLogger::debug(&format!("🔍 [EXEC] Working dir: {:?}, Env vars: {}, Capture output: {}", 
+                                     working_directory, environment.len(), capture_output));
 
         let pid = {
+            ConsoleLogger::debug(&format!("🔒 [EXEC] Acquiring containers lock for {}", container_id));
             let containers = self.containers.lock().unwrap();
             let container = containers.get(container_id)
                 .ok_or_else(|| format!("Container {} not found", container_id))?;
             
             // Check if container is running
             match container.state {
-                ContainerState::RUNNING => {},
-                _ => return Err(format!("Container {} is not running", container_id)),
+                ContainerState::RUNNING => {
+                    ConsoleLogger::debug(&format!("✅ [EXEC] Container {} is running", container_id));
+                },
+                ref state => {
+                    let state_msg = match state {
+                        ContainerState::PENDING => "PENDING",
+                        ContainerState::EXITED(code) => &format!("EXITED({})", code),
+                        ContainerState::FAILED(msg) => &format!("FAILED({})", msg),
+                        _ => "UNKNOWN",
+                    };
+                    ConsoleLogger::debug(&format!("❌ [EXEC] Container {} is not running, state: {}", container_id, state_msg));
+                    return Err(format!("Container {} is not running", container_id));
+                }
             }
             
             container.pid
                 .ok_or_else(|| format!("Container {} has no PID", container_id))?
         };
+        ConsoleLogger::debug(&format!("🔓 [EXEC] Released containers lock, got PID: {}", ProcessUtils::pid_to_i32(pid)));
 
         // Prepare the command to execute
         let cmd_str = if command.len() == 1 {
@@ -1361,6 +1386,7 @@ done
         } else {
             command.join(" ")
         };
+        ConsoleLogger::debug(&format!("📝 [EXEC] Prepared command string: '{}'", cmd_str));
 
         // Build nsenter command to enter container's namespaces
         let mut nsenter_cmd = vec![
@@ -1371,48 +1397,41 @@ done
 
         // Add working directory if specified
         if let Some(workdir) = working_directory {
+            ConsoleLogger::debug(&format!("📁 [EXEC] Setting working directory: {}", workdir));
             nsenter_cmd.extend(vec!["--wd".to_string(), workdir]);
         }
 
         // Add environment variables
         for (key, value) in environment {
+            ConsoleLogger::debug(&format!("🌍 [EXEC] Setting env var: {}={}", key, value));
             nsenter_cmd.extend(vec!["-E".to_string(), format!("{}={}", key, value)]);
         }
 
         // Add the actual command
-        nsenter_cmd.extend(vec!["--".to_string(), "/bin/sh".to_string(), "-c".to_string(), cmd_str]);
+        nsenter_cmd.extend(vec!["--".to_string(), "/bin/sh".to_string(), "-c".to_string(), cmd_str.clone()]);
+        
+        ConsoleLogger::debug(&format!("🚀 [EXEC] Full nsenter command: {:?}", nsenter_cmd));
+        let exec_start = std::time::SystemTime::now();
 
-        ConsoleLogger::debug(&format!("Executing nsenter command: {:?}", nsenter_cmd));
+        // Execute the command using nsenter
+        let output = Command::new("nsenter")
+            .args(&nsenter_cmd[1..]) // Skip the "nsenter" part since we're calling it directly
+            .output()
+            .map_err(|e| format!("Failed to execute nsenter: {}", e))?;
 
-        // Execute the command
-        if capture_output {
-            match Command::new(&nsenter_cmd[0])
-                .args(&nsenter_cmd[1..])
-                .output()
-            {
-                Ok(output) => {
-                    let exit_code = output.status.code().unwrap_or(-1);
-                    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-                    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-                    
-                    ConsoleLogger::debug(&format!("Command completed with exit code: {}", exit_code));
-                    Ok((exit_code, stdout, stderr))
-                }
-                Err(e) => Err(format!("Failed to execute command: {}", e)),
-            }
-        } else {
-            // Execute without capturing output (for interactive commands)
-            match Command::new(&nsenter_cmd[0])
-                .args(&nsenter_cmd[1..])
-                .status()
-            {
-                Ok(status) => {
-                    let exit_code = status.code().unwrap_or(-1);
-                    ConsoleLogger::debug(&format!("Command completed with exit code: {}", exit_code));
-                    Ok((exit_code, String::new(), String::new()))
-                }
-                Err(e) => Err(format!("Failed to execute command: {}", e)),
-            }
+        let elapsed = exec_start.elapsed().unwrap_or_default();
+        let exit_code = output.status.code().unwrap_or(-1);
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        
+        ConsoleLogger::debug(&format!("⏱️ [EXEC] Command completed in {:?}, exit code: {}", elapsed, exit_code));
+        if !stdout.is_empty() {
+            ConsoleLogger::debug(&format!("📤 [EXEC] stdout: {}", stdout.trim()));
         }
+        if !stderr.is_empty() {
+            ConsoleLogger::debug(&format!("📤 [EXEC] stderr: {}", stderr.trim()));
+        }
+
+        Ok((exit_code, stdout, stderr))
     }
 } 

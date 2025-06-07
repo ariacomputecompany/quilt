@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
 use std::collections::HashMap;
+use std::time::Duration;
 
 // Import protobuf definitions directly
 pub mod quilt {
@@ -124,12 +125,19 @@ enum Commands {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
-    let mut client = QuiltServiceClient::connect(cli.server_addr.clone()).await
+    // Create a channel with timeout configuration
+    let channel = tonic::transport::Channel::from_shared(cli.server_addr.clone())?
+        .timeout(Duration::from_secs(10))
+        .connect_timeout(Duration::from_secs(5))
+        .connect()
+        .await
         .map_err(|e| {
             eprintln!("❌ Failed to connect to server at {}: {}", cli.server_addr, e);
             eprintln!("   Make sure quiltd is running: ./dev.sh server-bg");
             e
         })?;
+
+    let mut client = QuiltServiceClient::new(channel);
 
     match cli.command {
         Commands::Create { 
@@ -204,14 +212,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         
         Commands::Status { container_id } => {
             println!("📊 Getting status for container {}...", container_id);
-            let request = tonic::Request::new(GetContainerStatusRequest { container_id }); 
+            let mut request = tonic::Request::new(GetContainerStatusRequest { container_id }); 
+            request.set_timeout(Duration::from_secs(5));
+            
             match client.get_container_status(request).await {
                 Ok(response) => {
                     let res: GetContainerStatusResponse = response.into_inner();
                     let status_enum = match res.status {
-                        1 => ContainerStatus::Pending,
-                        2 => ContainerStatus::Running,
-                        3 => ContainerStatus::Exited,
+                        0 => ContainerStatus::Pending,
+                        1 => ContainerStatus::Running,
+                        2 => ContainerStatus::Exited,
                         _ => ContainerStatus::Failed,
                     };
                     let status_str = match status_enum {

@@ -28,7 +28,7 @@ use quilt::{
 };
 
 pub struct QuiltServiceImpl {
-    runtime: Arc<Mutex<ContainerRuntime>>,
+    runtime: Arc<ContainerRuntime>,
     network_manager: Arc<Mutex<NetworkManager>>,
 }
 
@@ -49,7 +49,7 @@ impl QuiltServiceImpl {
         }
 
         Self {
-            runtime: Arc::new(Mutex::new(ContainerRuntime::new())),
+            runtime: Arc::new(ContainerRuntime::new()),
             network_manager: Arc::new(Mutex::new(network_manager)),
         }
     }
@@ -112,20 +112,22 @@ impl QuiltService for QuiltServiceImpl {
             },
         };
 
-        let runtime = self.runtime.lock().await;
+        let runtime = Arc::clone(&self.runtime);
         match runtime.create_container(container_id.clone(), config) {
             Ok(()) => {
                 ConsoleLogger::container_created(&container_id);
                 
                 // 1. Allocate network configuration for the container
-                let network_manager = self.network_manager.lock().await;
-                let network_config = match network_manager.allocate_container_network(&container_id) {
-                    Ok(config) => config,
-                    Err(e) => {
-                        ConsoleLogger::error(&format!("Failed to allocate network for container: {}", e));
-                        return Err(Status::internal(format!("Failed to allocate network: {}", e)));
+                let network_config = {
+                    let network_manager = self.network_manager.lock().await;
+                    match network_manager.allocate_container_network(&container_id) {
+                        Ok(config) => config,
+                        Err(e) => {
+                            ConsoleLogger::error(&format!("Failed to allocate network for container: {}", e));
+                            return Err(Status::internal(format!("Failed to allocate network: {}", e)));
+                        }
                     }
-                };
+                }; // Lock is released here
 
                 // 2. Store network configuration in container
                 if let Err(e) = runtime.set_container_network(&container_id, network_config.clone()) {
@@ -137,6 +139,8 @@ impl QuiltService for QuiltServiceImpl {
                 match runtime.start_container(&container_id, Some(network_config.clone())) {
                     Ok(()) => {
                         // 4. Set up the container's network interface now that it's running
+                        // Use a fresh lock for network setup to ensure proper context
+                        let network_manager = self.network_manager.lock().await;
                         if let Err(e) = runtime.setup_container_network_post_start(&container_id, &*network_manager) {
                             ConsoleLogger::error(&format!("Failed to configure container network: {}", e));
                             return Err(Status::internal(format!("Failed to configure container network: {}", e)));
@@ -172,15 +176,15 @@ impl QuiltService for QuiltServiceImpl {
         request: Request<GetContainerStatusRequest>,
     ) -> Result<Response<GetContainerStatusResponse>, Status> {
         let req = request.into_inner();
+        ConsoleLogger::debug(&format!("🔍 [GRPC] Received get_container_status request for: {}", req.container_id));
         
         // Use the deadlock-free combined method
-        let (container, stats_result) = {
-            let runtime = self.runtime.lock().await;
-            runtime.get_container_info_and_stats(&req.container_id)
-        }; // Lock is released here
+        let (container, stats_result) = self.runtime.get_container_info_and_stats(&req.container_id);
 
         match container {
             Some(container) => {
+                ConsoleLogger::debug(&format!("📋 [GRPC] Found container: {} with state: {:?}", req.container_id, container.state));
+                
                 let status = match container.state {
                     ContainerState::PENDING => ContainerStatus::Pending,
                     ContainerState::RUNNING => ContainerStatus::Running,
@@ -200,7 +204,14 @@ impl QuiltService for QuiltServiceImpl {
 
                 // Use the stats we got from the combined call
                 let stats = stats_result.unwrap_or_default();
+                
+                let ip_address = container.network_config
+                    .as_ref()
+                    .map(|nc| nc.ip_address.clone())
+                    .unwrap_or_else(|| "No IP assigned".to_string());
 
+                ConsoleLogger::debug(&format!("✅ [GRPC] Returning status for {}: {:?}, IP: {}", req.container_id, status, ip_address));
+                
                 Ok(Response::new(GetContainerStatusResponse {
                     container_id: req.container_id.clone(),
                     status: status as i32,
@@ -212,13 +223,13 @@ impl QuiltService for QuiltServiceImpl {
                         .and_then(|s| s.parse().ok())
                         .unwrap_or(0),
                     rootfs_path: container.rootfs_path,
-                    ip_address: container.network_config
-                        .as_ref()
-                        .map(|nc| nc.ip_address.clone())
-                        .unwrap_or_else(|| "No IP assigned".to_string()),
+                    ip_address,
                 }))
             }
-            None => Err(Status::not_found(format!("Container {} not found", req.container_id))),
+            None => {
+                ConsoleLogger::debug(&format!("❌ [GRPC] Container not found: {}", req.container_id));
+                Err(Status::not_found(format!("Container {} not found", req.container_id)))
+            }
         }
     }
 
@@ -227,9 +238,8 @@ impl QuiltService for QuiltServiceImpl {
         request: Request<GetContainerLogsRequest>,
     ) -> Result<Response<GetContainerLogsResponse>, Status> {
         let req = request.into_inner();
-        let runtime = self.runtime.lock().await;
 
-        match runtime.get_container_logs(&req.container_id) {
+        match self.runtime.get_container_logs(&req.container_id) {
             Some(logs) => {
                 let log_entries: Vec<LogEntry> = logs
                     .into_iter()
@@ -253,9 +263,8 @@ impl QuiltService for QuiltServiceImpl {
         request: Request<StopContainerRequest>,
     ) -> Result<Response<StopContainerResponse>, Status> {
         let req = request.into_inner();
-        let runtime = self.runtime.lock().await;
 
-        match runtime.stop_container(&req.container_id) {
+        match self.runtime.stop_container(&req.container_id) {
             Ok(()) => {
                 println!("✅ Container {} stopped successfully", req.container_id);
                 Ok(Response::new(StopContainerResponse {
@@ -278,9 +287,8 @@ impl QuiltService for QuiltServiceImpl {
         request: Request<RemoveContainerRequest>,
     ) -> Result<Response<RemoveContainerResponse>, Status> {
         let req = request.into_inner();
-        let runtime = self.runtime.lock().await;
 
-        match runtime.remove_container(&req.container_id) {
+        match self.runtime.remove_container(&req.container_id) {
             Ok(()) => {
                 println!("✅ Container {} removed successfully", req.container_id);
                 Ok(Response::new(RemoveContainerResponse {
@@ -303,17 +311,24 @@ impl QuiltService for QuiltServiceImpl {
         request: Request<ExecContainerRequest>,
     ) -> Result<Response<ExecContainerResponse>, Status> {
         let req = request.into_inner();
-        let runtime = self.runtime.lock().await;
-
-        match runtime.exec_container(
+        ConsoleLogger::debug(&format!("🔍 [GRPC] Received exec_container request for: {} with command: {:?}", req.container_id, req.command));
+        
+        match self.runtime.exec_container(
             &req.container_id,
-            req.command,
-            if req.working_directory.is_empty() { None } else { Some(req.working_directory) },
-            req.environment,
+            req.command.clone(),
+            if req.working_directory.is_empty() { None } else { Some(req.working_directory.clone()) },
+            req.environment.clone(),
             req.capture_output,
         ) {
             Ok((exit_code, stdout, stderr)) => {
-                ConsoleLogger::success(&format!("Executed command in container {} with exit code: {}", req.container_id, exit_code));
+                ConsoleLogger::debug(&format!("✅ [GRPC] Executed command in container {} with exit code: {}", req.container_id, exit_code));
+                if !stdout.is_empty() {
+                    ConsoleLogger::debug(&format!("📤 [GRPC] Command stdout: {}", stdout.trim()));
+                }
+                if !stderr.is_empty() {
+                    ConsoleLogger::debug(&format!("📤 [GRPC] Command stderr: {}", stderr.trim()));
+                }
+                
                 Ok(Response::new(ExecContainerResponse {
                     success: exit_code == 0,
                     exit_code,
@@ -323,7 +338,7 @@ impl QuiltService for QuiltServiceImpl {
                 }))
             }
             Err(e) => {
-                eprintln!("❌ Failed to execute command in container {}: {}", req.container_id, e);
+                ConsoleLogger::error(&format!("❌ [GRPC] Failed to execute command in container {}: {}", req.container_id, e));
                 Ok(Response::new(ExecContainerResponse {
                     success: false,
                     exit_code: -1,

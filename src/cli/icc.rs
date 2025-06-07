@@ -3,6 +3,7 @@
 
 use clap::{Parser, Subcommand};
 use std::collections::HashMap;
+use std::time::Duration;
 use tonic::transport::Channel;
 
 // Use protobuf definitions from parent
@@ -257,17 +258,18 @@ async fn handle_ping_command(
     println!("🏓 Pinging from {} to {} ({} packets, {}s timeout)", from_container, target, count, timeout);
     
     // First check if the source container is running
-    let status_request = tonic::Request::new(GetContainerStatusRequest { 
+    let mut status_request = tonic::Request::new(GetContainerStatusRequest { 
         container_id: from_container.clone() 
     });
+    status_request.set_timeout(Duration::from_secs(5));
     
     match client.get_container_status(status_request).await {
         Ok(response) => {
             let status = response.into_inner();
             let container_status = match status.status {
-                1 => ContainerStatus::Pending,
-                2 => ContainerStatus::Running,
-                3 => ContainerStatus::Exited,
+                0 => ContainerStatus::Pending,
+                1 => ContainerStatus::Running,
+                2 => ContainerStatus::Exited,
                 _ => ContainerStatus::Failed,
             };
             
@@ -286,17 +288,18 @@ async fn handle_ping_command(
         target
     } else {
         // Assume it's a container ID, get its IP
-        let target_status_request = tonic::Request::new(GetContainerStatusRequest { 
+        let mut target_status_request = tonic::Request::new(GetContainerStatusRequest { 
             container_id: target.clone() 
         });
+        target_status_request.set_timeout(Duration::from_secs(5));
         
         match client.get_container_status(target_status_request).await {
             Ok(response) => {
                 let status = response.into_inner();
                 let container_status = match status.status {
-                    1 => ContainerStatus::Pending,
-                    2 => ContainerStatus::Running,
-                    3 => ContainerStatus::Exited,
+                    0 => ContainerStatus::Pending,
+                    1 => ContainerStatus::Running,
+                    2 => ContainerStatus::Exited,
                     _ => ContainerStatus::Failed,
                 };
                 
@@ -324,13 +327,14 @@ async fn handle_ping_command(
         target_ip.clone()
     ];
     
-    let exec_request = tonic::Request::new(ExecContainerRequest {
+    let mut exec_request = tonic::Request::new(ExecContainerRequest {
         container_id: from_container.clone(),
         command: ping_cmd,
         working_directory: String::new(),
         environment: HashMap::new(),
         capture_output: true,
     });
+    exec_request.set_timeout(Duration::from_secs(15)); // Longer timeout for ping execution
     
     match client.exec_container(exec_request).await {
         Ok(response) => {
@@ -452,14 +456,65 @@ async fn handle_exec_command(
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("⚡ Executing command in container {}", container_id);
     println!("   Command: {:?}", command);
-    if let Some(workdir) = workdir {
+    if let Some(ref workdir) = workdir {
         println!("   Working directory: {}", workdir);
     }
     if !env.is_empty() {
         println!("   Environment variables: {:?}", env);
     }
-    // TODO: Implement exec functionality
-    Ok(())
+
+    // Parse environment variables from "KEY=VALUE" format
+    let mut environment = HashMap::new();
+    for env_var in env {
+        if let Some((key, value)) = env_var.split_once('=') {
+            environment.insert(key.to_string(), value.to_string());
+        } else {
+            return Err(format!("Invalid environment variable format: {}. Use KEY=VALUE", env_var).into());
+        }
+    }
+
+    // Execute the command
+    let mut exec_request = tonic::Request::new(ExecContainerRequest {
+        container_id: container_id.clone(),
+        command,
+        working_directory: workdir.unwrap_or_default(),
+        environment,
+        capture_output: true,
+    });
+    exec_request.set_timeout(Duration::from_secs(30)); // Generous timeout for exec commands
+
+    match client.exec_container(exec_request).await {
+        Ok(response) => {
+            let result = response.into_inner();
+            
+            if result.success {
+                println!("✅ Command executed successfully (exit code: {})", result.exit_code);
+                if !result.stdout.is_empty() {
+                    println!("📤 Output:");
+                    println!("{}", result.stdout);
+                }
+                if !result.stderr.is_empty() {
+                    println!("⚠️ Error output:");
+                    println!("{}", result.stderr);
+                }
+            } else {
+                println!("❌ Command failed with exit code: {}", result.exit_code);
+                if !result.stderr.is_empty() {
+                    println!("📤 Error:");
+                    println!("{}", result.stderr);
+                }
+                if !result.stdout.is_empty() {
+                    println!("📤 Output:");
+                    println!("{}", result.stdout);
+                }
+            }
+            
+            Ok(())
+        }
+        Err(e) => {
+            Err(format!("Failed to execute command: {}", e).into())
+        }
+    }
 }
 
 async fn handle_network_command(action: NetworkAction, client: &mut QuiltServiceClient<Channel>) -> Result<(), Box<dyn std::error::Error>> {

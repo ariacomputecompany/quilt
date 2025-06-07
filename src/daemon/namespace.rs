@@ -80,18 +80,23 @@ impl NamespaceManager {
     where
         F: FnOnce() -> i32 + Send + 'static,
     {
-        // Use unshare to create namespaces, then fork
-        if let Err(e) = nix::sched::unshare(clone_flags) {
-            return Err(format!("Failed to unshare namespaces: {}", e));
-        }
-
-        // Now fork a child process
+        // Use fork first, then unshare in child to avoid affecting the server process
+        // This fixes the issue where unshare() was incorrectly isolating the server
+        
         match unsafe { nix::unistd::fork() } {
             Ok(nix::unistd::ForkResult::Parent { child }) => {
+                ConsoleLogger::debug(&format!("Successfully created child process with PID: {} that will setup isolated namespaces", ProcessUtils::pid_to_i32(child)));
                 Ok(child)
             }
             Ok(nix::unistd::ForkResult::Child) => {
-                // This runs in the child process
+                // This runs in the child process - now create namespaces
+                // This approach ensures the server process is never affected
+                if let Err(e) = nix::sched::unshare(clone_flags) {
+                    ConsoleLogger::error(&format!("Failed to unshare namespaces in child: {}", e));
+                    std::process::exit(1);
+                }
+                
+                // Run the child function in the isolated namespaces
                 let exit_code = child_func();
                 std::process::exit(exit_code);
             }
