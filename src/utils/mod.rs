@@ -2,6 +2,8 @@
 pub mod command;
 pub mod console;
 pub mod filesystem;
+pub mod image;
+pub mod locking;
 pub mod process;
 pub mod validation;
 
@@ -19,4 +21,10 @@ pub use filesystem::{FileSystemUtils, DirectoryCreator};
 pub use process::{ProcessUtils, PidManager};
 
 #[allow(unused_imports)]
-pub use validation::{InputValidator, ConfigValidator}; 
+pub use validation::{InputValidator, ConfigValidator};
+
+#[allow(unused_imports)]
+pub use image::{ImageManager, ImageLayerCache, ImageLayerInfo};
+
+#[allow(unused_imports)]
+pub use locking::{ConcurrentContainerRegistry, AtomicOperations, LockingMetrics}; 

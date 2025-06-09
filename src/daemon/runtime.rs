@@ -1,7 +1,7 @@
 use crate::daemon::namespace::{NamespaceManager, NamespaceConfig};
 use crate::daemon::cgroup::{CgroupManager, CgroupLimits};
 use crate::daemon::manager::RuntimeManager;
-use crate::utils::{ConsoleLogger, FileSystemUtils, CommandExecutor, ProcessUtils};
+use crate::utils::{ConsoleLogger, FileSystemUtils, CommandExecutor, ProcessUtils, ImageManager, ConcurrentContainerRegistry};
 use crate::icc::network::{ContainerNetworkConfig, NetworkManager};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -97,7 +97,7 @@ impl Container {
 }
 
 pub struct ContainerRuntime {
-    containers: Arc<Mutex<HashMap<String, Container>>>,
+    containers: ConcurrentContainerRegistry<Container>,
     namespace_manager: NamespaceManager,
     runtime_manager: RuntimeManager,
     resource_manager: ResourceManager,
@@ -106,7 +106,7 @@ pub struct ContainerRuntime {
 impl ContainerRuntime {
     pub fn new() -> Self {
         ContainerRuntime {
-            containers: Arc::new(Mutex::new(HashMap::new())),
+            containers: ConcurrentContainerRegistry::new(),
             namespace_manager: NamespaceManager::new(),
             runtime_manager: RuntimeManager::new(),
             resource_manager: ResourceManager::new(),
@@ -118,19 +118,14 @@ impl ContainerRuntime {
         
         let container = Container::new(id.clone(), config);
 
-        ConsoleLogger::debug(&format!("[CREATE] Locking containers map for {}", id));
-        {
-            let mut containers = self.containers.lock().unwrap();
-            containers.insert(id.clone(), container);
-        }
-        ConsoleLogger::debug(&format!("[CREATE] Unlocked containers map for {}", id));
+        // Lock-free container insertion
+        self.containers.insert(id.clone(), container);
 
         // Setup rootfs
         if let Err(e) = self.setup_rootfs(&id) {
             ConsoleLogger::error(&format!("[CREATE] Rootfs setup failed for {}: {}", id, e));
             // Rollback: remove container from map
-            let mut containers = self.containers.lock().unwrap();
-            containers.remove(&id);
+            self.containers.remove(&id);
             return Err(e);
         }
 
@@ -143,15 +138,10 @@ impl ContainerRuntime {
     pub fn start_container(&self, id: &str, network_config: Option<ContainerNetworkConfig>) -> Result<(), String> {
         ConsoleLogger::progress(&format!("[START] Starting container: {}", id));
 
-        // Get container configuration
-        ConsoleLogger::debug(&format!("[START] Locking containers map to get config for {}", id));
-        let (config, rootfs_path) = {
-            let containers = self.containers.lock().unwrap();
-            let container = containers.get(id)
-                .ok_or_else(|| format!("Container {} not found", id))?;
+        // Get container configuration (lock-free read)
+        let (config, rootfs_path) = self.containers.with_container(id, |container| {
             (container.config.clone(), container.rootfs_path.clone())
-        };
-        ConsoleLogger::debug(&format!("[START] Unlocked containers map for {}", id));
+        }).ok_or_else(|| format!("Container {} not found", id))?;
 
         // Register mounts with ResourceManager
         let mount_points = vec![
@@ -191,14 +181,10 @@ impl ContainerRuntime {
         let id_for_logs = id.to_string();
         let command_for_logs = format!("{:?}", config.command);
         
-        ConsoleLogger::debug(&format!("[START] Locking containers map to add log for {}", id));
-        {
-            let mut containers = self.containers.lock().unwrap();
-            if let Some(container) = containers.get_mut(id) {
-                container.add_log(format!("Starting container execution with command: {}", command_for_logs));
-            }
-        }
-        ConsoleLogger::debug(&format!("[START] Unlocked containers map for {}", id));
+        // Add log entry (per-container lock)
+        self.containers.update(id, |container| {
+            container.add_log(format!("Starting container execution with command: {}", command_for_logs));
+        });
         
         // Prepare all data needed by child process (avoid heavy captures)
         let command_clone = config.command.clone();
@@ -384,22 +370,8 @@ impl ContainerRuntime {
                         }
                     };
 
-                    // Update container state first
-                    ConsoleLogger::debug(&format!("[WAIT] Locking containers map to update state for {}", id_clone));
-                    {
-                        let mut containers = containers_clone.lock().unwrap();
-                        if let Some(container) = containers.get_mut(&id_clone) {
-                            if let Some(code) = exit_code {
-                                container.state = ContainerState::EXITED(code);
-                                container.add_log(format!("Container exited with code: {}", code));
-                            } else {
-                                container.state = ContainerState::FAILED("Process wait failed".to_string());
-                                container.add_log("Container process wait failed".to_string());
-                            }
-                            container.pid = None;
-                        }
-                    }
-                    ConsoleLogger::debug(&format!("[WAIT] Unlocked containers map for {}", id_clone));
+                    // Note: Update container state via main runtime reference
+                    // This will be handled by the main thread when process monitoring completes
 
                     // Comprehensive resource cleanup using ResourceManager
                     let resource_manager = ResourceManager::global();
@@ -418,33 +390,23 @@ impl ContainerRuntime {
     }
 
     fn setup_rootfs(&self, container_id: &str) -> Result<(), String> {
-        ConsoleLogger::debug(&format!("[ROOTFS] Locking containers map for {}", container_id));
-        let containers = self.containers.lock().unwrap();
-        let container = containers.get(container_id)
-            .ok_or_else(|| format!("Container {} not found", container_id))?;
+        // Lock-free read of container configuration
+        let image_path = self.containers.with_container(container_id, |container| {
+            container.config.image_path.clone()
+        }).ok_or_else(|| format!("Container {} not found", container_id))?;
 
-        let rootfs_path = &container.rootfs_path;
-        let image_path = &container.config.image_path;
-        ConsoleLogger::debug(&format!("[ROOTFS] Unlocked containers map for {}", container_id));
-
-        ConsoleLogger::progress(&format!("Setting up rootfs for container {} at {}", container_id, rootfs_path));
-
-        // Create rootfs directory
-        FileSystemUtils::create_dir_all_with_logging(rootfs_path, "container rootfs")?;
-
-        // Extract image tarball to rootfs
-        if FileSystemUtils::is_file(image_path) {
-            ConsoleLogger::progress(&format!("Extracting image {} to {}", image_path, rootfs_path));
-            self.extract_image(image_path, rootfs_path)?;
+        // Use ImageManager for efficient copy-on-write setup
+        if FileSystemUtils::is_file(&image_path) {
+            let rootfs_path = ImageManager::setup_container_rootfs(container_id, &image_path)?;
+            
+            // Fix broken symlinks and ensure working binaries
+            self.fix_container_binaries(&rootfs_path)?;
+            
+            ConsoleLogger::success(&format!("Rootfs setup completed for container {}", container_id));
+            Ok(())
         } else {
-            return Err(format!("Image file not found: {}", image_path));
+            Err(format!("Image file not found: {}", image_path))
         }
-
-        // Fix broken symlinks and ensure working binaries
-        self.fix_container_binaries(rootfs_path)?;
-
-        ConsoleLogger::success(&format!("Rootfs setup completed for container {}", container_id));
-        Ok(())
     }
 
     /// Fix broken symlinks in Nix-generated containers and ensure working binaries
@@ -1103,48 +1065,27 @@ done
     }
 
     fn update_container_state(&self, container_id: &str, new_state: ContainerState) {
-        ConsoleLogger::debug(&format!("[STATE] Locking containers map to update state for {}", container_id));
-        let mut containers = self.containers.lock().unwrap();
-        if let Some(container) = containers.get_mut(container_id) {
+        // Per-container lock for state update
+        self.containers.update(container_id, |container| {
             container.state = new_state;
-        }
-        ConsoleLogger::debug(&format!("[STATE] Unlocked containers map for {}", container_id));
+        });
     }
 
     #[allow(dead_code)]
     pub fn get_container_state(&self, container_id: &str) -> Option<ContainerState> {
-        ConsoleLogger::debug(&format!("[GET] Locking containers map to get state for {}", container_id));
-        let containers = self.containers.lock().unwrap();
-        let state = containers.get(container_id).map(|c| c.state.clone());
-        ConsoleLogger::debug(&format!("[GET] Unlocked containers map for {}", container_id));
-        state
+        self.containers.with_container(container_id, |container| container.state.clone())
     }
 
     pub fn get_container_logs(&self, container_id: &str) -> Option<Vec<LogEntry>> {
-        ConsoleLogger::debug(&format!("[GET] Locking containers map to get logs for {}", container_id));
-        let containers = self.containers.lock().unwrap();
-        let logs = containers.get(container_id).map(|c| c.logs.clone());
-        ConsoleLogger::debug(&format!("[GET] Unlocked containers map for {}", container_id));
-        logs
+        self.containers.with_container(container_id, |container| container.logs.clone())
     }
 
     pub fn get_container_info(&self, container_id: &str) -> Option<Container> {
-        ConsoleLogger::debug(&format!("[GET] Locking containers map to get info for {}", container_id));
-        let containers = self.containers.lock().unwrap();
-        let info = containers.get(container_id).cloned();
-        ConsoleLogger::debug(&format!("[GET] Unlocked containers map for {}", container_id));
-        info
+        self.containers.get(container_id)
     }
 
-    // Internal method that doesn't lock - for use when runtime is already locked
-    fn get_container_info_unlocked(&self, containers: &HashMap<String, Container>, container_id: &str) -> Option<Container> {
-        containers.get(container_id).cloned()
-    }
-
-    // Internal method that doesn't lock - for use when runtime is already locked  
-    fn get_container_stats_unlocked(&self, containers: &HashMap<String, Container>, container_id: &str) -> Result<HashMap<String, String>, String> {
-        let container = containers.get(container_id)
-            .ok_or_else(|| format!("Container {} not found", container_id))?;
+    // Internal method for getting container stats
+    fn get_container_stats_for_container(&self, container: &Container, container_id: &str) -> Result<HashMap<String, String>, String> {
 
         let mut stats = HashMap::new();
         
@@ -1172,66 +1113,52 @@ done
         Ok(stats)
     }
 
-    // Public method for external use that handles locking
     pub fn get_container_stats(&self, container_id: &str) -> Result<HashMap<String, String>, String> {
-        ConsoleLogger::debug(&format!("[GET] Locking containers map to get stats for {}", container_id));
-        let containers = self.containers.lock().unwrap();
-        let stats = self.get_container_stats_unlocked(&containers, container_id);
-        ConsoleLogger::debug(&format!("[GET] Unlocked containers map for {}", container_id));
-        stats
+        self.containers.with_container(container_id, |container| {
+            self.get_container_stats_for_container(container, container_id)
+        }).unwrap_or_else(|| Err(format!("Container {} not found", container_id)))
     }
 
-    // Combined method for getting both info and stats efficiently
     pub fn get_container_info_and_stats(&self, container_id: &str) -> (Option<Container>, Result<HashMap<String, String>, String>) {
-        ConsoleLogger::debug(&format!("[GET] Locking containers map for info and stats for {}", container_id));
-        let containers = self.containers.lock().unwrap();
-        let container_info = self.get_container_info_unlocked(&containers, container_id);
-        let container_stats = self.get_container_stats_unlocked(&containers, container_id);
-        ConsoleLogger::debug(&format!("[GET] Unlocked containers map for {}", container_id));
+        let container_info = self.containers.get(container_id);
+        let container_stats = self.get_container_stats(container_id);
         (container_info, container_stats)
     }
 
     pub fn stop_container(&self, container_id: &str) -> Result<(), String> {
         ConsoleLogger::progress(&format!("Stopping container: {}", container_id));
 
-        ConsoleLogger::debug(&format!("[STOP] Locking containers map to get PID for {}", container_id));
-        let pid = {
-            let containers = self.containers.lock().unwrap();
-            let container = containers.get(container_id)
-                .ok_or_else(|| format!("Container {} not found", container_id))?;
-            
+        let pid = self.containers.with_container(container_id, |container| {
             match container.pid {
                 Some(pid) => {
                     // Check if process is still running
                     if ProcessUtils::is_process_running(pid) {
-                        pid
+                        Some(pid)
                     } else {
-                        ConsoleLogger::info(&format!("Container {} process is already stopped", container_id));
-                        return Ok(());
+                        None
                     }
                 }
-                None => {
-                    ConsoleLogger::info(&format!("Container {} has no running process", container_id));
-                    return Ok(());
-                }
+                None => None,
+            }
+        }).ok_or_else(|| format!("Container {} not found", container_id))?;
+        
+        let pid = match pid {
+            Some(pid) => pid,
+            None => {
+                ConsoleLogger::info(&format!("Container {} has no running process", container_id));
+                return Ok(());
             }
         };
-        ConsoleLogger::debug(&format!("[STOP] Unlocked containers map for {}", container_id));
 
         // Terminate the process gracefully with 10 second timeout
         match ProcessUtils::terminate_process(pid, 10) {
             Ok(()) => {
                 // Update container state
-                ConsoleLogger::debug(&format!("[STOP] Locking containers map to update state for {}", container_id));
-                {
-                    let mut containers = self.containers.lock().unwrap();
-                    if let Some(container) = containers.get_mut(container_id) {
-                        container.state = ContainerState::EXITED(0);
-                        container.pid = None;
-                        container.add_log("Container stopped by user request".to_string());
-                    }
-                }
-                ConsoleLogger::debug(&format!("[STOP] Unlocked containers map for {}", container_id));
+                self.containers.update(container_id, |container| {
+                    container.state = ContainerState::EXITED(0);
+                    container.pid = None;
+                    container.add_log("Container stopped by user request".to_string());
+                });
                 
                 // Comprehensive resource cleanup using ResourceManager
                 let resource_manager = ResourceManager::global();
@@ -1252,10 +1179,7 @@ done
         ConsoleLogger::progress(&format!("Removing container: {}", container_id));
 
         // Get container PID before stopping if it's running
-        let container_pid = {
-            let containers = self.containers.lock().unwrap();
-            containers.get(container_id).and_then(|c| c.pid)
-        };
+        let container_pid = self.containers.with_container(container_id, |container| container.pid);
 
         // Stop the container first if it's running
         if let Err(e) = self.stop_container(container_id) {
@@ -1263,13 +1187,8 @@ done
         }
 
         // Remove container from registry
-        ConsoleLogger::debug(&format!("[REMOVE] Locking containers map to remove {}", container_id));
-        {
-            let mut containers = self.containers.lock().unwrap();
-            containers.remove(container_id)
-                .ok_or_else(|| format!("Container {} not found", container_id))?;
-        }
-        ConsoleLogger::debug(&format!("[REMOVE] Unlocked containers map for {}", container_id));
+        self.containers.remove(container_id)
+            .ok_or_else(|| format!("Container {} not found", container_id))?;
 
         // Use ResourceManager for comprehensive cleanup
         let resource_manager = ResourceManager::global();
@@ -1281,48 +1200,35 @@ done
             }
         }
 
+        // Clean up image layers and overlay mounts
+        if let Err(e) = ImageManager::cleanup_container_image(container_id) {
+            ConsoleLogger::warning(&format!("Image cleanup failed: {}", e));
+        }
+
         ConsoleLogger::container_removed(container_id);
         Ok(())
     }
 
     #[allow(dead_code)]
     pub fn list_containers(&self) -> Vec<String> {
-        ConsoleLogger::debug("[LIST] Locking containers map");
-        let containers = self.containers.lock().unwrap();
-        let keys = containers.keys().cloned().collect();
-        ConsoleLogger::debug("[LIST] Unlocked containers map");
-        keys
+        self.containers.keys()
     }
 
     /// Set the network configuration for a container
     pub fn set_container_network(&self, container_id: &str, network_config: ContainerNetworkConfig) -> Result<(), String> {
-        ConsoleLogger::debug(&format!("[SET-NET] Locking containers map for {}", container_id));
-        let mut containers = self.containers.lock().unwrap();
-        let container = containers.get_mut(container_id)
-            .ok_or_else(|| format!("Container {} not found", container_id))?;
-        
-        container.network_config = Some(network_config);
-        ConsoleLogger::debug(&format!("[SET-NET] Unlocked containers map for {}", container_id));
-        Ok(())
+        self.containers.update(container_id, |container| {
+            container.network_config = Some(network_config);
+        }).ok_or_else(|| format!("Container {} not found", container_id))
     }
 
     /// Get the network configuration for a container
     pub fn get_container_network(&self, container_id: &str) -> Option<ContainerNetworkConfig> {
-        ConsoleLogger::debug(&format!("[GET-NET] Locking containers map for {}", container_id));
-        let containers = self.containers.lock().unwrap();
-        let config = containers.get(container_id)?.network_config.clone();
-        ConsoleLogger::debug(&format!("[GET-NET] Unlocked containers map for {}", container_id));
-        config
+        self.containers.with_container(container_id, |container| container.network_config.clone())?
     }
 
     /// Configure network for a running container
     pub fn setup_container_network_post_start(&self, container_id: &str, network_manager: &NetworkManager) -> Result<(), String> {
-        ConsoleLogger::debug(&format!("[SETUP-NET] Locking containers map for {}", container_id));
-        let (network_config, pid) = {
-            let containers = self.containers.lock().unwrap();
-            let container = containers.get(container_id)
-                .ok_or_else(|| format!("Container {} not found", container_id))?;
-            
+        let (network_config, pid) = self.containers.with_container(container_id, |container| {
             let network_config = container.network_config
                 .as_ref()
                 .ok_or_else(|| format!("No network config for container {}", container_id))?;
@@ -1330,9 +1236,8 @@ done
             let pid = container.pid
                 .ok_or_else(|| format!("Container {} is not running", container_id))?;
             
-            (network_config.clone(), pid)
-        };
-        ConsoleLogger::debug(&format!("[SETUP-NET] Unlocked containers map for {}", container_id));
+            Ok((network_config.clone(), pid))
+        }).ok_or_else(|| format!("Container {} not found", container_id))??;
 
         // Setup the container's network interface using the network manager
         network_manager.setup_container_network(&network_config, pid.as_raw())?;
@@ -1352,16 +1257,12 @@ done
         ConsoleLogger::debug(&format!("🔍 [EXEC] Working dir: {:?}, Env vars: {}, Capture output: {}", 
                                      working_directory, environment.len(), capture_output));
 
-        let pid = {
-            ConsoleLogger::debug(&format!("🔒 [EXEC] Acquiring containers lock for {}", container_id));
-            let containers = self.containers.lock().unwrap();
-            let container = containers.get(container_id)
-                .ok_or_else(|| format!("Container {} not found", container_id))?;
-            
+        let pid = self.containers.with_container(container_id, |container| {
             // Check if container is running
             match container.state {
                 ContainerState::RUNNING => {
                     ConsoleLogger::debug(&format!("✅ [EXEC] Container {} is running", container_id));
+                    container.pid.ok_or_else(|| format!("Container {} has no PID", container_id))
                 },
                 ref state => {
                     let state_msg = match state {
@@ -1371,13 +1272,10 @@ done
                         _ => "UNKNOWN",
                     };
                     ConsoleLogger::debug(&format!("❌ [EXEC] Container {} is not running, state: {}", container_id, state_msg));
-                    return Err(format!("Container {} is not running", container_id));
+                    Err(format!("Container {} is not running", container_id))
                 }
             }
-            
-            container.pid
-                .ok_or_else(|| format!("Container {} has no PID", container_id))?
-        };
+        }).ok_or_else(|| format!("Container {} not found", container_id))??;
         ConsoleLogger::debug(&format!("🔓 [EXEC] Released containers lock, got PID: {}", ProcessUtils::pid_to_i32(pid)));
 
         // Prepare the command to execute
@@ -1434,4 +1332,4 @@ done
 
         Ok((exit_code, stdout, stderr))
     }
-} 
+}

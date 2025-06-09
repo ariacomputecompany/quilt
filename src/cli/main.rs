@@ -125,10 +125,13 @@ enum Commands {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
-    // Create a channel with timeout configuration
+    // Create a channel with extended timeout configuration for concurrent operations
     let channel = tonic::transport::Channel::from_shared(cli.server_addr.clone())?
-        .timeout(Duration::from_secs(10))
-        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(60))  // Increased from 10s to handle concurrent load
+        .connect_timeout(Duration::from_secs(10))  // Increased connection timeout
+        .tcp_keepalive(Some(Duration::from_secs(60)))
+        .http2_keep_alive_interval(Duration::from_secs(30))
+        .keep_alive_while_idle(true)
         .connect()
         .await
         .map_err(|e| {
