@@ -27,4 +27,6 @@ pub use validation::{InputValidator, ConfigValidator};
 pub use image::{ImageManager, ImageLayerCache, ImageLayerInfo};
 
 #[allow(unused_imports)]
-pub use locking::{ConcurrentContainerRegistry, AtomicOperations, LockingMetrics}; 
+pub use locking::{ConcurrentContainerRegistry, AtomicOperations, LockingMetrics};
+
+// Container management is now implemented directly in the daemon layer 

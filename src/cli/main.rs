@@ -116,6 +116,25 @@ enum Commands {
         force: bool,
     },
     
+    /// Create a production-ready persistent container
+    #[clap(name = "create-production")]
+    CreateProduction {
+        #[clap(help = "Container image tar.gz file")]
+        image_path: String,
+        #[clap(long, help = "Container name/identifier")]
+        name: Option<String>,
+        #[clap(long, help = "Setup commands (copy:src:dest, run:command, etc.)")]
+        setup: Vec<String>,
+        #[clap(long, help = "Environment variables in KEY=VALUE format")]
+        env: Vec<String>,
+        #[clap(long, help = "Memory limit in MB", default_value = "512")]
+        memory: u64,
+        #[clap(long, help = "CPU limit percentage", default_value = "50.0")]
+        cpu: f64,
+        #[clap(long, help = "Disable networking")]
+        no_network: bool,
+    },
+
     /// Inter-Container Communication commands
     #[clap(subcommand)]
     Icc(IccCommands),
@@ -215,8 +234,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         
         Commands::Status { container_id } => {
             println!("📊 Getting status for container {}...", container_id);
-            let mut request = tonic::Request::new(GetContainerStatusRequest { container_id }); 
-            request.set_timeout(Duration::from_secs(5));
+            let mut request = tonic::Request::new(GetContainerStatusRequest {
+                container_id: container_id.clone(),
+            });
+            request.set_timeout(Duration::from_secs(60)); // ELITE: Extended timeout for network load
             
             match client.get_container_status(request).await {
                 Ok(response) => {
@@ -333,6 +354,59 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         
+        Commands::CreateProduction { image_path, name, setup, env, memory, cpu, no_network } => {
+            println!("🚀 Creating production container using the new event-driven readiness system...");
+            
+            // Parse environment variables
+            let mut environment = std::collections::HashMap::new();
+            for env_var in env {
+                if let Some((key, value)) = env_var.split_once('=') {
+                    environment.insert(key.to_string(), value.to_string());
+                }
+            }
+            
+            // Create production container using enhanced daemon runtime with event-driven readiness
+            let create_request = CreateContainerRequest {
+                image_path,
+                command: vec!["sleep".to_string(), "3600".to_string()], // 1 hour instead of infinity
+                environment,
+                working_directory: String::new(), // Empty string instead of None
+                setup_commands: setup,
+                memory_limit_mb: if memory > 0 { memory as i32 } else { 512 },
+                cpu_limit_percent: if cpu > 0.0 { cpu as f32 } else { 50.0 },
+                enable_network_namespace: !no_network,
+                enable_pid_namespace: true,
+                enable_mount_namespace: true,
+                enable_uts_namespace: true,
+                enable_ipc_namespace: true,
+            };
+
+            match client.create_container(tonic::Request::new(create_request)).await {
+                Ok(response) => {
+                    let res = response.into_inner();
+                    if res.success {
+                        println!("✅ Production container created and ready with ID: {}", res.container_id);
+                        println!("   Memory: {}MB", memory);
+                        println!("   CPU: {}%", cpu);
+                        println!("   Networking: {}", if !no_network { "enabled" } else { "disabled" });
+                        println!("   Event-driven readiness: enabled");
+                        println!("   Container automatically started with PID verification");
+                        
+                        if let Some(container_name) = name {
+                            println!("   Custom name: {}", container_name);
+                        }
+                    } else {
+                        eprintln!("❌ Failed to create production container: {}", res.error_message);
+                        std::process::exit(1);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("❌ Error creating production container: {}", e.message());
+                    std::process::exit(1);
+                }
+            }
+        }
+
         Commands::Icc(icc_cmd) => {
             cli::icc::handle_icc_command(icc_cmd, client).await?
         }

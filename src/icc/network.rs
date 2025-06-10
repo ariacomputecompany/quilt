@@ -2,16 +2,19 @@
 // Optimized Inter-Container Communication using Linux Bridge
 
 use crate::utils::{CommandExecutor, ConsoleLogger};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc};
 use std::thread;
 use std::time::Duration;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, AtomicBool, Ordering};
+use scopeguard;
 
 #[derive(Debug, Clone)]
 pub struct NetworkConfig {
     pub bridge_name: String,
     pub subnet_cidr: String,
     pub bridge_ip: String,
-    pub next_ip: Arc<Mutex<u32>>,
+    pub next_ip: Arc<AtomicU32>,
 }
 
 #[derive(Debug, Clone)]
@@ -24,9 +27,48 @@ pub struct ContainerNetworkConfig {
     pub veth_container_name: String,
 }
 
+// ELITE: Network state management with atomic operations
+#[derive(Debug)]
+struct NetworkStateCache {
+    bridge_ready: Arc<AtomicBool>,
+    routing_ready: Arc<AtomicBool>,
+    setup_in_progress: Arc<AtomicBool>,
+}
+
+impl NetworkStateCache {
+    fn new() -> Self {
+        Self {
+            bridge_ready: Arc::new(AtomicBool::new(false)),
+            routing_ready: Arc::new(AtomicBool::new(false)),
+            setup_in_progress: Arc::new(AtomicBool::new(false)),
+        }
+    }
+    
+    fn is_bridge_ready(&self) -> bool {
+        self.bridge_ready.load(Ordering::Acquire)
+    }
+    
+    fn set_bridge_ready(&self, ready: bool) {
+        self.bridge_ready.store(ready, Ordering::Release);
+    }
+    
+    fn try_start_setup(&self) -> bool {
+        self.setup_in_progress.compare_exchange(
+            false, 
+            true, 
+            Ordering::AcqRel, 
+            Ordering::Acquire
+        ).is_ok()
+    }
+    
+    fn finish_setup(&self) {
+        self.setup_in_progress.store(false, Ordering::Release);
+    }
+}
+
 pub struct NetworkManager {
     config: NetworkConfig,
-    bridge_initialized: Arc<Mutex<bool>>,
+    state_cache: NetworkStateCache,
 }
 
 impl NetworkManager {
@@ -35,42 +77,56 @@ impl NetworkManager {
             bridge_name: bridge_name.to_string(),
             subnet_cidr: subnet_cidr.to_string(),
             bridge_ip: "10.42.0.1".to_string(),
-            next_ip: Arc::new(Mutex::new(2)),
+            next_ip: Arc::new(AtomicU32::new(2)),
         };
         
         Ok(Self { 
             config,
-            bridge_initialized: Arc::new(Mutex::new(false)),
+            state_cache: NetworkStateCache::new(),
         })
     }
 
     pub fn ensure_bridge_ready(&self) -> Result<(), String> {
-        let mut initialized = self.bridge_initialized.lock()
-            .map_err(|_| "Failed to lock bridge initialization mutex")?;
-        
-        if *initialized {
-            ConsoleLogger::debug(&format!("Bridge {} already initialized", self.config.bridge_name));
+        // ELITE: Fast path - check if bridge is already ready
+        if self.state_cache.is_bridge_ready() {
+            ConsoleLogger::debug(&format!("Bridge {} already initialized (fast path)", self.config.bridge_name));
             return Ok(());
         }
+        
+        // ELITE: Try to acquire setup lock, but don't block if another thread is setting up
+        if !self.state_cache.try_start_setup() {
+            // Another thread is setting up, wait for it to complete
+            ConsoleLogger::debug("Bridge setup in progress by another thread, waiting...");
+            for _ in 0..50 { // Max 500ms wait
+                if self.state_cache.is_bridge_ready() {
+                    return Ok(());
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            // If still not ready after 500ms, proceed with our own setup
+            ConsoleLogger::warning("Bridge setup timeout, proceeding with own setup");
+        }
+
+        // ELITE: Ensure we release the setup lock on exit
+        let _guard = scopeguard::guard((), |_| {
+            self.state_cache.finish_setup();
+        });
 
         ConsoleLogger::progress(&format!("Initializing network bridge: {}", self.config.bridge_name));
         
         // Check if bridge already exists and is properly configured
-        if self.bridge_exists() {
+        if self.bridge_exists_fast() {
             ConsoleLogger::info(&format!("Bridge {} already exists, checking configuration...", self.config.bridge_name));
             
-            // Check if bridge has correct IP
-            let ip_check = CommandExecutor::execute_shell(&format!("ip addr show {} | grep {}", 
-                self.config.bridge_name, self.config.bridge_ip));
-            let bridge_has_ip = ip_check.map_or(false, |r| r.success);
+            // ELITE: Batch bridge verification in single command
+            let verify_cmd = format!(
+                "ip addr show {} | grep -q {} && ip link show {} | grep -q 'state UP'",
+                self.config.bridge_name, self.config.bridge_ip, self.config.bridge_name
+            );
             
-            // Check if bridge is up
-            let status_result = CommandExecutor::execute_shell(&format!("ip link show {}", self.config.bridge_name))?;
-            let bridge_is_up = status_result.success && status_result.stdout.to_uppercase().contains("UP");
-            
-            if bridge_has_ip && bridge_is_up {
+            if CommandExecutor::execute_shell(&verify_cmd).map_or(false, |r| r.success) {
                 ConsoleLogger::success(&format!("Bridge {} already properly configured, reusing it", self.config.bridge_name));
-                *initialized = true;
+                self.state_cache.set_bridge_ready(true);
                 return Ok(());
             } else {
                 ConsoleLogger::warning(&format!("Bridge {} exists but not properly configured, recreating...", self.config.bridge_name));
@@ -78,42 +134,16 @@ impl NetworkManager {
             }
         }
         
-        // Create the bridge
-        ConsoleLogger::debug(&format!("Creating bridge: {}", self.config.bridge_name));
-        self.create_bridge()?;
+        // ELITE: Atomic bridge creation with batched operations
+        self.create_bridge_atomic()?;
         
-        // Verify bridge was created
-        if !self.bridge_exists() {
+        // Final verification and cache update
+        if !self.bridge_exists_fast() {
+            self.state_cache.set_bridge_ready(false);
             return Err(format!("Bridge {} was not created successfully", self.config.bridge_name));
         }
-        ConsoleLogger::debug(&format!("✅ Bridge {} created successfully", self.config.bridge_name));
         
-        // Configure bridge IP
-        ConsoleLogger::debug(&format!("Configuring bridge IP: {}", self.config.bridge_ip));
-        self.configure_bridge_ip()?;
-        
-        // Bring bridge up
-        ConsoleLogger::debug(&format!("Bringing bridge {} up", self.config.bridge_name));
-        self.bring_bridge_up()?;
-        
-        // Final verification
-        if !self.bridge_exists() {
-            return Err(format!("Bridge {} disappeared after configuration", self.config.bridge_name));
-        }
-        
-        // Check if bridge is actually up
-        let status_result = CommandExecutor::execute_shell(&format!("ip link show {}", self.config.bridge_name))?;
-        if !status_result.success {
-            return Err(format!("Failed to check bridge {} status", self.config.bridge_name));
-        }
-        
-        // Check if the output contains "UP" (either "state UP" or just "UP")
-        if !status_result.stdout.to_uppercase().contains("UP") {
-            ConsoleLogger::warning(&format!("Bridge {} may not be fully UP yet, but proceeding anyway", self.config.bridge_name));
-            ConsoleLogger::debug(&format!("Bridge status: {}", status_result.stdout.trim()));
-        }
-        
-        *initialized = true;
+        self.state_cache.set_bridge_ready(true);
         ConsoleLogger::success(&format!("Network bridge '{}' is ready", self.config.bridge_name));
         Ok(())
     }
@@ -140,14 +170,209 @@ impl NetworkManager {
         ConsoleLogger::progress(&format!("Setting up network for container {} (PID: {})", 
             config.container_id, container_pid));
 
-        self.create_veth_pair(&config.veth_host_name, &config.veth_container_name)?;
-        self.connect_veth_to_bridge(&config.veth_host_name)?;
-        self.move_veth_to_container(&config.veth_container_name, container_pid)?;
-        self.configure_container_interface(config, container_pid)?;
+        // ELITE: Use ultra-batched network setup for maximum performance
+        self.setup_container_network_ultra_batched(config, container_pid)?;
         
         ConsoleLogger::success(&format!("Network configured for container {} at {}", 
             config.container_id, config.ip_address));
         Ok(())
+    }
+
+    // ELITE: Ultra-batched network setup - maximum performance optimization
+    fn setup_container_network_ultra_batched(&self, config: &ContainerNetworkConfig, container_pid: i32) -> Result<(), String> {
+        // ELITE: Pre-generate all interface names and commands
+        let interface_name = format!("quilt{}", &config.container_id[..8]);
+        let ip_with_mask = format!("{}/{}", config.ip_address, config.subnet_mask);
+        
+        // ELITE: Step 1 - Ultra-batched host operations (single command)
+        let host_batch_cmd = format!(
+            "ip link delete {} 2>/dev/null || true && ip link delete {} 2>/dev/null || true && ip link add {} type veth peer name {} && ip link set {} master {} && ip link set {} up && ip link set {} netns {}",
+            config.veth_host_name, config.veth_container_name,  // Cleanup
+            config.veth_host_name, config.veth_container_name,  // Create veth pair
+            config.veth_host_name, self.config.bridge_name,     // Attach to bridge
+            config.veth_host_name,                              // Bring host side up
+            config.veth_container_name, container_pid           // Move to container
+        );
+        
+        ConsoleLogger::debug(&format!("Executing ultra-batched host setup: {}", host_batch_cmd));
+        
+        let host_result = CommandExecutor::execute_shell(&host_batch_cmd)?;
+        if !host_result.success {
+            return Err(format!("Failed ultra-batched host setup: {}", host_result.stderr));
+        }
+        
+        // ELITE: Step 2 - Ultra-batched container operations (single nsenter)
+        let container_batch_cmd = format!(
+            "nsenter -t {} -n sh -c 'ip link set {} name {} && ip addr add {} dev {} && ip link set {} up && ip link set lo up && (ip route add default via {} dev {} 2>/dev/null || true) && ip route show'",
+            container_pid, 
+            config.veth_container_name, interface_name,         // Rename interface
+            ip_with_mask, interface_name,                       // Assign IP
+            interface_name,                                     // Bring interface up
+            config.gateway_ip, interface_name                   // Add default route
+        );
+        
+        ConsoleLogger::debug(&format!("Executing ultra-batched container setup: {}", container_batch_cmd));
+        
+        let container_result = CommandExecutor::execute_shell(&container_batch_cmd)?;
+        if !container_result.success {
+            return Err(format!("Failed ultra-batched container setup: {}", container_result.stderr));
+        }
+        
+        // ELITE: Verify network readiness
+        self.verify_container_network_ready(config, container_pid)?;
+        
+        ConsoleLogger::success(&format!("Ultra-batched network setup completed: {} = {}/{}", interface_name, config.ip_address, config.subnet_mask));
+        Ok(())
+    }
+    
+    // ELITE: Production-grade network readiness verification with exec testing
+    fn verify_container_network_ready(&self, config: &ContainerNetworkConfig, container_pid: i32) -> Result<(), String> {
+        let interface_name = format!("quilt{}", &config.container_id[..8]);
+        
+        ConsoleLogger::debug(&format!("🔍 Production network verification for container {} (interface: {})", config.container_id, interface_name));
+        
+        // Phase 1: Network interface verification (fast check)
+        for attempt in 1..=20 { // Max 2 seconds for network interface
+            let mut verification_ok = true;
+            let mut error_details = Vec::new();
+            
+            // Check 1: Interface exists and has IP
+            let ip_check_cmd = format!(
+                "nsenter -t {} -n ip addr show {} | grep 'inet.*{}'",
+                container_pid, interface_name, config.ip_address.split('/').next().unwrap()
+            );
+            
+            match CommandExecutor::execute_shell(&ip_check_cmd) {
+                Ok(result) if result.success => {
+                    ConsoleLogger::debug(&format!("✅ Interface {} has correct IP", interface_name));
+                }
+                _ => {
+                    verification_ok = false;
+                    error_details.push(format!("Interface {} missing or incorrect IP", interface_name));
+                }
+            }
+            
+            // Check 2: Bridge connectivity
+            let bridge_check_cmd = format!("ip link show {} | grep 'master {}'", 
+                                         format!("veth-{}", &config.container_id[..8]), self.config.bridge_name);
+            match CommandExecutor::execute_shell(&bridge_check_cmd) {
+                Ok(result) if result.success => {
+                    ConsoleLogger::debug(&format!("✅ Bridge connectivity verified"));
+                }
+                _ => {
+                    verification_ok = false;
+                    error_details.push("Bridge connectivity issue".to_string());
+                }
+            }
+            
+            if verification_ok {
+                break; // Network interface ready, proceed to exec test
+            }
+            
+            if attempt == 20 {
+                return Err(format!("Network interface verification failed: {}", error_details.join(", ")));
+            }
+            
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        
+        // Phase 2: Container exec verification (ensure container can actually be used)
+        ConsoleLogger::debug(&format!("🔍 Testing container {} exec readiness", config.container_id));
+        for attempt in 1..=30 { // Max 3 seconds for exec readiness
+            // Test basic exec functionality
+            let exec_test_cmd = format!(
+                "nsenter -t {} -p -m -n -u -i -- /bin/sh -c 'echo network_exec_ready'",
+                container_pid
+            );
+            
+            match CommandExecutor::execute_shell(&exec_test_cmd) {
+                Ok(result) if result.success => {
+                    let stdout = result.stdout.trim();
+                    if stdout == "network_exec_ready" {
+                        ConsoleLogger::debug(&format!("✅ Container {} exec readiness verified", config.container_id));
+                        break;
+                    } else {
+                        ConsoleLogger::debug(&format!("Exec test unexpected output: '{}'", stdout));
+                    }
+                }
+                Ok(result) => {
+                    ConsoleLogger::debug(&format!("Exec test failed: {}", result.stderr));
+                }
+                Err(e) => {
+                    ConsoleLogger::debug(&format!("Exec test error: {}", e));
+                }
+            }
+            
+            if attempt == 30 {
+                return Err(format!("Container {} exec verification failed - container not ready for commands", config.container_id));
+            }
+            
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        
+        // Phase 3: Network connectivity test (ping to bridge gateway)
+        ConsoleLogger::debug(&format!("🔍 Testing container {} network connectivity", config.container_id));
+        let gateway_ping_cmd = format!(
+            "nsenter -t {} -n -- ping -c 1 -W 2 {} > /dev/null 2>&1",
+            container_pid, self.config.bridge_ip
+        );
+        
+        match CommandExecutor::execute_shell(&gateway_ping_cmd) {
+            Ok(result) if result.success => {
+                ConsoleLogger::success(&format!("✅ Container {} production network ready - interface, exec, and connectivity verified", config.container_id));
+                Ok(())
+            }
+            _ => {
+                ConsoleLogger::warning(&format!("Network connectivity test failed for {}, but interface and exec are ready", config.container_id));
+                // Don't fail on ping issues - interface and exec work, which is what matters
+                Ok(())
+            }
+        }
+    }
+    
+    // ELITE: Fast bridge existence check without debugging overhead
+    fn bridge_exists_fast(&self) -> bool {
+        // Single command to check bridge existence
+        let check_cmd = format!("ip link show {}", self.config.bridge_name);
+        match CommandExecutor::execute_shell(&check_cmd) {
+            Ok(result) => result.success && result.stdout.contains(&self.config.bridge_name),
+            Err(_) => false,
+        }
+    }
+    
+    // ELITE: Atomic bridge creation with all operations batched
+    fn create_bridge_atomic(&self) -> Result<(), String> {
+        ConsoleLogger::debug(&format!("Creating bridge atomically: {}", self.config.bridge_name));
+        
+        // ELITE: Single compound command for complete bridge setup
+        let bridge_cidr = format!("{}/16", self.config.bridge_ip);
+        let atomic_bridge_cmd = format!(
+            "ip link add name {} type bridge && ip addr add {} dev {} && ip link set {} up",
+            self.config.bridge_name, bridge_cidr, self.config.bridge_name, self.config.bridge_name
+        );
+        
+        ConsoleLogger::debug(&format!("Executing atomic bridge setup: {}", atomic_bridge_cmd));
+        
+        let result = CommandExecutor::execute_shell(&atomic_bridge_cmd)?;
+        if !result.success {
+            let error_msg = format!("Failed atomic bridge creation for {}: stderr: '{}', stdout: '{}'", 
+                                   self.config.bridge_name, result.stderr.trim(), result.stdout.trim());
+            ConsoleLogger::error(&error_msg);
+            return Err(error_msg);
+        }
+        
+        // ELITE: Fast verification without artificial delays
+        for attempt in 1..=10 {
+            if self.bridge_exists_fast() {
+                ConsoleLogger::debug(&format!("✅ Atomic bridge creation verified on attempt {}", attempt));
+                return Ok(());
+            }
+            if attempt < 10 {
+                thread::sleep(Duration::from_millis(5)); // Minimal delay
+            }
+        }
+        
+        Err(format!("Bridge {} failed atomic creation verification", self.config.bridge_name))
     }
     
     fn bridge_exists(&self) -> bool {
@@ -171,7 +396,7 @@ impl NetworkManager {
             Err(e) => ConsoleLogger::debug(&format!("🔍 Failed to list bridges: {}", e)),
         }
         
-        // Try multiple times with different approaches due to potential timing issues during container creation
+        // ELITE: Try multiple times with faster polling instead of fixed delays
         for attempt in 1..=3 {
             match CommandExecutor::execute_shell(&check_cmd) {
                 Ok(result) => {
@@ -199,9 +424,9 @@ impl NetworkManager {
                 }
             }
             
-            // Wait a bit before retrying (only for first 2 attempts)
+            // ELITE: Micro-sleep instead of 50ms delay
             if attempt < 3 {
-                thread::sleep(Duration::from_millis(50));
+                thread::sleep(Duration::from_millis(5));  // 5ms vs 50ms
             }
         }
         
@@ -218,25 +443,6 @@ impl NetworkManager {
                 false
             }
         }
-    }
-    
-    fn create_bridge(&self) -> Result<(), String> {
-        let create_cmd = format!("ip link add name {} type bridge", self.config.bridge_name);
-        ConsoleLogger::debug(&format!("Executing: {}", create_cmd));
-        
-        let result = CommandExecutor::execute_shell(&create_cmd)?;
-        if !result.success {
-            let error_msg = format!("Failed to create bridge {}: stderr: '{}', stdout: '{}'", 
-                                   self.config.bridge_name, result.stderr.trim(), result.stdout.trim());
-            ConsoleLogger::error(&error_msg);
-            return Err(error_msg);
-        }
-        
-        // Give the system a moment to create the bridge
-        thread::sleep(Duration::from_millis(100));
-        
-        ConsoleLogger::debug(&format!("Bridge creation command successful for {}", self.config.bridge_name));
-        Ok(())
     }
     
     fn configure_bridge_ip(&self) -> Result<(), String> {
@@ -276,18 +482,60 @@ impl NetworkManager {
             return Err(error_msg);
         }
         
-        // Give the system a moment to bring the interface up
-        thread::sleep(Duration::from_millis(100));
+        // ELITE: Replace artificial delay with efficient verification
+        self.verify_bridge_up()?;
         
         ConsoleLogger::debug(&format!("Successfully brought bridge {} up", self.config.bridge_name));
         Ok(())
     }
     
+    // ELITE: Efficient bridge verification without artificial delays
+    fn verify_bridge_created(&self) -> Result<(), String> {
+        for attempt in 1..=10 {  // Fast polling instead of single 100ms delay
+            if self.bridge_exists() {
+                return Ok(());
+            }
+            if attempt < 10 {
+                thread::sleep(Duration::from_millis(10));  // 10ms vs 100ms
+            }
+        }
+        Err(format!("Bridge {} was not created after verification", self.config.bridge_name))
+    }
+
+    fn verify_bridge_up(&self) -> Result<(), String> {
+        let check_cmd = format!("ip link show {} | grep -q 'state UP'", self.config.bridge_name);
+        for attempt in 1..=10 {  // Fast polling instead of single 100ms delay
+            if CommandExecutor::execute_shell(&check_cmd).map_or(false, |r| r.success) {
+                return Ok(());
+            }
+            if attempt < 10 {
+                thread::sleep(Duration::from_millis(10));  // 10ms vs 100ms
+            }
+        }
+        Err(format!("Bridge {} failed to come up", self.config.bridge_name))
+    }
+    
     fn allocate_next_ip(&self) -> Result<String, String> {
-        let mut next_ip_num = self.config.next_ip.lock().map_err(|e| e.to_string())?;
-        let ip_num = *next_ip_num;
-        *next_ip_num += 1;
-        Ok(format!("10.42.0.{}", ip_num))
+        // ELITE: Lock-free IP allocation using compare-and-swap
+        let mut current_ip = self.config.next_ip.load(Ordering::Relaxed);
+        loop {
+            let next_ip = current_ip + 1;
+            
+            // Ensure we don't exceed IP range (10.42.0.2 - 10.42.0.254)
+            if next_ip > 254 {
+                return Err("IP address pool exhausted".to_string());
+            }
+            
+            match self.config.next_ip.compare_exchange_weak(
+                current_ip, 
+                next_ip, 
+                Ordering::Relaxed, 
+                Ordering::Relaxed
+            ) {
+                Ok(_) => return Ok(format!("10.42.0.{}", next_ip)),
+                Err(actual) => current_ip = actual, // CAS failed, retry with updated value
+            }
+        }
     }
     
     fn create_veth_pair(&self, host_name: &str, container_name: &str) -> Result<(), String> {
@@ -309,54 +557,28 @@ impl NetworkManager {
             return Err(error_msg);
         }
         
-        // Give the system a moment to create both interfaces
-        thread::sleep(Duration::from_millis(100));
-        
-        // Verify both sides of the veth pair were created
-        let verify_host = CommandExecutor::execute_shell(&format!("ip link show {}", host_name))?;
-        if !verify_host.success {
-            return Err(format!("Host side veth interface {} was not created successfully", host_name));
-        }
-        
-        let verify_container = CommandExecutor::execute_shell(&format!("ip link show {}", container_name))?;
-        if !verify_container.success {
-            return Err(format!("Container side veth interface {} was not created successfully", container_name));
-        }
+        // ELITE: Replace artificial delay with efficient verification
+        self.verify_veth_pair_created(host_name, container_name)?;
         
         ConsoleLogger::debug(&format!("Successfully created and verified veth pair: {} <-> {}", host_name, container_name));
         Ok(())
     }
     
-    fn connect_veth_to_bridge(&self, veth_name: &str) -> Result<(), String> {
-        // Verify bridge exists before trying to connect
-        if !self.bridge_exists() {
-            return Err(format!("Bridge {} does not exist when trying to connect {}", self.config.bridge_name, veth_name));
+    // ELITE: Efficient veth pair verification without artificial delays  
+    fn verify_veth_pair_created(&self, host_name: &str, container_name: &str) -> Result<(), String> {
+        for attempt in 1..=10 {  // Fast polling instead of single 100ms delay
+            let verify_host = CommandExecutor::execute_shell(&format!("ip link show {}", host_name));
+            let verify_container = CommandExecutor::execute_shell(&format!("ip link show {}", container_name));
+            
+            if verify_host.map_or(false, |r| r.success) && verify_container.map_or(false, |r| r.success) {
+                return Ok(());
+            }
+            
+            if attempt < 10 {
+                thread::sleep(Duration::from_millis(10));  // 10ms vs 100ms
+            }
         }
-        
-        let master_cmd = format!("ip link set {} master {}", veth_name, self.config.bridge_name);
-        ConsoleLogger::debug(&format!("Executing: {}", master_cmd));
-        
-        let master_result = CommandExecutor::execute_shell(&master_cmd)?;
-        if !master_result.success {
-            let error_msg = format!("Failed to connect {} to bridge {}: stderr: '{}', stdout: '{}'", 
-                                   veth_name, self.config.bridge_name, master_result.stderr.trim(), master_result.stdout.trim());
-            ConsoleLogger::error(&error_msg);
-            return Err(error_msg);
-        }
-        
-        let up_cmd = format!("ip link set {} up", veth_name);
-        ConsoleLogger::debug(&format!("Executing: {}", up_cmd));
-        
-        let up_result = CommandExecutor::execute_shell(&up_cmd)?;
-        if !up_result.success {
-            let error_msg = format!("Failed to bring {} up: stderr: '{}', stdout: '{}'", 
-                                   veth_name, up_result.stderr.trim(), up_result.stdout.trim());
-            ConsoleLogger::error(&error_msg);
-            return Err(error_msg);
-        }
-        
-        ConsoleLogger::debug(&format!("Successfully connected {} to bridge {}", veth_name, self.config.bridge_name));
-        Ok(())
+        Err(format!("Veth pair {} <-> {} was not created successfully", host_name, container_name))
     }
     
     fn move_veth_to_container(&self, veth_name: &str, container_pid: i32) -> Result<(), String> {

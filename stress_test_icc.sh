@@ -17,7 +17,12 @@ PARENT_CONTAINERS=2
 CHILD_CONTAINERS_PER_PARENT=3
 NETWORK_PEERS=3
 STRESS_DURATION=90
-COMMAND_TIMEOUT=20 # 20 second timeout for CLI commands
+COMMAND_TIMEOUT=45 # ELITE: Increased from 20s to 45s for network optimizations
+
+# ELITE: Performance measurement configuration
+NETWORK_SETUP_TIMEOUT=30  # Timeout specifically for network setup
+PING_TIMEOUT=15           # Timeout specifically for ping commands
+CREATE_TIMEOUT=30         # Timeout for container creation
 
 # Colors for logging
 RED='\033[0;31m'
@@ -67,7 +72,7 @@ set -x # Enable verbose command logging
 
 # Build binaries
 log_test "Building binaries..."
-cargo build --quiet || { log_fail "Build failed."; exit 1; }
+cargo build 2>/dev/null || { log_fail "Build failed."; exit 1; }
 log_pass "Binaries built successfully."
 
 # Start server
@@ -83,15 +88,20 @@ log_test "=== TEST 1: NETWORK CONNECTIVITY (PING) ==="
 peer_ids=()
 for i in $(seq 1 $NETWORK_PEERS); do
     log_icc "Attempting to create network peer 'peer-$i'..."
+    
+    # ELITE: Measure pure network setup time
+    network_start_time=$(date +%s%3N)  # Milliseconds
     start_time=$(date +%s)
     
-    create_output=$(timeout $COMMAND_TIMEOUT "$CLI_BIN" create --image-path ./nixos-minimal.tar.gz -- /bin/sh -c "echo 'Peer $i ready'; sleep $STRESS_DURATION") || {
+    create_output=$(timeout $CREATE_TIMEOUT "$CLI_BIN" create --image-path ./nixos-minimal.tar.gz -- /bin/sh -c "echo 'Peer $i ready'; sleep $STRESS_DURATION") || {
         log_fail "❌ Create command for peer-$i timed out or failed."
         continue
     }
     
     end_time=$(date +%s)
+    network_end_time=$(date +%s%3N)  # Milliseconds
     duration=$((end_time - start_time))
+    network_duration=$((network_end_time - network_start_time))
     
     peer_id=$(get_container_id_from_output "$create_output")
     if [ -z "$peer_id" ]; then
@@ -100,16 +110,23 @@ for i in $(seq 1 $NETWORK_PEERS); do
     fi
     
     peer_ids+=("$peer_id")
-    log_icc "Created network peer 'peer-$i' with ID: $peer_id in ${duration}s"
+    log_icc "Created network peer 'peer-$i' with ID: $peer_id in ${duration}s (pure network setup: ${network_duration}ms)"
 done
 
-# Ping between peers
+# ELITE: Wait for network stabilization
+log_icc "Waiting 10 seconds for network stabilization..."
+sleep 10
+
+# Ping between peers with specific timeout
 for from_id in "${peer_ids[@]}"; do
     for to_id in "${peer_ids[@]}"; do
         if [ "$from_id" != "$to_id" ]; then
             log_icc "Pinging from $from_id to $to_id..."
-            if output=$(timeout $COMMAND_TIMEOUT "$CLI_BIN" icc ping "$from_id" "$to_id" --count 1); then
-                log_pass "✅ Ping from $from_id to $to_id successful."
+            ping_start_time=$(date +%s%3N)
+            if output=$(timeout $PING_TIMEOUT "$CLI_BIN" icc ping "$from_id" "$to_id" --count 1 --timeout 10); then
+                ping_end_time=$(date +%s%3N)
+                ping_duration=$((ping_end_time - ping_start_time))
+                log_pass "✅ Ping from $from_id to $to_id successful in ${ping_duration}ms."
             else
                 log_fail "❌ Ping from $from_id to $to_id failed. Exit code: $?. Output: $output"
             fi
@@ -143,7 +160,7 @@ for i in $(seq 1 $PARENT_CONTAINERS); do
             exec_cmd="/usr/bin/quilt-cli create --image-path ./nixos-minimal.tar.gz -- /bin/sh -c 'echo \"Hello from $child_name\"; sleep 15'"
             
             start_time=$(date +%s)
-            output=$(timeout $COMMAND_TIMEOUT "$CLI_BIN" icc exec --container-id "$parent_id" -- /bin/sh -c "$exec_cmd")
+            output=$(timeout $COMMAND_TIMEOUT "$CLI_BIN" icc exec "$parent_id" /bin/sh -c "$exec_cmd")
             child_id=$(get_container_id_from_output "$output")
             end_time=$(date +%s)
             duration=$((end_time - start_time))

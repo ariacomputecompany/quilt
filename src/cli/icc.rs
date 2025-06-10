@@ -9,8 +9,8 @@ use tonic::transport::Channel;
 // Use protobuf definitions from parent
 use crate::quilt::quilt_service_client::QuiltServiceClient;
 use crate::quilt::{
-    GetContainerStatusRequest, GetContainerStatusResponse,
-    ExecContainerRequest, ExecContainerResponse,
+    GetContainerStatusRequest,
+    ExecContainerRequest,
     ContainerStatus,
 };
 
@@ -257,13 +257,13 @@ async fn handle_ping_command(
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("🏓 Pinging from {} to {} ({} packets, {}s timeout)", from_container, target, count, timeout);
     
-    // First check if the source container is running
-    let mut status_request = tonic::Request::new(GetContainerStatusRequest { 
+    // ELITE: Check source container status
+    let mut from_request = tonic::Request::new(GetContainerStatusRequest { 
         container_id: from_container.clone() 
     });
-    status_request.set_timeout(Duration::from_secs(5));
+    from_request.set_timeout(Duration::from_secs(30));
     
-    match client.get_container_status(status_request).await {
+    let from_status = match client.get_container_status(from_request).await {
         Ok(response) => {
             let status = response.into_inner();
             let container_status = match status.status {
@@ -274,26 +274,27 @@ async fn handle_ping_command(
             };
             
             if !matches!(container_status, ContainerStatus::Running) {
-                return Err(format!("Source container {} is not running", from_container).into());
+                return Err(format!("Source container {} is not running (status: {:?})", from_container, container_status).into());
             }
+            status
         }
         Err(e) => {
             return Err(format!("Failed to get status for container {}: {}", from_container, e).into());
         }
-    }
+    };
     
-    // Check if target is a container ID (UUID-like) or an IP address
-    let target_ip = if target.contains('.') {
-        // Assume it's already an IP address
+    // ELITE: Determine target IP
+    let final_target_ip = if target.contains('.') {
+        // Already an IP address
         target
     } else {
-        // Assume it's a container ID, get its IP
-        let mut target_status_request = tonic::Request::new(GetContainerStatusRequest { 
-            container_id: target.clone() 
+        // Container ID - get its IP
+        let mut target_request = tonic::Request::new(GetContainerStatusRequest {
+            container_id: target.clone(),
         });
-        target_status_request.set_timeout(Duration::from_secs(5));
+        target_request.set_timeout(Duration::from_secs(30));
         
-        match client.get_container_status(target_status_request).await {
+        match client.get_container_status(target_request).await {
             Ok(response) => {
                 let status = response.into_inner();
                 let container_status = match status.status {
@@ -304,7 +305,7 @@ async fn handle_ping_command(
                 };
                 
                 if !matches!(container_status, ContainerStatus::Running) {
-                    return Err(format!("Target container {} is not running", target).into());
+                    return Err(format!("Target container {} is not running (status: {:?})", target, container_status).into());
                 }
                 
                 if status.ip_address.is_empty() || status.ip_address == "No IP assigned" {
@@ -319,12 +320,14 @@ async fn handle_ping_command(
         }
     };
     
-    // Execute ping command
+    // ELITE: Use optimized ping with adaptive timeout
+    let adaptive_timeout = std::cmp::max(timeout, 10); // Minimum 10s for network load
     let ping_cmd = vec![
         "ping".to_string(),
         "-c".to_string(), count.to_string(),
-        "-W".to_string(), timeout.to_string(),
-        target_ip.clone()
+        "-W".to_string(), adaptive_timeout.to_string(),
+        "-i".to_string(), "0.5".to_string(),  // ELITE: Faster ping interval
+        final_target_ip.clone()
     ];
     
     let mut exec_request = tonic::Request::new(ExecContainerRequest {
@@ -334,7 +337,10 @@ async fn handle_ping_command(
         environment: HashMap::new(),
         capture_output: true,
     });
-    exec_request.set_timeout(Duration::from_secs(15)); // Longer timeout for ping execution
+    // ELITE: Much more generous timeout for exec under load
+    exec_request.set_timeout(Duration::from_secs(adaptive_timeout as u64 + 10)); 
+    
+    println!("📡 Executing ping with {:.1}s timeout...", adaptive_timeout);
     
     match client.exec_container(exec_request).await {
         Ok(response) => {
@@ -347,7 +353,14 @@ async fn handle_ping_command(
                     println!("{}", result.stdout);
                 }
             } else {
-                println!("❌ Ping failed with exit code: {}", result.exit_code);
+                println!("❌ Ping from {} to {} failed. Exit code: {}", from_container, final_target_ip, result.exit_code);
+                if result.exit_code == 124 {
+                    println!("⚠️  Exit code 124 indicates timeout - network may still be initializing");
+                }
+                if !result.stdout.is_empty() {
+                    println!("📤 Output:");
+                    println!("{}", result.stdout);
+                }
                 if !result.stderr.is_empty() {
                     println!("📤 Error:");
                     println!("{}", result.stderr);

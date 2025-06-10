@@ -1,15 +1,17 @@
 mod daemon;
 mod utils;
 mod icc;
+mod sync;
 
-use daemon::{ContainerRuntime, ContainerConfig, ContainerState, CgroupLimits, NamespaceConfig};
+use daemon::{ContainerConfig, CgroupLimits, NamespaceConfig};
 use utils::console::ConsoleLogger;
-use icc::network::NetworkManager;
+use sync::{SyncEngine, containers::ContainerState};
 
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use std::collections::HashMap;
 use tonic::{transport::Server, Request, Response, Status};
 use uuid::Uuid;
+use sqlx::Row;
 
 // Include the generated protobuf code
 pub mod quilt {
@@ -24,34 +26,27 @@ use quilt::{
     StopContainerRequest, StopContainerResponse,
     RemoveContainerRequest, RemoveContainerResponse,
     ExecContainerRequest, ExecContainerResponse,
-    LogEntry, ContainerStatus,
+    ContainerStatus,
 };
 
+#[derive(Clone)]
 pub struct QuiltServiceImpl {
-    runtime: Arc<ContainerRuntime>,
-    network_manager: Arc<Mutex<NetworkManager>>,
+    sync_engine: Arc<SyncEngine>,
 }
 
 impl QuiltServiceImpl {
-    pub fn new() -> Self {
-        let network_manager = match NetworkManager::new("quilt0", "10.42.0.0/16") {
-            Ok(nm) => nm,
-            Err(e) => {
-                eprintln!("Failed to create network manager: {}", e);
-                std::process::exit(1);
-            }
-        };
+    pub async fn new() -> Result<Self, Box<dyn std::error::Error>> {
+        // Initialize sync engine with database
+        let sync_engine = Arc::new(SyncEngine::new("quilt.db").await?);
         
-        // Initialize bridge in background - don't fail startup if this fails
-        if let Err(e) = network_manager.ensure_bridge_ready() {
-            eprintln!("Warning: Failed to initialize bridge during startup: {}", e);
-            eprintln!("Bridge will be created when first container is started");
-        }
-
-        Self {
-            runtime: Arc::new(ContainerRuntime::new()),
-            network_manager: Arc::new(Mutex::new(network_manager)),
-        }
+        // Start background services for monitoring and cleanup
+        sync_engine.start_background_services().await?;
+        
+        ConsoleLogger::success("Sync engine initialized with background services");
+        
+        Ok(Self {
+            sync_engine,
+        })
     }
 }
 
@@ -64,96 +59,44 @@ impl QuiltService for QuiltServiceImpl {
         let req = request.into_inner();
         let container_id = Uuid::new_v4().to_string();
 
-        println!("Creating container {} with image: {}", container_id, req.image_path);
+        ConsoleLogger::container_created(&container_id);
 
-        // Parse resource limits
-        let resource_limits = if req.memory_limit_mb > 0 || req.cpu_limit_percent > 0.0 {
-            Some(CgroupLimits {
-                memory_limit_bytes: if req.memory_limit_mb > 0 {
-                    Some((req.memory_limit_mb as u64) * 1024 * 1024)
-                } else {
-                    None
-                },
-                cpu_quota: if req.cpu_limit_percent > 0.0 {
-                    // Convert percentage to quota (100000 microseconds = 100% CPU)
-                    Some((req.cpu_limit_percent * 1000.0) as i64)
-                } else {
-                    None
-                },
-                cpu_period: Some(100000), // 100ms period
-                cpu_shares: Some(1024),   // Default
-                pids_limit: Some(1024),   // Default
-            })
-        } else {
-            Some(CgroupLimits::default())
-        };
-
-        // Parse namespace configuration
-        let namespace_config = Some(NamespaceConfig {
-            pid: req.enable_pid_namespace,
-            mount: req.enable_mount_namespace,
-            uts: req.enable_uts_namespace,
-            ipc: req.enable_ipc_namespace,
-            network: req.enable_network_namespace,
-        });
-
-        // Create container configuration
-        let config = ContainerConfig {
+        // Convert gRPC request to sync engine container config
+        let config = sync::containers::ContainerConfig {
+            id: container_id.clone(),
+            name: None, // gRPC request doesn't have name field
             image_path: req.image_path,
-            command: req.command,
-            environment: req.environment,
-            setup_commands: req.setup_commands,
-            resource_limits,
-            namespace_config,
-            working_directory: if req.working_directory.is_empty() {
-                None
-            } else {
-                Some(req.working_directory)
+            command: if req.command.is_empty() { 
+                "sleep infinity".to_string() // Default for long-running agents
+            } else { 
+                req.command.join(" ")
             },
+            environment: req.environment,
+            memory_limit_mb: if req.memory_limit_mb > 0 { Some(req.memory_limit_mb as i64) } else { None },
+            cpu_limit_percent: if req.cpu_limit_percent > 0.0 { Some(req.cpu_limit_percent as f64) } else { None },
+            enable_network_namespace: req.enable_network_namespace,
+            enable_pid_namespace: req.enable_pid_namespace,
+            enable_mount_namespace: req.enable_mount_namespace,
+            enable_uts_namespace: req.enable_uts_namespace,
+            enable_ipc_namespace: req.enable_ipc_namespace,
         };
 
-        let runtime = Arc::clone(&self.runtime);
-        match runtime.create_container(container_id.clone(), config) {
-            Ok(()) => {
-                ConsoleLogger::container_created(&container_id);
+        // ✅ NON-BLOCKING: Create container with coordinated network allocation
+        match self.sync_engine.create_container(config).await {
+            Ok(_network_config) => {
+                // ✅ INSTANT RETURN: Container creation is coordinated but non-blocking
+                ConsoleLogger::success(&format!("Container {} created with network config", container_id));
                 
-                // 1. Allocate network configuration for the container
-                let network_config = {
-                    let network_manager = self.network_manager.lock().await;
-                    match network_manager.allocate_container_network(&container_id) {
-                        Ok(config) => config,
-                        Err(e) => {
-                            ConsoleLogger::error(&format!("Failed to allocate network for container: {}", e));
-                            return Err(Status::internal(format!("Failed to allocate network: {}", e)));
-                        }
+                // Start the actual container process in background
+                let sync_engine = self.sync_engine.clone();
+                let container_id_clone = container_id.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = start_container_process(&sync_engine, &container_id_clone).await {
+                        ConsoleLogger::error(&format!("Failed to start container process {}: {}", container_id_clone, e));
+                        let _ = sync_engine.update_container_state(&container_id_clone, ContainerState::Error).await;
                     }
-                }; // Lock is released here
-
-                // 2. Store network configuration in container
-                if let Err(e) = runtime.set_container_network(&container_id, network_config.clone()) {
-                    ConsoleLogger::error(&format!("Failed to store network config: {}", e));
-                    return Err(Status::internal(format!("Failed to store network config: {}", e)));
-                }
-
-                // 3. Start container with network configuration passed for ResourceManager tracking
-                match runtime.start_container(&container_id, Some(network_config.clone())) {
-                    Ok(()) => {
-                        // 4. Set up the container's network interface now that it's running
-                        // Use a fresh lock for network setup to ensure proper context
-                        let network_manager = self.network_manager.lock().await;
-                        if let Err(e) = runtime.setup_container_network_post_start(&container_id, &*network_manager) {
-                            ConsoleLogger::error(&format!("Failed to configure container network: {}", e));
-                            return Err(Status::internal(format!("Failed to configure container network: {}", e)));
-                        }
-
-                        ConsoleLogger::container_started(&container_id, None);
-                    }
-                    Err(e) => {
-                        ConsoleLogger::container_failed(&container_id, &e);
-                        return Err(Status::internal(format!("Failed to start container: {}", e)));
-                    }
-                }
-
+                });
+                
                 Ok(Response::new(CreateContainerResponse {
                     container_id,
                     success: true,
@@ -165,7 +108,7 @@ impl QuiltService for QuiltServiceImpl {
                 Ok(Response::new(CreateContainerResponse {
                     container_id: String::new(),
                     success: false,
-                    error_message: e,
+                    error_message: e.to_string(),
                 }))
             }
         }
@@ -176,57 +119,34 @@ impl QuiltService for QuiltServiceImpl {
         request: Request<GetContainerStatusRequest>,
     ) -> Result<Response<GetContainerStatusResponse>, Status> {
         let req = request.into_inner();
-        ConsoleLogger::debug(&format!("🔍 [GRPC] Received get_container_status request for: {}", req.container_id));
+        ConsoleLogger::debug(&format!("🔍 [GRPC] Status request for: {}", req.container_id));
         
-        // Use the deadlock-free combined method
-        let (container, stats_result) = self.runtime.get_container_info_and_stats(&req.container_id);
-
-        match container {
-            Some(container) => {
-                ConsoleLogger::debug(&format!("📋 [GRPC] Found container: {} with state: {:?}", req.container_id, container.state));
-                
-                let status = match container.state {
-                    ContainerState::PENDING => ContainerStatus::Pending,
-                    ContainerState::RUNNING => ContainerStatus::Running,
-                    ContainerState::EXITED(_) => ContainerStatus::Exited,
-                    ContainerState::FAILED(_) => ContainerStatus::Failed,
+        // ✅ ALWAYS FAST: Direct database query, never blocks
+        match self.sync_engine.get_container_status(&req.container_id).await {
+            Ok(status) => {
+                let grpc_status = match status.state {
+                    ContainerState::Created => ContainerStatus::Pending,
+                    ContainerState::Starting => ContainerStatus::Pending,
+                    ContainerState::Running => ContainerStatus::Running,
+                    ContainerState::Exited => ContainerStatus::Exited,
+                    ContainerState::Error => ContainerStatus::Failed,
                 };
 
-                let exit_code = match container.state {
-                    ContainerState::EXITED(code) => code,
-                    _ => 0,
-                };
-
-                let error_message = match container.state {
-                    ContainerState::FAILED(ref msg) => msg.clone(),
-                    _ => String::new(),
-                };
-
-                // Use the stats we got from the combined call
-                let stats = stats_result.unwrap_or_default();
-                
-                let ip_address = container.network_config
-                    .as_ref()
-                    .map(|nc| nc.ip_address.clone())
-                    .unwrap_or_else(|| "No IP assigned".to_string());
-
-                ConsoleLogger::debug(&format!("✅ [GRPC] Returning status for {}: {:?}, IP: {}", req.container_id, status, ip_address));
+                ConsoleLogger::debug(&format!("✅ [GRPC] Status for {}: {:?}", req.container_id, grpc_status));
                 
                 Ok(Response::new(GetContainerStatusResponse {
-                    container_id: req.container_id.clone(),
-                    status: status as i32,
-                    exit_code,
-                    error_message,
-                    pid: container.pid.map(|p| p.as_raw()).unwrap_or(0),
-                    created_at: container.created_at,
-                    memory_usage_bytes: stats.get("memory_usage_bytes")
-                        .and_then(|s| s.parse().ok())
-                        .unwrap_or(0),
-                    rootfs_path: container.rootfs_path,
-                    ip_address,
+                    container_id: req.container_id,
+                    status: grpc_status as i32,
+                    exit_code: status.exit_code.unwrap_or(0) as i32,
+                    error_message: if status.state == ContainerState::Error { "Container failed".to_string() } else { String::new() },
+                    pid: status.pid.unwrap_or(0) as i32,
+                    created_at: status.created_at as u64,
+                    memory_usage_bytes: 0, // TODO: Implement memory monitoring in sync engine
+                    rootfs_path: status.rootfs_path.unwrap_or_default(),
+                    ip_address: status.ip_address.unwrap_or_default(),
                 }))
             }
-            None => {
+            Err(_) => {
                 ConsoleLogger::debug(&format!("❌ [GRPC] Container not found: {}", req.container_id));
                 Err(Status::not_found(format!("Container {} not found", req.container_id)))
             }
@@ -239,23 +159,12 @@ impl QuiltService for QuiltServiceImpl {
     ) -> Result<Response<GetContainerLogsResponse>, Status> {
         let req = request.into_inner();
 
-        match self.runtime.get_container_logs(&req.container_id) {
-            Some(logs) => {
-                let log_entries: Vec<LogEntry> = logs
-                    .into_iter()
-                    .map(|entry| LogEntry {
-                        timestamp: entry.timestamp,
-                        message: entry.message,
-                    })
-                    .collect();
-
-                Ok(Response::new(GetContainerLogsResponse {
-                    container_id: req.container_id,
-                    logs: log_entries,
-                }))
-            }
-            None => Err(Status::not_found(format!("Container {} not found", req.container_id))),
-        }
+        // TODO: Implement structured logging in sync engine
+        // For now, return empty logs since we're focusing on the core sync functionality
+        Ok(Response::new(GetContainerLogsResponse {
+            container_id: req.container_id,
+            logs: vec![],
+        }))
     }
 
     async fn stop_container(
@@ -264,19 +173,25 @@ impl QuiltService for QuiltServiceImpl {
     ) -> Result<Response<StopContainerResponse>, Status> {
         let req = request.into_inner();
 
-        match self.runtime.stop_container(&req.container_id) {
+        // ✅ NON-BLOCKING: Stop monitoring and update state
+        match self.sync_engine.stop_monitoring(&req.container_id).await {
             Ok(()) => {
-                println!("✅ Container {} stopped successfully", req.container_id);
+                // Update container state to trigger cleanup
+                if let Err(e) = self.sync_engine.update_container_state(&req.container_id, ContainerState::Exited).await {
+                    ConsoleLogger::warning(&format!("Failed to update container state: {}", e));
+                }
+                
+                ConsoleLogger::success(&format!("Container {} stopped", req.container_id));
                 Ok(Response::new(StopContainerResponse {
                     success: true,
                     error_message: String::new(),
                 }))
             }
             Err(e) => {
-                eprintln!("❌ Failed to stop container {}: {}", req.container_id, e);
+                ConsoleLogger::error(&format!("Failed to stop container {}: {}", req.container_id, e));
                 Ok(Response::new(StopContainerResponse {
                     success: false,
-                    error_message: e,
+                    error_message: e.to_string(),
                 }))
             }
         }
@@ -288,19 +203,20 @@ impl QuiltService for QuiltServiceImpl {
     ) -> Result<Response<RemoveContainerResponse>, Status> {
         let req = request.into_inner();
 
-        match self.runtime.remove_container(&req.container_id) {
+        // ✅ NON-BLOCKING: Coordinated cleanup through sync engine
+        match self.sync_engine.delete_container(&req.container_id).await {
             Ok(()) => {
-                println!("✅ Container {} removed successfully", req.container_id);
+                ConsoleLogger::success(&format!("Container {} removed", req.container_id));
                 Ok(Response::new(RemoveContainerResponse {
                     success: true,
                     error_message: String::new(),
                 }))
             }
             Err(e) => {
-                eprintln!("❌ Failed to remove container {}: {}", req.container_id, e);
+                ConsoleLogger::error(&format!("Failed to remove container {}: {}", req.container_id, e));
                 Ok(Response::new(RemoveContainerResponse {
                     success: false,
-                    error_message: e,
+                    error_message: e.to_string(),
                 }))
             }
         }
@@ -311,57 +227,164 @@ impl QuiltService for QuiltServiceImpl {
         request: Request<ExecContainerRequest>,
     ) -> Result<Response<ExecContainerResponse>, Status> {
         let req = request.into_inner();
-        ConsoleLogger::debug(&format!("🔍 [GRPC] Received exec_container request for: {} with command: {:?}", req.container_id, req.command));
+        ConsoleLogger::debug(&format!("🔍 [GRPC] Exec request for: {} with command: {:?}", req.container_id, req.command));
         
-        match self.runtime.exec_container(
-            &req.container_id,
-            req.command.clone(),
-            if req.working_directory.is_empty() { None } else { Some(req.working_directory.clone()) },
-            req.environment.clone(),
-            req.capture_output,
-        ) {
-            Ok((exit_code, stdout, stderr)) => {
-                ConsoleLogger::debug(&format!("✅ [GRPC] Executed command in container {} with exit code: {}", req.container_id, exit_code));
-                if !stdout.is_empty() {
-                    ConsoleLogger::debug(&format!("📤 [GRPC] Command stdout: {}", stdout.trim()));
+        // Get container status to check if it's running and get PID
+        match self.sync_engine.get_container_status(&req.container_id).await {
+            Ok(status) => {
+                if status.state != ContainerState::Running {
+                    return Ok(Response::new(ExecContainerResponse {
+                        success: false,
+                        exit_code: -1,
+                        stdout: String::new(),
+                        stderr: String::new(),
+                        error_message: format!("Container {} is not running (state: {:?})", req.container_id, status.state),
+                    }));
                 }
-                if !stderr.is_empty() {
-                    ConsoleLogger::debug(&format!("📤 [GRPC] Command stderr: {}", stderr.trim()));
+
+                let pid = match status.pid {
+                    Some(pid) => pid,
+                    None => {
+                        return Ok(Response::new(ExecContainerResponse {
+                            success: false,
+                            exit_code: -1,
+                            stdout: String::new(),
+                            stderr: String::new(),
+                            error_message: "Container has no PID".to_string(),
+                        }));
+                    }
+                };
+
+                // Execute command using nsenter (direct execution, not through old runtime)
+                let command_str = req.command.join(" ");
+                let exec_cmd = if req.capture_output {
+                    format!("nsenter -t {} -p -m -n -u -i -- /bin/sh -c '{}'", pid, command_str)
+                } else {
+                    format!("nsenter -t {} -p -m -n -u -i -- /bin/sh -c '{}' >/dev/null 2>&1", pid, command_str)
+                };
+
+                match utils::command::CommandExecutor::execute_shell(&exec_cmd) {
+                    Ok(result) => {
+                        ConsoleLogger::debug(&format!("✅ [GRPC] Exec completed with exit code: {}", result.exit_code.unwrap_or(-1)));
+                        
+                        Ok(Response::new(ExecContainerResponse {
+                            success: result.success,
+                            exit_code: result.exit_code.unwrap_or(-1),
+                            stdout: result.stdout,
+                            stderr: result.stderr,
+                            error_message: String::new(),
+                        }))
+                    }
+                    Err(e) => {
+                        ConsoleLogger::error(&format!("❌ [GRPC] Exec failed: {}", e));
+                        Ok(Response::new(ExecContainerResponse {
+                            success: false,
+                            exit_code: -1,
+                            stdout: String::new(),
+                            stderr: String::new(),
+                            error_message: e,
+                        }))
+                    }
+                }
+            }
+            Err(_) => {
+                Err(Status::not_found(format!("Container {} not found", req.container_id)))
+            }
+        }
+    }
+}
+
+// ✅ BACKGROUND CONTAINER PROCESS STARTUP
+async fn start_container_process(sync_engine: &SyncEngine, container_id: &str) -> Result<(), String> {
+    use daemon::runtime::ContainerRuntime;
+    
+    // Get container configuration from sync engine
+    let _status = sync_engine.get_container_status(container_id).await
+        .map_err(|e| format!("Failed to get container config: {}", e))?;
+
+    // Get full container config from database to get image_path and command
+    let container_record = sqlx::query("SELECT image_path, command FROM containers WHERE id = ?")
+        .bind(container_id)
+        .fetch_one(sync_engine.pool())
+        .await
+        .map_err(|e| format!("Failed to get container details: {}", e))?;
+    
+    let image_path: String = container_record.get("image_path");
+    let command: String = container_record.get("command");
+
+    // Convert sync engine config back to legacy format for actual container startup
+    // TODO: Eventually replace this with native sync engine container startup
+    let legacy_config = ContainerConfig {
+        image_path,
+        command: vec!["/bin/sh".to_string(), "-c".to_string(), command],
+        environment: HashMap::new(), // TODO: Get from sync engine
+        setup_commands: vec![],
+        resource_limits: Some(CgroupLimits::default()),
+        namespace_config: Some(NamespaceConfig::default()),
+        working_directory: None,
+    };
+
+    // Create legacy runtime for actual process management (temporary)
+    let runtime = ContainerRuntime::new();
+    
+    // Update state to Starting
+    sync_engine.update_container_state(container_id, ContainerState::Starting).await
+        .map_err(|e| format!("Failed to update state: {}", e))?;
+
+    // Create container in legacy runtime
+    runtime.create_container(container_id.to_string(), legacy_config)
+        .map_err(|e| format!("Failed to create legacy container: {}", e))?;
+
+    // Start the container
+    match runtime.start_container(container_id, None) {
+        Ok(()) => {
+            // Get the PID from legacy runtime and store in sync engine
+            if let Some(container) = runtime.get_container_info(container_id) {
+                if let Some(pid) = container.pid {
+                    sync_engine.set_container_pid(container_id, pid).await
+                        .map_err(|e| format!("Failed to set PID: {}", e))?;
                 }
                 
-                Ok(Response::new(ExecContainerResponse {
-                    success: exit_code == 0,
-                    exit_code,
-                    stdout,
-                    stderr,
-                    error_message: String::new(),
-                }))
+                // Update state to Running
+                sync_engine.update_container_state(container_id, ContainerState::Running).await
+                    .map_err(|e| format!("Failed to update to running: {}", e))?;
             }
-            Err(e) => {
-                ConsoleLogger::error(&format!("❌ [GRPC] Failed to execute command in container {}: {}", req.container_id, e));
-                Ok(Response::new(ExecContainerResponse {
-                    success: false,
-                    exit_code: -1,
-                    stdout: String::new(),
-                    stderr: String::new(),
-                    error_message: e,
-                }))
-            }
+            
+            ConsoleLogger::success(&format!("Container {} started successfully", container_id));
+            Ok(())
+        }
+        Err(e) => {
+            sync_engine.update_container_state(container_id, ContainerState::Error).await.ok();
+            Err(format!("Failed to start container: {}", e))
         }
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let service = QuiltServiceImpl::new();
+    // ✅ SYNC ENGINE INITIALIZATION
+    let service = Arc::new(QuiltServiceImpl::new().await
+        .map_err(|e| format!("Failed to initialize sync engine: {}", e))?);
+    
     let addr: std::net::SocketAddr = "127.0.0.1:50051".parse()?;
 
     ConsoleLogger::server_starting(&addr.to_string());
+    ConsoleLogger::success("🚀 Quilt server running with SQLite sync engine - non-blocking operations enabled");
 
-    Server::builder()
-        .add_service(QuiltServiceServer::new(service))
-        .serve(addr)
-        .await?;
+    // ✅ GRACEFUL SHUTDOWN
+    let service_clone = service.clone();
+    tokio::select! {
+        result = Server::builder()
+            .add_service(QuiltServiceServer::new((*service).clone()))
+            .serve(addr) => {
+            result?;
+        }
+        _ = tokio::signal::ctrl_c() => {
+            ConsoleLogger::info("Received shutdown signal, cleaning up...");
+            service_clone.sync_engine.close().await;
+            ConsoleLogger::success("Sync engine closed gracefully");
+        }
+    }
 
     Ok(())
 }

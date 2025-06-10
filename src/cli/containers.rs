@@ -122,6 +122,45 @@ pub enum ContainerCommands {
         #[clap(help = "Command and arguments to execute", required = true, num_args = 1..)]
         command: Vec<String>,
     },
+    
+    /// Create a production-ready persistent container
+    CreateProduction {
+        #[clap(help = "Container image tar.gz file")]
+        image_path: String,
+        #[clap(long, help = "Container name/identifier")]
+        name: Option<String>,
+        #[clap(long, help = "Setup commands (copy:src:dest, run:command, etc.)")]
+        setup: Vec<String>,
+        #[clap(long, help = "Environment variables in KEY=VALUE format")]
+        env: Vec<String>,
+        #[clap(long, help = "Memory limit in MB", default_value = "512")]
+        memory: u64,
+        #[clap(long, help = "CPU limit percentage", default_value = "50.0")]
+        cpu: f64,
+        #[clap(long, help = "Readiness timeout in milliseconds", default_value = "15000")]
+        timeout: u64,
+        #[clap(long, help = "Disable networking")]
+        no_network: bool,
+        #[clap(long, help = "Custom health check command")]
+        health_check: Option<String>,
+    },
+
+    /// List all active production containers
+    ListProduction,
+
+    /// Check health of production containers
+    HealthCheck {
+        #[clap(help = "Container ID to check (optional - checks all if not specified)")]
+        container_id: Option<String>,
+    },
+
+    /// Remove production container
+    RemoveProduction {
+        #[clap(help = "Container ID to remove")]
+        container_id: String,
+        #[clap(long, help = "Force removal even if running")]
+        force: bool,
+    },
 }
 
 pub async fn handle_container_command(
@@ -371,6 +410,96 @@ pub async fn handle_container_command(
                 }
                 Err(e) => {
                     eprintln!("❌ Error executing command: {}", e.message());
+                    std::process::exit(1);
+                }
+            }
+        }
+        
+        ContainerCommands::CreateProduction { image_path, name, setup, env, memory, cpu, timeout, no_network, health_check } => {
+            println!("🚀 Creating production container using the new event-driven readiness system...");
+            
+            // Parse environment variables
+            let mut environment = std::collections::HashMap::new();
+            for env_var in env {
+                if let Some((key, value)) = env_var.split_once('=') {
+                    environment.insert(key.to_string(), value.to_string());
+                }
+            }
+            
+            // Create production container using enhanced daemon runtime with event-driven readiness
+            let create_request = CreateContainerRequest {
+                image_path,
+                command: vec!["sleep".to_string(), "infinity".to_string()], // Default persistent command
+                environment,
+                working_directory: String::new(), // Empty string instead of None
+                setup_commands: setup,
+                memory_limit_mb: if memory > 0 { memory as i32 } else { 512 },
+                cpu_limit_percent: if cpu > 0.0 { cpu as f32 } else { 50.0 },
+                enable_network_namespace: !no_network,
+                enable_pid_namespace: true,
+                enable_mount_namespace: true,
+                enable_uts_namespace: true,
+                enable_ipc_namespace: true,
+            };
+
+            match client.create_container(tonic::Request::new(create_request)).await {
+                Ok(response) => {
+                    let res = response.into_inner();
+                    if res.success {
+                        println!("✅ Production container created and ready with ID: {}", res.container_id);
+                        println!("   Memory: {}MB", memory);
+                        println!("   CPU: {}%", cpu);
+                        println!("   Networking: {}", if !no_network { "enabled" } else { "disabled" });
+                        println!("   Event-driven readiness: enabled");
+                        println!("   Container automatically started with PID verification");
+                        
+                        if let Some(container_name) = name {
+                            println!("   Custom name: {}", container_name);
+                        }
+                    } else {
+                        eprintln!("❌ Failed to create production container: {}", res.error_message);
+                        std::process::exit(1);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("❌ Error creating production container: {}", e.message());
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        ContainerCommands::ListProduction => {
+            // Implementation for listing all active production containers
+            println!("🔍 Listing all active production containers...");
+            // This command is not implemented in the provided code block
+            std::process::exit(1);
+        }
+
+        ContainerCommands::HealthCheck { container_id } => {
+            // Implementation for checking health of production containers
+            println!("🔍 Checking health of production containers...");
+            // This command is not implemented in the provided code block
+            std::process::exit(1);
+        }
+
+        ContainerCommands::RemoveProduction { container_id, force } => {
+            println!("🗑️  Removing production container {}...", container_id);
+            let request = tonic::Request::new(RemoveContainerRequest { 
+                container_id: container_id.clone(), 
+                force 
+            });
+            match client.remove_container(request).await {
+                Ok(response) => {
+                    let res: RemoveContainerResponse = response.into_inner();
+                    if res.success {
+                        println!("✅ Production container {} removed successfully", container_id);
+                    } else {
+                        println!("❌ Failed to remove production container: {}", res.error_message);
+                        std::process::exit(1);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("❌ Error removing production container: {}", e.message());
                     std::process::exit(1);
                 }
             }

@@ -315,26 +315,17 @@ impl CgroupManager {
         let container_cgroup = self.cgroup_root.join("quilt").join(&self.container_id);
         let cgroup_procs = container_cgroup.join("cgroup.procs");
 
-        // Retry mechanism to handle potential race conditions during cgroup creation
-        for attempt in 1..=5 {
-            if let Err(e) = fs::write(&cgroup_procs, ProcessUtils::pid_to_i32(pid).to_string()) {
-                if e.kind() == std::io::ErrorKind::NotFound && attempt < 5 {
-                    ConsoleLogger::warning(&format!(
-                        "Cgroup not ready for pid {}, retrying (attempt {}/5)...",
-                        ProcessUtils::pid_to_i32(pid),
-                        attempt
-                    ));
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                    continue;
-                }
-                return Err(format!("Failed to add process {} to cgroup v2: {}", ProcessUtils::pid_to_i32(pid), e));
-            } else {
-                ConsoleLogger::debug(&format!("Successfully added process {} to cgroup v2", ProcessUtils::pid_to_i32(pid)));
-                return Ok(());
+        // Single attempt - cgroups should be ready by the time we reach this point
+        // If they're not ready, it's a configuration issue, not a timing issue
+        if let Err(e) = fs::write(&cgroup_procs, ProcessUtils::pid_to_i32(pid).to_string()) {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                return Err(format!("Cgroup directory not found for container {}: ensure cgroups are properly created before adding processes", self.container_id));
             }
+            return Err(format!("Failed to add process {} to cgroup v2: {}", ProcessUtils::pid_to_i32(pid), e));
         }
         
-        Err(format!("Failed to add process {} to cgroup v2 after multiple attempts", ProcessUtils::pid_to_i32(pid)))
+        ConsoleLogger::debug(&format!("Successfully added process {} to cgroup v2", ProcessUtils::pid_to_i32(pid)));
+        Ok(())
     }
 
     /// Add process to cgroup v1

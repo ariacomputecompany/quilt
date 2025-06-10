@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::path::Path;
 use nix::unistd::Pid;
 use crate::utils::{ConsoleLogger, CommandExecutor};
@@ -6,49 +7,65 @@ use crate::daemon::cgroup::CgroupManager;
 use crate::icc::network::ContainerNetworkConfig;
 use crate::utils::FileSystemUtils;
 
-/// Comprehensive resource manager for container lifecycle
+/// Thread-safe comprehensive resource manager for container lifecycle
 pub struct ResourceManager {
-    /// Track active mounts per container
-    active_mounts: HashMap<String, Vec<String>>,
-    /// Track network interfaces per container
-    network_interfaces: HashMap<String, ContainerNetworkConfig>,
+    /// Track active mounts per container (thread-safe)
+    active_mounts: Arc<Mutex<HashMap<String, Vec<String>>>>,
+    /// Track network interfaces per container (thread-safe)
+    network_interfaces: Arc<Mutex<HashMap<String, ContainerNetworkConfig>>>,
 }
 
 impl ResourceManager {
     pub fn new() -> Self {
         ResourceManager {
-            active_mounts: HashMap::new(),
-            network_interfaces: HashMap::new(),
+            active_mounts: Arc::new(Mutex::new(HashMap::new())),
+            network_interfaces: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    /// Register mounts for a container
-    pub fn register_mounts(&mut self, container_id: &str, mounts: Vec<String>) {
+    /// Register mounts for a container (thread-safe)
+    pub fn register_mounts(&self, container_id: &str, mounts: Vec<String>) {
         ConsoleLogger::debug(&format!("[RESOURCE] Registering {} mounts for container {}", mounts.len(), container_id));
-        self.active_mounts.insert(container_id.to_string(), mounts);
+        if let Ok(mut active_mounts) = self.active_mounts.lock() {
+            active_mounts.insert(container_id.to_string(), mounts);
+        }
     }
 
-    /// Register network configuration for a container
-    pub fn register_network(&mut self, container_id: &str, network_config: ContainerNetworkConfig) {
+    /// Register network configuration for a container (thread-safe)
+    pub fn register_network(&self, container_id: &str, network_config: ContainerNetworkConfig) {
         ConsoleLogger::debug(&format!("[RESOURCE] Registering network config for container {}", container_id));
-        self.network_interfaces.insert(container_id.to_string(), network_config);
+        if let Ok(mut network_interfaces) = self.network_interfaces.lock() {
+            network_interfaces.insert(container_id.to_string(), network_config);
+        }
     }
 
-    /// Cleanup all resources for a container
-    pub fn cleanup_container_resources(&mut self, container_id: &str, container_pid: Option<Pid>) -> Result<(), String> {
+    /// Cleanup all resources for a container (thread-safe)
+    pub fn cleanup_container_resources(&self, container_id: &str, container_pid: Option<Pid>) -> Result<(), String> {
         ConsoleLogger::progress(&format!("🧹 Cleaning up all resources for container: {}", container_id));
 
         let mut cleanup_errors = Vec::new();
 
-        // 1. Cleanup network resources
-        if let Some(network_config) = self.network_interfaces.remove(container_id) {
+        // 1. Cleanup network resources (thread-safe)
+        let network_config = if let Ok(mut network_interfaces) = self.network_interfaces.lock() {
+            network_interfaces.remove(container_id)
+        } else {
+            None
+        };
+        
+        if let Some(network_config) = network_config {
             if let Err(e) = self.cleanup_network_resources(&network_config, container_pid) {
                 cleanup_errors.push(format!("Network cleanup failed: {}", e));
             }
         }
 
-        // 2. Cleanup mount namespaces
-        if let Some(mounts) = self.active_mounts.remove(container_id) {
+        // 2. Cleanup mount namespaces (thread-safe)
+        let mounts = if let Ok(mut active_mounts) = self.active_mounts.lock() {
+            active_mounts.remove(container_id)
+        } else {
+            None
+        };
+        
+        if let Some(mounts) = mounts {
             if let Err(e) = self.cleanup_mount_resources(container_id, &mounts, container_pid) {
                 cleanup_errors.push(format!("Mount cleanup failed: {}", e));
             }
@@ -59,9 +76,9 @@ impl ResourceManager {
             cleanup_errors.push(format!("Cgroup cleanup failed: {}", e));
         }
 
-        // 4. Final rootfs cleanup
+        // 4. Final rootfs cleanup (retry with proper ordering)
         let rootfs_path = format!("/tmp/quilt-containers/{}", container_id);
-        if let Err(e) = self.cleanup_rootfs_resources(&rootfs_path) {
+        if let Err(e) = self.cleanup_rootfs_resources_safe(&rootfs_path) {
             cleanup_errors.push(format!("Rootfs cleanup failed: {}", e));
         }
 
@@ -157,38 +174,76 @@ impl ResourceManager {
         cgroup_manager.cleanup()
     }
 
-    /// Cleanup rootfs after all mounts are cleaned up
-    fn cleanup_rootfs_resources(&self, rootfs_path: &str) -> Result<(), String> {
+    /// Cleanup rootfs resources with improved mount ordering
+    fn cleanup_rootfs_resources_safe(&self, rootfs_path: &str) -> Result<(), String> {
         ConsoleLogger::debug(&format!("📂 Cleaning up rootfs: {}", rootfs_path));
 
-        // Ensure all mounts are gone before removing directory
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        if !Path::new(rootfs_path).exists() {
+            ConsoleLogger::debug("Rootfs path doesn't exist, skipping cleanup");
+            return Ok(());
+        }
 
-        // Force remove the directory
+        // Step 1: Force unmount all nested mounts in proper order (most specific first)
+        let nested_mounts = vec![
+            format!("{}/proc", rootfs_path),
+            format!("{}/sys", rootfs_path),
+            format!("{}/dev/pts", rootfs_path),
+            format!("{}/dev", rootfs_path),
+        ];
+
+        for mount_point in nested_mounts {
+            if Path::new(&mount_point).exists() {
+                let umount_cmd = format!("umount -l '{}' 2>/dev/null || true", mount_point);
+                let _ = CommandExecutor::execute_shell(&umount_cmd);
+                
+                // Give kernel time to process unmount
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+
+        // Step 2: Try graceful removal first
         match FileSystemUtils::remove_path(rootfs_path) {
             Ok(()) => {
-                ConsoleLogger::success(&format!("Rootfs cleaned up: {}", rootfs_path));
+                ConsoleLogger::success(&format!("✅ Rootfs cleanup successful: {}", rootfs_path));
+                return Ok(());
+            }
+            Err(e) => {
+                ConsoleLogger::warning(&format!("Normal rootfs removal failed, trying force removal: {}", e));
+            }
+        }
+
+        // Step 3: Force cleanup with more aggressive unmounting
+        let force_umount_cmd = format!("umount -f -l '{}' 2>/dev/null || true", rootfs_path);
+        let _ = CommandExecutor::execute_shell(&force_umount_cmd);
+        
+        // Wait a bit longer for force unmount to complete
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        // Step 4: Force remove directory
+        let force_remove_cmd = format!("rm -rf '{}'", rootfs_path);
+        match CommandExecutor::execute_shell(&force_remove_cmd) {
+            Ok(_) => {
+                ConsoleLogger::success(&format!("✅ Force rootfs cleanup successful: {}", rootfs_path));
                 Ok(())
             }
             Err(e) => {
-                // If normal removal fails, try force removal
-                ConsoleLogger::warning(&format!("Normal rootfs removal failed, trying force removal: {}", e));
-                let force_remove_cmd = format!("rm -rf {}", rootfs_path);
-                match CommandExecutor::execute_shell(&force_remove_cmd) {
+                // Last resort - try with sudo if available
+                let sudo_remove_cmd = format!("sudo rm -rf '{}' 2>/dev/null || rm -rf '{}'", rootfs_path, rootfs_path);
+                match CommandExecutor::execute_shell(&sudo_remove_cmd) {
                     Ok(_) => {
-                        ConsoleLogger::success(&format!("Force rootfs cleanup successful: {}", rootfs_path));
+                        ConsoleLogger::success(&format!("✅ Emergency rootfs cleanup successful: {}", rootfs_path));
                         Ok(())
                     }
-                    Err(e) => {
-                        Err(format!("Failed to remove rootfs {}: {}", rootfs_path, e))
+                    Err(e2) => {
+                        Err(format!("Failed to remove rootfs {}: {} (emergency attempt: {})", rootfs_path, e, e2))
                     }
                 }
             }
         }
     }
 
-    /// Emergency cleanup - force cleanup all resources for a container
-    pub fn emergency_cleanup(&mut self, container_id: &str) -> Result<(), String> {
+    /// Emergency cleanup for a container (thread-safe)
+    pub fn emergency_cleanup(&self, container_id: &str) -> Result<(), String> {
         ConsoleLogger::warning(&format!("🚨 Emergency cleanup for container: {}", container_id));
 
         // Kill any remaining processes
@@ -202,12 +257,16 @@ impl ResourceManager {
         Ok(())
     }
 
-    /// Cleanup all resources for all containers (system-wide cleanup)
-    pub fn cleanup_all_resources(&mut self) -> Result<(), String> {
+    /// Cleanup all resources for all containers (system-wide cleanup, thread-safe)
+    pub fn cleanup_all_resources(&self) -> Result<(), String> {
         ConsoleLogger::warning("🧹 Performing system-wide resource cleanup");
 
-        // Get all container IDs
-        let container_ids: Vec<String> = self.active_mounts.keys().cloned().collect();
+        // Get all container IDs (thread-safe)
+        let container_ids: Vec<String> = if let Ok(active_mounts) = self.active_mounts.lock() {
+            active_mounts.keys().cloned().collect()
+        } else {
+            vec![]
+        };
         
         let mut cleanup_errors = Vec::new();
         for container_id in container_ids {
@@ -239,18 +298,19 @@ impl ResourceManager {
     }
 }
 
-/// Singleton resource manager
-static mut RESOURCE_MANAGER: Option<ResourceManager> = None;
-static RESOURCE_MANAGER_INIT: std::sync::Once = std::sync::Once::new();
+/// Thread-safe singleton resource manager using proper synchronization
+use std::sync::Once;
+static mut RESOURCE_MANAGER: Option<Arc<ResourceManager>> = None;
+static RESOURCE_MANAGER_INIT: Once = Once::new();
 
 impl ResourceManager {
-    /// Get the global resource manager instance
-    pub fn global() -> &'static mut ResourceManager {
+    /// Get the global resource manager instance (thread-safe)
+    pub fn global() -> Arc<ResourceManager> {
         unsafe {
             RESOURCE_MANAGER_INIT.call_once(|| {
-                RESOURCE_MANAGER = Some(ResourceManager::new());
+                RESOURCE_MANAGER = Some(Arc::new(ResourceManager::new()));
             });
-            RESOURCE_MANAGER.as_mut().unwrap()
+            RESOURCE_MANAGER.as_ref().unwrap().clone()
         }
     }
 } 

@@ -1,10 +1,11 @@
 use crate::daemon::namespace::{NamespaceManager, NamespaceConfig};
 use crate::daemon::cgroup::{CgroupManager, CgroupLimits};
 use crate::daemon::manager::RuntimeManager;
+use crate::daemon::readiness::{ContainerReadinessManager, ReadinessConfig, cleanup_readiness_signal};
 use crate::utils::{ConsoleLogger, FileSystemUtils, CommandExecutor, ProcessUtils, ImageManager, ConcurrentContainerRegistry};
 use crate::icc::network::{ContainerNetworkConfig, NetworkManager};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::process::Command;
 use std::fs;
 use std::path::Path;
@@ -13,9 +14,8 @@ use tar::Archive;
 use nix::unistd::{chroot, chdir, Pid, execv};
 use std::os::unix::fs::PermissionsExt;
 use std::ffi::CString;
-use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
 use crate::daemon::resource::ResourceManager;
+use std::time::SystemTime;
 
 #[derive(Debug, Clone)]
 pub enum ContainerState {
@@ -57,7 +57,7 @@ impl Default for ContainerConfig {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Container {
     #[allow(dead_code)]
     pub id: String,
@@ -68,6 +68,25 @@ pub struct Container {
     pub rootfs_path: String,
     pub created_at: u64,
     pub network_config: Option<ContainerNetworkConfig>,
+    // Task management to prevent leaks
+    pub monitoring_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Clone for Container {
+    fn clone(&self) -> Self {
+        Container {
+            id: self.id.clone(),
+            config: self.config.clone(),
+            state: self.state.clone(),
+            logs: self.logs.clone(),
+            pid: self.pid,
+            rootfs_path: self.rootfs_path.clone(),
+            created_at: self.created_at,
+            network_config: self.network_config.clone(),
+            // JoinHandle cannot be cloned, so we set it to None
+            monitoring_task: None,
+        }
+    }
 }
 
 impl Container {
@@ -83,6 +102,7 @@ impl Container {
             rootfs_path: format!("/tmp/quilt-containers/{}", id),
             created_at: timestamp,
             network_config: None,
+            monitoring_task: None,
         }
     }
 
@@ -97,19 +117,21 @@ impl Container {
 }
 
 pub struct ContainerRuntime {
-    containers: ConcurrentContainerRegistry<Container>,
+    containers: Arc<ConcurrentContainerRegistry<Container>>,
     namespace_manager: NamespaceManager,
     runtime_manager: RuntimeManager,
     resource_manager: ResourceManager,
+    readiness_manager: ContainerReadinessManager,
 }
 
 impl ContainerRuntime {
     pub fn new() -> Self {
         ContainerRuntime {
-            containers: ConcurrentContainerRegistry::new(),
+            containers: Arc::new(ConcurrentContainerRegistry::new()),
             namespace_manager: NamespaceManager::new(),
             runtime_manager: RuntimeManager::new(),
             resource_manager: ResourceManager::new(),
+            readiness_manager: ContainerReadinessManager::new(ReadinessConfig::default()),
         }
     }
 
@@ -187,10 +209,13 @@ impl ContainerRuntime {
         });
         
         // Prepare all data needed by child process (avoid heavy captures)
-        let command_clone = config.command.clone();
+        // ENHANCED: Inject readiness check into command
+        let enhanced_command = self.readiness_manager.inject_readiness_into_command(id, config.command.clone());
+        let command_clone = enhanced_command;
         let environment_clone = config.environment.clone();
         let rootfs_path_clone = rootfs_path.clone();
         let setup_commands_clone = setup_commands.clone();
+        let network_enabled = namespace_config.network; // Capture network flag for child process
 
         // Create new lightweight runtime manager for child (not clone of existing)
         let child_func = move || -> i32 {
@@ -204,10 +229,14 @@ impl ContainerRuntime {
                 return 1;
             }
 
-            // Setup basic network namespace (loopback only) - actual network setup happens from host
-            if let Err(e) = namespace_manager.setup_network_namespace() {
-                eprintln!("Failed to setup network namespace: {}", e);
-                // Non-fatal, continue
+            // Setup basic network namespace ONLY if networking is enabled
+            if network_enabled {
+                if let Err(e) = namespace_manager.setup_network_namespace() {
+                    eprintln!("Failed to setup network namespace: {}", e);
+                    // Non-fatal, continue
+                }
+            } else {
+                println!("Skipping network namespace setup (networking disabled for container)");
             }
 
             // Set container hostname
@@ -252,19 +281,29 @@ impl ContainerRuntime {
             // Execute the main command with reduced memory overhead
             println!("Executing main command in container: {:?}", command_clone);
             
-            // Prepare the final command to execute
+            // Prepare the final command to execute - IMPROVED LOGIC
             let (final_program, final_args) = if command_clone.len() >= 3 
                 && (command_clone[0].ends_with("/sh") || command_clone[0].ends_with("/bash"))
                 && command_clone[1] == "-c" {
                 // Command is already a shell command like ["/bin/sh", "-c", "actual command"]
                 // Use it directly to avoid double-shell wrapping
                 (command_clone[0].clone(), command_clone[1..].to_vec())
+            } else if command_clone.len() == 2 && command_clone[0] == "sleep" {
+                // Special handling for sleep commands to ensure they work properly
+                let sleep_duration = &command_clone[1];
+                // Validate sleep duration
+                if sleep_duration.parse::<u64>().is_ok() || sleep_duration == "infinity" {
+                    ("/bin/sh".to_string(), vec!["-c".to_string(), format!("exec sleep {}", sleep_duration)])
+                } else {
+                    ConsoleLogger::warning(&format!("Invalid sleep duration: {}, using default", sleep_duration));
+                    ("/bin/sh".to_string(), vec!["-c".to_string(), "exec sleep 3600".to_string()])
+                }
             } else if command_clone.len() == 1 {
                 // Single command - execute it through shell
-                ("/bin/sh".to_string(), vec!["-c".to_string(), command_clone[0].clone()])
+                ("/bin/sh".to_string(), vec!["-c".to_string(), format!("exec {}", command_clone[0])])
             } else {
-                // Multiple arguments - join them and execute through shell
-                ("/bin/sh".to_string(), vec!["-c".to_string(), command_clone.join(" ")])
+                // Multiple arguments - join them and execute through shell with exec
+                ("/bin/sh".to_string(), vec!["-c".to_string(), format!("exec {}", command_clone.join(" "))])
             };
 
             // Convert to CString for exec (do this once, outside any fork)
@@ -319,7 +358,7 @@ impl ContainerRuntime {
         // Create the namespaced process
         match self.namespace_manager.create_namespaced_process(&namespace_config, child_func) {
             Ok(pid) => {
-                ConsoleLogger::container_started(id, Some(ProcessUtils::pid_to_i32(pid)));
+                ConsoleLogger::debug(&format!("🚀 Container process created, PID: {} - verifying readiness...", ProcessUtils::pid_to_i32(pid)));
                 
                 // Add process to cgroups
                 if let Err(e) = cgroup_manager.add_process(pid) {
@@ -333,24 +372,40 @@ impl ContainerRuntime {
                     }
                 }
 
-                ConsoleLogger::debug(&format!("[START] Locking containers map to update state for {}", id));
-                // Update container state
-                {
-                    let mut containers = self.containers.lock().unwrap();
-                    if let Some(container) = containers.get_mut(id) {
-                        container.pid = Some(pid);
-                        container.state = ContainerState::RUNNING;
-                        container.add_log(format!("Container started with PID: {}", pid));
+                // ✅ CRITICAL: Event-driven readiness verification - NO POLLING
+                match self.readiness_manager.wait_for_container_ready(id, pid, &rootfs_path) {
+                    Ok(()) => {
+                        // Now container is truly ready
+                        ConsoleLogger::container_started(id, Some(ProcessUtils::pid_to_i32(pid)));
+                        
+                        ConsoleLogger::debug(&format!("[START] Locking containers map to update state for {}", id));
+                        // Update container state using lock-free concurrent operations
+                        self.containers.update(id, |container| {
+                            container.pid = Some(pid);
+                            container.state = ContainerState::RUNNING;
+                            container.add_log(format!("Container started with PID: {} and verified ready (event-driven)", pid));
+                        });
+                        ConsoleLogger::debug(&format!("[START] Unlocked containers map for {}", id));
+                    }
+                    Err(e) => {
+                        ConsoleLogger::error(&format!("Container {} failed event-driven readiness check: {}", id, e));
+                        // Kill the process since it's not working properly
+                        let _ = ProcessUtils::terminate_process(pid, 2);
+                        // Clean up readiness signal
+                        cleanup_readiness_signal(id);
+                        self.update_container_state(id, ContainerState::FAILED(e.clone()));
+                        return Err(format!("Container {} failed to become ready (event-driven): {}", id, e));
                     }
                 }
-                ConsoleLogger::debug(&format!("[START] Unlocked containers map for {}", id));
 
-                // Wait for process completion in a separate task
-                let containers_clone = Arc::clone(&self.containers);
+                // Wait for process completion in a separate task - MANAGED TO PREVENT LEAKS
                 let id_clone = id.to_string();
                 let start_time = std::time::SystemTime::now();
+                let containers_ref = self.containers.clone(); // Clone the Arc for the task
+                let resource_manager = ResourceManager::global();
                 
-                tokio::spawn(async move {
+                // ✅ CRITICAL FIX: Use a JoinHandle to manage the task lifecycle
+                let wait_task = tokio::spawn(async move {
                     ConsoleLogger::debug(&format!("🕐 [TIMING] Started waiting for process {} at {:?}", ProcessUtils::pid_to_i32(pid), start_time));
                     
                     let exit_code = match NamespaceManager::new().wait_for_process(pid) {
@@ -370,14 +425,31 @@ impl ContainerRuntime {
                         }
                     };
 
-                    // Note: Update container state via main runtime reference
-                    // This will be handled by the main thread when process monitoring completes
+                    // Update container state to EXITED
+                    containers_ref.update(&id_clone, |container| {
+                        if let Some(code) = exit_code {
+                            container.state = ContainerState::EXITED(code);
+                        } else {
+                            container.state = ContainerState::FAILED("Process monitoring failed".to_string());
+                        }
+                        container.pid = None;
+                        container.add_log("Container process completed".to_string());
+                    });
 
                     // Comprehensive resource cleanup using ResourceManager
-                    let resource_manager = ResourceManager::global();
                     if let Err(e) = resource_manager.cleanup_container_resources(&id_clone, Some(pid)) {
                         ConsoleLogger::warning(&format!("Resource cleanup failed for {}: {}", id_clone, e));
                     }
+                    
+                    ConsoleLogger::debug(&format!("✅ Container {} monitoring task completed", id_clone));
+                });
+
+                // Store the task handle in container metadata for later cleanup if needed
+                // For now, we'll let it run to completion since it cleans up after itself
+                
+                // Update container state to store the monitoring task
+                self.containers.update(id, |container| {
+                    container.monitoring_task = Some(wait_task);
                 });
 
                 Ok(())
@@ -1128,35 +1200,26 @@ done
     pub fn stop_container(&self, container_id: &str) -> Result<(), String> {
         ConsoleLogger::progress(&format!("Stopping container: {}", container_id));
 
-        let pid = self.containers.with_container(container_id, |container| {
-            match container.pid {
-                Some(pid) => {
-                    // Check if process is still running
-                    if ProcessUtils::is_process_running(pid) {
-                        Some(pid)
-                    } else {
-                        None
-                    }
-                }
-                None => None,
-            }
+        // Get container PID and monitoring task
+        let (pid, monitoring_task) = self.containers.with_container(container_id, |container| {
+            (container.pid, container.monitoring_task.as_ref().map(|t| t.abort_handle()))
         }).ok_or_else(|| format!("Container {} not found", container_id))?;
-        
-        let pid = match pid {
-            Some(pid) => pid,
-            None => {
-                ConsoleLogger::info(&format!("Container {} has no running process", container_id));
-                return Ok(());
-            }
-        };
 
-        // Terminate the process gracefully with 10 second timeout
+        let pid = pid.ok_or_else(|| format!("Container {} is not running", container_id))?;
+
+        // Abort the monitoring task to prevent resource leaks
+        if let Some(abort_handle) = monitoring_task {
+            abort_handle.abort();
+            ConsoleLogger::debug(&format!("Aborted monitoring task for container {}", container_id));
+        }
+
         match ProcessUtils::terminate_process(pid, 10) {
             Ok(()) => {
                 // Update container state
                 self.containers.update(container_id, |container| {
                     container.state = ContainerState::EXITED(0);
                     container.pid = None;
+                    container.monitoring_task = None; // Clear the task handle
                     container.add_log("Container stopped by user request".to_string());
                 });
                 
@@ -1179,7 +1242,8 @@ done
         ConsoleLogger::progress(&format!("Removing container: {}", container_id));
 
         // Get container PID before stopping if it's running
-        let container_pid = self.containers.with_container(container_id, |container| container.pid);
+        let container_pid = self.containers.with_container(container_id, |container| container.pid)
+            .flatten(); // This converts Option<Option<Pid>> to Option<Pid>
 
         // Stop the container first if it's running
         if let Err(e) = self.stop_container(container_id) {
@@ -1189,6 +1253,9 @@ done
         // Remove container from registry
         self.containers.remove(container_id)
             .ok_or_else(|| format!("Container {} not found", container_id))?;
+
+        // Clean up readiness signal files
+        cleanup_readiness_signal(container_id);
 
         // Use ResourceManager for comprehensive cleanup
         let resource_manager = ResourceManager::global();
@@ -1236,7 +1303,7 @@ done
             let pid = container.pid
                 .ok_or_else(|| format!("Container {} is not running", container_id))?;
             
-            Ok((network_config.clone(), pid))
+            Result::<(ContainerNetworkConfig, nix::unistd::Pid), String>::Ok((network_config.clone(), pid))
         }).ok_or_else(|| format!("Container {} not found", container_id))??;
 
         // Setup the container's network interface using the network manager
@@ -1332,4 +1399,6 @@ done
 
         Ok((exit_code, stdout, stderr))
     }
+
+    // OLD POLLING-BASED VERIFICATION REMOVED - REPLACED WITH EVENT-DRIVEN READINESS SYSTEM
 }
