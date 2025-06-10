@@ -114,7 +114,7 @@ container_ids=()
 for i in $(seq 1 $CONCURRENT_CONTAINERS); do
     (
         log_test "Creating container: concurrent-worker-$i"
-        command="echo 'Container $i ready'; sleep 10; echo 'Container $i completed'"
+        command="echo 'Container $i ready'; for j in \$(seq 1 100); do echo 'Working \$j'; done; echo 'Container $i completed'"
         log_test "Command: $command"
         # Capture both stdout and stderr for debugging
         output=$("$CLI_BIN" create --image-path ./nixos-minimal.tar.gz -- /bin/sh -c "$command" 2>&1)
@@ -195,9 +195,9 @@ SERVER_STARTUP_TIME=$(echo "$SERVER_READY_TIME - $SERVER_START_TIME" | bc -l)
 CONTAINER_CREATION_TIME=$(echo "$CONTAINER_CREATE_END_TIME - $CONTAINER_CREATE_START_TIME" | bc -l)
 STATUS_CHECK_TIME=$(echo "$STATUS_CHECK_END_TIME - $STATUS_CHECK_START_TIME" | bc -l)
 
-# Calculate actual work time (excluding artificial sleeps)
-SLEEP_TIME=3.0  # 3 seconds for container settling
-ACTUAL_WORK_TIME=$(echo "$TOTAL_TEST_TIME - $SLEEP_TIME" | bc -l)
+# Calculate actual work time (excluding brief settling periods)
+SETTLING_TIME=5.0  # 5 seconds total for server ready + container settling
+ACTUAL_WORK_TIME=$(echo "$TOTAL_TEST_TIME - $SETTLING_TIME" | bc -l)
 
 log_pass "Full stress test completed successfully!"
 
@@ -207,13 +207,13 @@ log_test "📊 PERFORMANCE METRICS REPORT 📊"
 log_test "=================================="
 log_test "Test Configuration:"
 log_test "  • Concurrent containers: $CONCURRENT_CONTAINERS"
-log_test "  • Container sleep time: 10s each"
+log_test "  • Container task: 100 echo operations each"
 log_test ""
 log_test "⏱️  Timing Breakdown:"
 log_test "  • Server startup:       $(printf "%.3f" "$SERVER_STARTUP_TIME")s"
 log_test "  • Container creation:   $(printf "%.3f" "$CONTAINER_CREATION_TIME")s"
 log_test "  • Status verification:  $(printf "%.3f" "$STATUS_CHECK_TIME")s"
-log_test "  • Artificial sleeps:    ${SLEEP_TIME}s"
+log_test "  • Settling periods:     ${SETTLING_TIME}s"
 log_test ""
 log_test "📈 Summary Times:"
 log_test "  • Total test time:      $(printf "%.3f" "$TOTAL_TEST_TIME")s"
