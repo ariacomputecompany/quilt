@@ -1,123 +1,132 @@
-# Quilt Container Runtime
+# Quilt
 
-A lightweight, high-performance container runtime written in Rust with advanced namespace isolation, memory management, and parallel execution capabilities.
+Rust container runtime with SQLite-based sync engine.
 
-## Features
+## Overview
 
-### Core Container Runtime
-- **Linux Namespaces**: PID, mount, UTS, IPC, and network isolation
-- **Memory Management**: Cgroup-based resource limits with strict enforcement
-- **Custom Shell Binary**: Self-contained shell for Nix environments with broken symlinks
-- **Network Connectivity**: Full internet access for downloads and package installations
-- **Parallel Execution**: Concurrent container creation and management
-
-### Advanced Capabilities
-- **Real Software Installation**: Downloads and installs Node.js, Python, development tools
-- **Command Execution**: Compound shell commands with proper parsing and execution
-- **File System Isolation**: Independent container file systems with mount namespaces
-- **Process Management**: Complete container lifecycle with cleanup and resource reclamation
-- **Error Recovery**: Robust error handling with fail-fast design
+Quilt is a container runtime that uses Linux namespaces and cgroups for isolation. It provides a gRPC API for container management and a CLI client for interaction.
 
 ## Architecture
 
-```
-┌─────────────────┐    ┌──────────────────┐    ┌─────────────────┐
-│   CLI Client    │────│   gRPC Server    │────│  Runtime Engine │
-│  (quilt-cli)    │    │     (quilt)      │    │   (containers)  │
-└─────────────────┘    └──────────────────┘    └─────────────────┘
-                                │
-                                ▼
-                       ┌─────────────────┐
-                       │   Namespace     │
-                       │   + Cgroups     │
-                       │   + Custom Shell│
-                       └─────────────────┘
-```
+- **quilt**: gRPC server daemon managing containers
+- **cli**: Command-line client
+- **SQLite backend**: Non-blocking state management
+- **Namespaces**: PID, mount, UTS, IPC, network isolation
+- **Cgroups**: Memory and CPU resource limits
 
-## Quick Start
+## Requirements
 
-### Build
+- Linux kernel with namespace support
+- cgroup v1 or v2
+- Rust 1.70+
+- gcc
+- pkg-config
+- protobuf compiler
+
+## Build
+
 ```bash
-# Build both server and CLI in one command
-cargo build --release --target x86_64-unknown-linux-gnu
+cargo build --release
 ```
 
-### Run Server
+## Usage
+
+### Start Server
 ```bash
-./target/x86_64-unknown-linux-gnu/release/quilt
+./target/release/quilt
+```
+
+### Generate Container Image
+```bash
+./dev.sh generate-rootfs
 ```
 
 ### Create Container
 ```bash
-./target/x86_64-unknown-linux-gnu/debug/cli create \
+./target/release/cli create \
   --image-path ./nixos-minimal.tar.gz \
   --memory-limit 512 \
-  -- /bin/sh -c "echo 'Hello World'; ls /bin"
+  --cpu-limit 50.0 \
+  --enable-all-namespaces \
+  -- /bin/sh -c "echo hello"
+```
+
+### Container Operations
+```bash
+# Status
+./target/release/cli status <container-id>
+
+# Logs
+./target/release/cli logs <container-id>
+
+# Execute command
+./target/release/cli exec <container-id> <command>
+
+# Stop
+./target/release/cli stop <container-id>
+
+# Remove
+./target/release/cli remove <container-id>
+```
+
+### Inter-Container Communication
+```bash
+# Ping between containers
+./target/release/cli icc ping <container-1> <container-2>
+
+# Execute via ICC
+./target/release/cli icc exec <container-id> <command>
 ```
 
 ## Testing
 
-### Basic Functionality Test
 ```bash
-./test_container_functionality.sh
+# Run all tests
+./tests/test_container_functionality.sh
+./tests/test_sync_engine.sh
+./tests/test_icc.sh
 ```
-- 5 tests covering basic commands, file operations, error handling
-- ~18s execution time
-- Always exits 0 with detailed timing metrics
 
-### Advanced Runtime Test
-```bash
-./test_runtime_downloads.sh
+## Project Structure
+
 ```
-- Real software downloads (Node.js, Python, development tools)
-- Parallel container execution (4 simultaneous containers)
-- ~25s execution time with comprehensive validation
+src/
+├── main.rs           # gRPC server
+├── cli/              # CLI client
+├── daemon/           # Container runtime
+├── sync/             # SQLite state engine
+├── icc/              # Inter-container communication
+└── utils/            # Shared utilities
 
-## Technical Highlights
+proto/
+└── quilt.proto       # gRPC service definitions
 
-### Memory Management
-- **Zero memory leaks**: Proper CString lifetime management
-- **Efficient resource usage**: ~200ms container creation time
-- **Parallel safety**: Concurrent containers without interference
+tests/                # Test scripts
+```
 
-### Command Execution
-- **Compound commands**: Handles `;`, `&&`, `||`, `|` operators
-- **Custom shell binary**: C program with built-in commands for broken environments
-- **Proper exec**: Direct process replacement without nested shells
+## Performance
 
-### Performance
-- **Container Creation**: ~200ms average
-- **Command Execution**: <10ms after creation
-- **Log Retrieval**: ~10ms
-- **Parallel Scaling**: Linear performance with multiple containers
+- Container creation: ~200ms
+- Status queries: <1ms
+- Command execution: <10ms
+- Supports parallel container operations
 
-### Robustness
-- **Fail-fast design**: Timeouts prevent hanging
-- **Comprehensive cleanup**: Resources always reclaimed
-- **Error isolation**: Container failures don't affect system
-- **Network reliability**: Handles download failures gracefully
+## Contributing
 
-## Dependencies
+1. Fork the repository
+2. Create a feature branch (`git checkout -b feature/name`)
+3. Commit changes (`git commit -am 'Add feature'`)
+4. Push to branch (`git push origin feature/name`)
+5. Create Pull Request
 
-### Runtime
-- Linux kernel with namespace support
-- `systemd` or cgroup v1/v2 support
-- Standard C library for custom shell binary
+### Guidelines
 
-### Build
-- Rust 1.70+
-- `gcc` or compatible C compiler
-- `pkg-config`
-- Protocol Buffers compiler
-
-## Container Images
-
-Compatible with standard OCI/Docker images and custom tarballs. Includes automatic binary fixing for Nix-generated containers with broken `/nix/store` symlinks.
+- Run `cargo fmt` before committing
+- Run `cargo clippy` and fix warnings
+- Add tests for new features
+- Update documentation as needed
+- Keep commits focused and atomic
 
 ## License
 
-[License details]
-
----
-
-**Status**: Production-ready container runtime with real-world software installation capabilities and comprehensive test coverage. 
+[Specify license]

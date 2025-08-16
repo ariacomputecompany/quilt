@@ -1,11 +1,28 @@
+# Target directory
 **/target/
+
+# Log files
 *.log
+stress_logs/
+
+# Database files
+*.db
+*.db-shm
+*.db-wal
+
+# Internal documentation
+docs/internal/
+
+# OS files
 .DS_Store
+
+# Container runtime
 active_containers/
 
 # Nix-related
 flake.lock
-result*
+result
+result-*
 
-ENGINEERING.md
-KUBERNETES.md
+# Container images
+*.tar.gz
