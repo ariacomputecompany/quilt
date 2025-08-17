@@ -8,6 +8,7 @@ use crate::sync::{
     network::{NetworkManager, NetworkConfig, NetworkAllocation},
     monitor::ProcessMonitorService,
     cleanup::CleanupService,
+    volumes::{VolumeManager, Volume, Mount, MountType},
     error::{SyncError, SyncResult},
 };
 
@@ -16,6 +17,7 @@ pub struct SyncEngine {
     connection_manager: Arc<ConnectionManager>,
     container_manager: Arc<ContainerManager>,
     network_manager: Arc<NetworkManager>,
+    volume_manager: Arc<VolumeManager>,
     monitor_service: Arc<ProcessMonitorService>,
     cleanup_service: Arc<CleanupService>,
     
@@ -36,13 +38,18 @@ impl SyncEngine {
         // Create component managers
         let container_manager = Arc::new(ContainerManager::new(connection_manager.pool().clone()));
         let network_manager = Arc::new(NetworkManager::new(connection_manager.pool().clone()));
+        let volume_manager = Arc::new(VolumeManager::new(connection_manager.pool().clone()));
         let monitor_service = Arc::new(ProcessMonitorService::new(connection_manager.pool().clone()));
         let cleanup_service = Arc::new(CleanupService::new(connection_manager.pool().clone()));
+        
+        // Initialize volume manager
+        volume_manager.initialize().await?;
         
         let engine = Self {
             connection_manager,
             container_manager,
             network_manager,
+            volume_manager,
             monitor_service,
             cleanup_service,
             background_tasks: Arc::new(RwLock::new(Vec::new())),
@@ -272,6 +279,11 @@ impl SyncEngine {
         self.container_manager.container_exists(container_id).await
     }
     
+    /// Get container ID by name
+    pub async fn get_container_by_name(&self, name: &str) -> SyncResult<String> {
+        self.container_manager.get_container_by_name(name).await
+    }
+    
     /// Get database connection pool for advanced operations
     pub fn pool(&self) -> &sqlx::SqlitePool {
         self.connection_manager.pool()
@@ -294,6 +306,62 @@ impl SyncEngine {
             active_networks,
             active_monitors: active_monitors_count,
         })
+    }
+    
+    // Volume management methods
+    
+    /// Create a new volume
+    pub async fn create_volume(
+        &self,
+        name: &str,
+        driver: Option<&str>,
+        labels: std::collections::HashMap<String, String>,
+        options: std::collections::HashMap<String, String>,
+    ) -> SyncResult<Volume> {
+        self.volume_manager.create_volume(name, driver, labels, options).await
+    }
+    
+    /// Get volume by name
+    pub async fn get_volume(&self, name: &str) -> SyncResult<Option<Volume>> {
+        self.volume_manager.get_volume(name).await
+    }
+    
+    /// List all volumes
+    pub async fn list_volumes(&self, filters: Option<std::collections::HashMap<String, String>>) -> SyncResult<Vec<Volume>> {
+        self.volume_manager.list_volumes(filters).await
+    }
+    
+    /// Remove a volume
+    pub async fn remove_volume(&self, name: &str, force: bool) -> SyncResult<()> {
+        self.volume_manager.remove_volume(name, force).await
+    }
+    
+    /// Add mount to container
+    pub async fn add_container_mount(
+        &self,
+        container_id: &str,
+        source: &str,
+        target: &str,
+        mount_type: MountType,
+        readonly: bool,
+        options: std::collections::HashMap<String, String>,
+    ) -> SyncResult<Mount> {
+        self.volume_manager.add_mount(container_id, source, target, mount_type, readonly, options).await
+    }
+    
+    /// Get mounts for a container
+    pub async fn get_container_mounts(&self, container_id: &str) -> SyncResult<Vec<Mount>> {
+        self.volume_manager.get_container_mounts(container_id).await
+    }
+    
+    /// Remove all mounts for a container
+    pub async fn remove_container_mounts(&self, container_id: &str) -> SyncResult<()> {
+        self.volume_manager.remove_container_mounts(container_id).await
+    }
+    
+    /// Get volume path for mounting
+    pub fn get_volume_path(&self, volume_name: &str) -> std::path::PathBuf {
+        self.volume_manager.get_volume_path(volume_name)
     }
 }
 

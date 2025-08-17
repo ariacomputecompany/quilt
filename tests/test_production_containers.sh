@@ -50,7 +50,7 @@ echo "📋 TEST 2: Persistent Agent Container"
 echo "===================================="
 
 echo "Creating persistent container that agents can use..."
-CONTAINER_ID=$(timeout 30 ./target/debug/cli create --image-path ./nixos-minimal.tar.gz -- sleep infinity | grep "Container ID:" | awk '{print $NF}')
+CONTAINER_ID=$(timeout 30 ./target/debug/cli create --image-path ./nixos-minimal.tar.gz -- tail -f /dev/null | grep "Container ID:" | awk '{print $NF}')
 
 if [ -n "$CONTAINER_ID" ]; then
     echo "✅ Persistent container created: $CONTAINER_ID"
@@ -81,7 +81,7 @@ if [ -n "$CONTAINER_ID" ]; then
     
     # Test inter-container communication setup
     echo "🏓 Setting up second container for communication test..."
-    CONTAINER_B=$(timeout 30 ./target/debug/cli create --image-path ./nixos-minimal.tar.gz -- sleep infinity | grep "Container ID:" | awk '{print $NF}')
+    CONTAINER_B=$(timeout 30 ./target/debug/cli create --image-path ./nixos-minimal.tar.gz -- tail -f /dev/null | grep "Container ID:" | awk '{print $NF}')
     
     if [ -n "$CONTAINER_B" ]; then
         echo "✅ Second container created: $CONTAINER_B"
@@ -145,7 +145,7 @@ echo "   - Health checking system"
 echo ""
 
 echo "📋 Agent-ready features:"
-echo "   ✅ Persistent containers (sleep infinity)"
+echo "   ✅ Persistent containers (tail -f /dev/null)"
 echo "   ✅ Instant exec after creation"
 echo "   ✅ Network-ready verification"
 echo "   ✅ Resource limits and constraints"

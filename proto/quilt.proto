@@ -16,6 +16,18 @@ service QuiltService {
     rpc RemoveContainer (RemoveContainerRequest) returns (RemoveContainerResponse);
     // Executes a command in a running container
     rpc ExecContainer (ExecContainerRequest) returns (ExecContainerResponse);
+    // Starts a stopped container
+    rpc StartContainer (StartContainerRequest) returns (StartContainerResponse);
+    // Kills a container immediately
+    rpc KillContainer (KillContainerRequest) returns (KillContainerResponse);
+    // Gets a container by name
+    rpc GetContainerByName (GetContainerByNameRequest) returns (GetContainerByNameResponse);
+    
+    // Volume management
+    rpc CreateVolume (CreateVolumeRequest) returns (CreateVolumeResponse);
+    rpc RemoveVolume (RemoveVolumeRequest) returns (RemoveVolumeResponse);
+    rpc ListVolumes (ListVolumesRequest) returns (ListVolumesResponse);
+    rpc InspectVolume (InspectVolumeRequest) returns (InspectVolumeResponse);
 }
 
 // Container status enumeration
@@ -24,6 +36,32 @@ enum ContainerStatus {
     RUNNING = 1;   // Container is actively running
     EXITED = 2;    // Container finished execution
     FAILED = 3;    // Container failed to start or execute
+}
+
+// Mount type enumeration
+enum MountType {
+    BIND = 0;      // Bind mount from host path
+    VOLUME = 1;    // Named volume
+    TMPFS = 2;     // Temporary filesystem in memory
+}
+
+// Mount configuration
+message Mount {
+    string source = 1;              // Source path (host path for bind, volume name for volume, empty for tmpfs)
+    string target = 2;              // Target path inside container
+    MountType type = 3;             // Type of mount
+    bool readonly = 4;              // Whether the mount is read-only
+    map<string, string> options = 5; // Mount-specific options
+}
+
+// Volume information
+message Volume {
+    string name = 1;                // Volume name
+    string driver = 2;              // Volume driver (e.g., "local")
+    string mount_point = 3;         // Host path where volume is stored
+    map<string, string> labels = 4; // User-defined metadata
+    map<string, string> options = 5; // Driver-specific options
+    uint64 created_at = 6;          // Creation timestamp
 }
 
 message CreateContainerRequest {
@@ -46,6 +84,13 @@ message CreateContainerRequest {
     bool enable_uts_namespace = 10;                // Enable UTS namespace isolation (hostname)
     bool enable_ipc_namespace = 11;                // Enable IPC namespace isolation
     bool enable_network_namespace = 12;            // Enable network namespace isolation
+    
+    // Container identification and mode
+    string name = 13;                              // Optional container name (must be unique)
+    bool async_mode = 14;                          // Create as async/long-running container
+    
+    // Volume and mount configuration
+    repeated Mount mounts = 15;                    // Mount configurations for the container
 }
 
 message CreateContainerResponse {
@@ -56,6 +101,7 @@ message CreateContainerResponse {
 
 message GetContainerStatusRequest {
     string container_id = 1;                       // Container ID to query
+    string container_name = 2;                     // Container name (alternative to ID)
 }
 
 message GetContainerStatusResponse {
@@ -77,6 +123,7 @@ message LogEntry {
 
 message GetContainerLogsRequest {
     string container_id = 1;                      // Container ID to get logs for
+    string container_name = 2;                    // Container name (alternative to ID)
 }
 
 message GetContainerLogsResponse {
@@ -87,6 +134,7 @@ message GetContainerLogsResponse {
 message StopContainerRequest {
     string container_id = 1;                      // Container ID to stop
     int32 timeout_seconds = 2;                    // Timeout before force kill (optional)
+    string container_name = 3;                    // Container name (alternative to ID)
 }
 
 message StopContainerResponse {
@@ -97,6 +145,7 @@ message StopContainerResponse {
 message RemoveContainerRequest {
     string container_id = 1;                      // Container ID to remove
     bool force = 2;                               // Force removal even if running
+    string container_name = 3;                    // Container name (alternative to ID)
 }
 
 message RemoveContainerResponse {
@@ -110,6 +159,8 @@ message ExecContainerRequest {
     string working_directory = 3;                 // Working directory (optional)
     map<string, string> environment = 4;          // Additional environment variables
     bool capture_output = 5;                      // Whether to capture and return output
+    string container_name = 6;                    // Container name (alternative to ID)
+    bool copy_script = 7;                         // Auto-copy local script to container
 }
 
 message ExecContainerResponse {
@@ -118,4 +169,77 @@ message ExecContainerResponse {
     string stdout = 3;                            // Standard output (if capture_output=true)
     string stderr = 4;                            // Standard error (if capture_output=true)
     string error_message = 5;                     // Error message if execution failed
+}
+
+message StartContainerRequest {
+    string container_id = 1;                      // Container ID to start
+    string container_name = 2;                    // Container name (alternative to ID)
+}
+
+message StartContainerResponse {
+    bool success = 1;                             // Whether start was successful
+    string error_message = 2;                     // Error message if start failed
+    int32 pid = 3;                               // Process ID of started container
+}
+
+message KillContainerRequest {
+    string container_id = 1;                      // Container ID to kill
+    string container_name = 2;                    // Container name (alternative to ID)
+}
+
+message KillContainerResponse {
+    bool success = 1;                             // Whether kill was successful
+    string error_message = 2;                     // Error message if kill failed
+}
+
+message GetContainerByNameRequest {
+    string name = 1;                              // Container name to look up
+}
+
+message GetContainerByNameResponse {
+    string container_id = 1;                      // Container ID
+    bool found = 2;                               // Whether container was found
+    string error_message = 3;                     // Error message if lookup failed
+}
+
+// Volume management messages
+message CreateVolumeRequest {
+    string name = 1;                              // Volume name
+    string driver = 2;                            // Volume driver (default: "local")
+    map<string, string> labels = 3;               // User-defined metadata
+    map<string, string> options = 4;              // Driver-specific options
+}
+
+message CreateVolumeResponse {
+    bool success = 1;                             // Whether creation was successful
+    string error_message = 2;                     // Error message if creation failed
+    Volume volume = 3;                            // Created volume information
+}
+
+message RemoveVolumeRequest {
+    string name = 1;                              // Volume name to remove
+    bool force = 2;                               // Force removal even if in use
+}
+
+message RemoveVolumeResponse {
+    bool success = 1;                             // Whether removal was successful
+    string error_message = 2;                     // Error message if removal failed
+}
+
+message ListVolumesRequest {
+    map<string, string> filters = 1;              // Filter volumes by labels
+}
+
+message ListVolumesResponse {
+    repeated Volume volumes = 1;                  // List of volumes
+}
+
+message InspectVolumeRequest {
+    string name = 1;                              // Volume name to inspect
+}
+
+message InspectVolumeResponse {
+    bool found = 1;                               // Whether volume was found
+    Volume volume = 2;                            // Volume information
+    string error_message = 3;                     // Error message if inspection failed
 } 

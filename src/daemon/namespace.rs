@@ -1,7 +1,7 @@
 use nix::sched::CloneFlags;
 use nix::unistd::Pid;
 use nix::mount::{mount, MsFlags};
-use nix::sys::wait::{waitpid, WaitStatus};
+use nix::sys::wait::{waitpid, WaitStatus, WaitPidFlag};
 use std::path::Path;
 use crate::utils::{ConsoleLogger, ProcessUtils};
 use crate::utils::CommandExecutor;
@@ -249,6 +249,121 @@ impl NamespaceManager {
 
         Ok(())
     }
+    
+    /// Setup container mounts (bind mounts, volumes, tmpfs)
+    pub fn setup_container_mounts(&self, rootfs_path: &str, mounts: &[crate::daemon::MountConfig]) -> Result<(), String> {
+        use crate::daemon::MountType;
+        
+        ConsoleLogger::debug(&format!("Setting up {} mounts for container", mounts.len()));
+        
+        for mount_config in mounts {
+            let target_path = if mount_config.target.starts_with('/') {
+                format!("{}{}", rootfs_path, mount_config.target)
+            } else {
+                format!("{}/{}", rootfs_path, mount_config.target)
+            };
+            
+            // Ensure target directory exists
+            if let Err(e) = std::fs::create_dir_all(&target_path) {
+                ConsoleLogger::warning(&format!("Failed to create mount target {}: {}", target_path, e));
+                continue;
+            }
+            
+            match mount_config.mount_type {
+                MountType::Bind => {
+                    self.setup_bind_mount(&mount_config.source, &target_path, mount_config.readonly)?;
+                }
+                MountType::Volume => {
+                    // For volumes, the source should be the full volume path
+                    self.setup_bind_mount(&mount_config.source, &target_path, mount_config.readonly)?;
+                }
+                MountType::Tmpfs => {
+                    self.setup_tmpfs_mount(&target_path, &mount_config.options)?;
+                }
+            }
+        }
+        
+        Ok(())
+    }
+    
+    fn setup_bind_mount(&self, source: &str, target: &str, readonly: bool) -> Result<(), String> {
+        ConsoleLogger::debug(&format!("Setting up bind mount: {} -> {} (readonly: {})", source, target, readonly));
+        
+        // Check if source exists
+        if !Path::new(source).exists() {
+            return Err(format!("Mount source '{}' does not exist", source));
+        }
+        
+        // Perform bind mount
+        let mut flags = MsFlags::MS_BIND;
+        if readonly {
+            flags |= MsFlags::MS_RDONLY;
+        }
+        
+        if let Err(e) = mount(
+            Some(source),
+            target,
+            None::<&str>,
+            flags,
+            None::<&str>,
+        ) {
+            return Err(format!("Failed to bind mount {} to {}: {}", source, target, e));
+        }
+        
+        // For readonly mounts, remount to ensure readonly is applied
+        if readonly {
+            if let Err(e) = mount(
+                None::<&str>,
+                target,
+                None::<&str>,
+                MsFlags::MS_BIND | MsFlags::MS_REMOUNT | MsFlags::MS_RDONLY,
+                None::<&str>,
+            ) {
+                ConsoleLogger::warning(&format!("Failed to remount {} as readonly: {}", target, e));
+            }
+        }
+        
+        ConsoleLogger::success(&format!("Successfully mounted {} to {}", source, target));
+        Ok(())
+    }
+    
+    fn setup_tmpfs_mount(&self, target: &str, options: &std::collections::HashMap<String, String>) -> Result<(), String> {
+        ConsoleLogger::debug(&format!("Setting up tmpfs mount at {}", target));
+        
+        // Build mount options string
+        let mut mount_opts = Vec::new();
+        
+        // Add size option if specified
+        if let Some(size) = options.get("size") {
+            mount_opts.push(format!("size={}", size));
+        } else {
+            mount_opts.push("size=64m".to_string()); // Default size
+        }
+        
+        // Add mode option if specified
+        if let Some(mode) = options.get("mode") {
+            mount_opts.push(format!("mode={}", mode));
+        }
+        
+        let opts_str = if mount_opts.is_empty() {
+            None
+        } else {
+            Some(mount_opts.join(","))
+        };
+        
+        if let Err(e) = mount(
+            Some("tmpfs"),
+            target,
+            Some("tmpfs"),
+            MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
+            opts_str.as_deref(),
+        ) {
+            return Err(format!("Failed to mount tmpfs at {}: {}", target, e));
+        }
+        
+        ConsoleLogger::success(&format!("Successfully mounted tmpfs at {}", target));
+        Ok(())
+    }
 
     /// Setup the network for a container with a veth pair
     pub fn setup_container_network(&self, config: &ContainerNetworkConfig) -> Result<(), String> {
@@ -320,7 +435,48 @@ impl NamespaceManager {
         }
     }
 
-    /// Wait for a process to complete and return its exit code
+    /// Wait for a process to complete and return its exit code (non-blocking for async)
+    pub async fn wait_for_process_async(&self, pid: Pid) -> Result<i32, String> {
+        ConsoleLogger::debug(&format!("Starting async wait for process {}", ProcessUtils::pid_to_i32(pid)));
+        
+        // Use non-blocking waitpid with WNOHANG in a loop
+        loop {
+            match waitpid(pid, Some(WaitPidFlag::WNOHANG)) {
+                Ok(WaitStatus::StillAlive) => {
+                    // Process is still running, yield to async runtime
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                    continue;
+                }
+                Ok(WaitStatus::Exited(_, exit_code)) => {
+                    ConsoleLogger::success(&format!("Process {} exited with code: {}", ProcessUtils::pid_to_i32(pid), exit_code));
+                    return Ok(exit_code);
+                }
+                Ok(WaitStatus::Signaled(_, signal, _)) => {
+                    let msg = format!("Process {} was terminated by signal: {:?}", ProcessUtils::pid_to_i32(pid), signal);
+                    ConsoleLogger::warning(&msg);
+                    return Err(msg);
+                }
+                Ok(status) => {
+                    let msg = format!("Process {} ended with unexpected status: {:?}", ProcessUtils::pid_to_i32(pid), status);
+                    ConsoleLogger::warning(&msg);
+                    return Err(msg);
+                }
+                Err(nix::errno::Errno::ECHILD) => {
+                    // Process doesn't exist or is not our child
+                    let msg = format!("Process {} is not a child or doesn't exist", ProcessUtils::pid_to_i32(pid));
+                    ConsoleLogger::warning(&msg);
+                    return Ok(0); // Assume normal exit
+                }
+                Err(e) => {
+                    let msg = format!("Failed to wait for process {}: {}", ProcessUtils::pid_to_i32(pid), e);
+                    ConsoleLogger::error(&msg);
+                    return Err(msg);
+                }
+            }
+        }
+    }
+    
+    /// Wait for a process to complete and return its exit code (blocking version for sync code)
     pub fn wait_for_process(&self, pid: Pid) -> Result<i32, String> {
         ConsoleLogger::debug(&format!("Waiting for process {} to complete", ProcessUtils::pid_to_i32(pid)));
 

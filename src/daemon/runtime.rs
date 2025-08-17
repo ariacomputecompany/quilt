@@ -41,6 +41,23 @@ pub struct ContainerConfig {
     pub namespace_config: Option<NamespaceConfig>,
     #[allow(dead_code)]
     pub working_directory: Option<String>,
+    pub mounts: Vec<MountConfig>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MountConfig {
+    pub source: String,
+    pub target: String,
+    pub mount_type: MountType,
+    pub readonly: bool,
+    pub options: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum MountType {
+    Bind,
+    Volume,
+    Tmpfs,
 }
 
 impl Default for ContainerConfig {
@@ -53,6 +70,7 @@ impl Default for ContainerConfig {
             resource_limits: Some(CgroupLimits::default()),
             namespace_config: Some(NamespaceConfig::default()),
             working_directory: None,
+            mounts: vec![],
         }
     }
 }
@@ -156,6 +174,26 @@ impl ContainerRuntime {
         ConsoleLogger::container_created(&id);
         Ok(())
     }
+    
+    pub fn register_existing_container(&self, id: String, config: ContainerConfig, rootfs_path: String) -> Result<(), String> {
+        ConsoleLogger::progress(&format!("Registering existing container: {}", id));
+        
+        // Verify rootfs exists before creating container
+        if !std::path::Path::new(&rootfs_path).exists() {
+            return Err(format!("Rootfs path {} does not exist", rootfs_path));
+        }
+        
+        let mut container = Container::new(id.clone(), config);
+        container.rootfs_path = rootfs_path.clone();
+        
+        // Lock-free container insertion
+        self.containers.insert(id.clone(), container);
+        
+        self.update_container_state(&id, ContainerState::PENDING);
+        
+        ConsoleLogger::debug(&format!("Registered existing container {} with rootfs {}", id, rootfs_path));
+        Ok(())
+    }
 
     pub fn start_container(&self, id: &str, network_config: Option<ContainerNetworkConfig>) -> Result<(), String> {
         ConsoleLogger::progress(&format!("[START] Starting container: {}", id));
@@ -216,6 +254,7 @@ impl ContainerRuntime {
         let rootfs_path_clone = rootfs_path.clone();
         let setup_commands_clone = setup_commands.clone();
         let network_enabled = namespace_config.network; // Capture network flag for child process
+        let mounts_clone = config.mounts.clone();
 
         // Create new lightweight runtime manager for child (not clone of existing)
         let child_func = move || -> i32 {
@@ -227,6 +266,14 @@ impl ContainerRuntime {
             if let Err(e) = namespace_manager.setup_mount_namespace(&rootfs_path_clone) {
                 eprintln!("Failed to setup mount namespace: {}", e);
                 return 1;
+            }
+            
+            // Setup container mounts (volumes, bind mounts, tmpfs)
+            if !mounts_clone.is_empty() {
+                if let Err(e) = namespace_manager.setup_container_mounts(&rootfs_path_clone, &mounts_clone) {
+                    eprintln!("Failed to setup container mounts: {}", e);
+                    // Non-fatal, continue - container can run without extra mounts
+                }
             }
 
             // Setup basic network namespace ONLY if networking is enabled
@@ -281,29 +328,42 @@ impl ContainerRuntime {
             // Execute the main command with reduced memory overhead
             println!("Executing main command in container: {:?}", command_clone);
             
-            // Prepare the final command to execute - IMPROVED LOGIC
-            let (final_program, final_args) = if command_clone.len() >= 3 
-                && (command_clone[0].ends_with("/sh") || command_clone[0].ends_with("/bash"))
-                && command_clone[1] == "-c" {
-                // Command is already a shell command like ["/bin/sh", "-c", "actual command"]
-                // Use it directly to avoid double-shell wrapping
-                (command_clone[0].clone(), command_clone[1..].to_vec())
-            } else if command_clone.len() == 2 && command_clone[0] == "sleep" {
-                // Special handling for sleep commands to ensure they work properly
-                let sleep_duration = &command_clone[1];
-                // Validate sleep duration
-                if sleep_duration.parse::<u64>().is_ok() || sleep_duration == "infinity" {
-                    ("/bin/sh".to_string(), vec!["-c".to_string(), format!("exec sleep {}", sleep_duration)])
-                } else {
-                    ConsoleLogger::warning(&format!("Invalid sleep duration: {}, using default", sleep_duration));
-                    ("/bin/sh".to_string(), vec!["-c".to_string(), "exec sleep 3600".to_string()])
-                }
-            } else if command_clone.len() == 1 {
-                // Single command - execute it through shell
-                ("/bin/sh".to_string(), vec!["-c".to_string(), format!("exec {}", command_clone[0])])
+            // Verify shell exists and find appropriate shell
+            let shell_path = if std::path::Path::new("/bin/sh").exists() {
+                "/bin/sh"
+            } else if std::path::Path::new("/bin/bash").exists() {
+                "/bin/bash"
+            } else if std::path::Path::new("/usr/bin/sh").exists() {
+                "/usr/bin/sh"
+            } else if std::path::Path::new("/usr/bin/bash").exists() {
+                "/usr/bin/bash"
+            } else if std::path::Path::new("/nix/var/nix/profiles/default/bin/sh").exists() {
+                "/nix/var/nix/profiles/default/bin/sh"
             } else {
-                // Multiple arguments - join them and execute through shell with exec
-                ("/bin/sh".to_string(), vec!["-c".to_string(), format!("exec {}", command_clone.join(" "))])
+                eprintln!("ERROR: No shell found in container! Tried /bin/sh, /bin/bash, /usr/bin/sh, /usr/bin/bash, /nix/var/nix/profiles/default/bin/sh");
+                eprintln!("Container filesystem might be incomplete or corrupted");
+                return 1;
+            };
+            
+            println!("Using shell: {}", shell_path);
+            
+            // Simple command execution - no detection, no overhead
+            let (final_program, final_args) = if command_clone.len() >= 3 
+                && (command_clone[0] == "/bin/sh" || command_clone[0] == "/bin/bash" || 
+                    command_clone[0] == "/usr/bin/sh" || command_clone[0] == "/usr/bin/bash" ||
+                    command_clone[0].ends_with("/sh") || command_clone[0].ends_with("/bash"))
+                && command_clone[1] == "-c" {
+                // Already a shell command - use as-is
+                println!("Command already wrapped in shell: {:?}", command_clone);
+                (command_clone[0].clone(), command_clone[1..].to_vec())
+            } else if command_clone.len() == 1 {
+                // Single command - execute through shell
+                println!("Wrapping single command in shell: {:?}", command_clone);
+                (shell_path.to_string(), vec!["-c".to_string(), command_clone[0].clone()])
+            } else {
+                // Multiple arguments - execute directly without shell
+                println!("Executing command directly: {:?}", command_clone);
+                (command_clone[0].clone(), command_clone[1..].to_vec())
             };
 
             // Convert to CString for exec (do this once, outside any fork)
@@ -372,9 +432,24 @@ impl ContainerRuntime {
                     }
                 }
 
+                // First verify the process actually started
+                // EVENT-DRIVEN: Just check immediately, no sleep
+                if !ProcessUtils::is_process_running(pid) {
+                    ConsoleLogger::error(&format!("Container {} process {} died immediately after starting", id, ProcessUtils::pid_to_i32(pid)));
+                    self.update_container_state(id, ContainerState::FAILED("Process died immediately".to_string()));
+                    return Err(format!("Container {} process died immediately", id));
+                }
+                
                 // ✅ CRITICAL: Event-driven readiness verification - NO POLLING
                 match self.readiness_manager.wait_for_container_ready(id, pid, &rootfs_path) {
                     Ok(()) => {
+                        // Double-check process is still alive after readiness check
+                        if !ProcessUtils::is_process_running(pid) {
+                            ConsoleLogger::error(&format!("Container {} process {} died during readiness check", id, ProcessUtils::pid_to_i32(pid)));
+                            self.update_container_state(id, ContainerState::FAILED("Process died during readiness".to_string()));
+                            return Err(format!("Container {} process died during readiness check", id));
+                        }
+                        
                         // Now container is truly ready
                         ConsoleLogger::container_started(id, Some(ProcessUtils::pid_to_i32(pid)));
                         
@@ -408,7 +483,7 @@ impl ContainerRuntime {
                 let wait_task = tokio::spawn(async move {
                     ConsoleLogger::debug(&format!("🕐 [TIMING] Started waiting for process {} at {:?}", ProcessUtils::pid_to_i32(pid), start_time));
                     
-                    let exit_code = match NamespaceManager::new().wait_for_process(pid) {
+                    let exit_code = match NamespaceManager::new().wait_for_process_async(pid).await {
                         Ok(exit_code) => {
                             let elapsed = start_time.elapsed().unwrap_or_default();
                             ConsoleLogger::success(&format!("Container {} exited with code: {} after {:?}", id_clone, exit_code, elapsed));
@@ -436,10 +511,8 @@ impl ContainerRuntime {
                         container.add_log("Container process completed".to_string());
                     });
 
-                    // Comprehensive resource cleanup using ResourceManager
-                    if let Err(e) = resource_manager.cleanup_container_resources(&id_clone, Some(pid)) {
-                        ConsoleLogger::warning(&format!("Resource cleanup failed for {}: {}", id_clone, e));
-                    }
+                    // Don't cleanup resources on exit - container can be restarted
+                    ConsoleLogger::debug(&format!("Container {} exited, resources preserved for restart", id_clone));
                     
                     ConsoleLogger::debug(&format!("✅ Container {} monitoring task completed", id_clone));
                 });
@@ -1223,11 +1296,8 @@ done
                     container.add_log("Container stopped by user request".to_string());
                 });
                 
-                // Comprehensive resource cleanup using ResourceManager
-                let resource_manager = ResourceManager::global();
-                if let Err(e) = resource_manager.cleanup_container_resources(container_id, Some(pid)) {
-                    ConsoleLogger::warning(&format!("Resource cleanup failed for {}: {}", container_id, e));
-                }
+                // Don't cleanup resources on stop - container can be restarted
+                ConsoleLogger::debug(&format!("Container {} stopped, resources preserved for restart", container_id));
                 
                 ConsoleLogger::container_stopped(container_id);
                 Ok(())

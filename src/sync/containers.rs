@@ -44,6 +44,9 @@ impl ContainerState {
             (ContainerState::Starting, ContainerState::Error) => true,
             (ContainerState::Running, ContainerState::Exited) => true,
             (ContainerState::Running, ContainerState::Error) => true,
+            (ContainerState::Exited, ContainerState::Starting) => true, // Allow restart
+            (ContainerState::Exited, ContainerState::Created) => true, // Allow reset
+            (ContainerState::Error, ContainerState::Starting) => true, // Allow retry
             (_, ContainerState::Error) => true, // Can always transition to error
             _ => false,
         }
@@ -92,6 +95,22 @@ impl ContainerManager {
     }
     
     pub async fn create_container(&self, config: ContainerConfig) -> SyncResult<()> {
+        // Check if name already exists
+        if let Some(ref name) = config.name {
+            if !name.is_empty() {
+                let existing = sqlx::query("SELECT id FROM containers WHERE name = ?")
+                    .bind(name)
+                    .fetch_optional(&self.pool)
+                    .await?;
+                    
+                if existing.is_some() {
+                    return Err(SyncError::ValidationFailed {
+                        message: format!("Container with name '{}' already exists", name),
+                    });
+                }
+            }
+        }
+        
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
         let environment_json = serde_json::to_string(&config.environment)?;
         
@@ -285,6 +304,20 @@ impl ContainerManager {
         }
     }
     
+    pub async fn get_container_by_name(&self, name: &str) -> SyncResult<String> {
+        let container_id: Option<String> = sqlx::query_scalar("SELECT id FROM containers WHERE name = ?")
+            .bind(name)
+            .fetch_optional(&self.pool)
+            .await?;
+            
+        match container_id {
+            Some(id) => Ok(id),
+            None => Err(SyncError::NotFound {
+                container_id: format!("name:{}", name),
+            }),
+        }
+    }
+    
     pub async fn list_containers(&self, state_filter: Option<ContainerState>) -> SyncResult<Vec<ContainerStatus>> {
         let mut query = "
             SELECT 
@@ -458,6 +491,158 @@ mod tests {
             assert_eq!(to, "running");
         } else {
             panic!("Expected InvalidStateTransition error");
+        }
+    }
+    
+    #[tokio::test]
+    async fn test_container_name_uniqueness() {
+        let (_conn, container_manager) = setup_test_db().await;
+        
+        // Create first container with name
+        let config1 = ContainerConfig {
+            id: "container-1".to_string(),
+            name: Some("unique-name".to_string()),
+            image_path: "/path/to/image".to_string(),
+            command: "echo hello".to_string(),
+            environment: HashMap::new(),
+            memory_limit_mb: None,
+            cpu_limit_percent: None,
+            enable_network_namespace: true,
+            enable_pid_namespace: true,
+            enable_mount_namespace: true,
+            enable_uts_namespace: true,
+            enable_ipc_namespace: true,
+        };
+        
+        container_manager.create_container(config1).await.unwrap();
+        
+        // Try to create another container with same name
+        let config2 = ContainerConfig {
+            id: "container-2".to_string(),
+            name: Some("unique-name".to_string()),
+            image_path: "/path/to/image".to_string(),
+            command: "echo world".to_string(),
+            environment: HashMap::new(),
+            memory_limit_mb: None,
+            cpu_limit_percent: None,
+            enable_network_namespace: true,
+            enable_pid_namespace: true,
+            enable_mount_namespace: true,
+            enable_uts_namespace: true,
+            enable_ipc_namespace: true,
+        };
+        
+        let result = container_manager.create_container(config2).await;
+        assert!(result.is_err());
+        
+        if let Err(SyncError::ValidationFailed { message }) = result {
+            assert!(message.contains("already exists"));
+        } else {
+            panic!("Expected ValidationFailed error for duplicate name");
+        }
+    }
+    
+    #[tokio::test]
+    async fn test_get_container_by_name() {
+        let (_conn, container_manager) = setup_test_db().await;
+        
+        // Create container with name
+        let config = ContainerConfig {
+            id: "test-id-123".to_string(),
+            name: Some("test-name".to_string()),
+            image_path: "/path/to/image".to_string(),
+            command: "tail -f /dev/null".to_string(),
+            environment: HashMap::new(),
+            memory_limit_mb: Some(512),
+            cpu_limit_percent: Some(25.0),
+            enable_network_namespace: true,
+            enable_pid_namespace: true,
+            enable_mount_namespace: true,
+            enable_uts_namespace: true,
+            enable_ipc_namespace: true,
+        };
+        
+        container_manager.create_container(config).await.unwrap();
+        
+        // Look up by name
+        let result = container_manager.get_container_by_name("test-name").await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "test-id-123");
+        
+        // Look up non-existent name
+        let result = container_manager.get_container_by_name("non-existent").await;
+        assert!(result.is_err());
+        
+        if let Err(SyncError::NotFound { container_id }) = result {
+            assert_eq!(container_id, "name:non-existent");
+        } else {
+            panic!("Expected NotFound error");
+        }
+    }
+    
+    #[tokio::test]
+    async fn test_empty_name_handling() {
+        let (_conn, container_manager) = setup_test_db().await;
+        
+        // Create container with empty name (should be treated as no name)
+        let config = ContainerConfig {
+            id: "empty-name-test".to_string(),
+            name: Some("".to_string()),
+            image_path: "/path/to/image".to_string(),
+            command: "echo test".to_string(),
+            environment: HashMap::new(),
+            memory_limit_mb: None,
+            cpu_limit_percent: None,
+            enable_network_namespace: true,
+            enable_pid_namespace: true,
+            enable_mount_namespace: true,
+            enable_uts_namespace: true,
+            enable_ipc_namespace: true,
+        };
+        
+        // Should succeed (empty name is ignored)
+        container_manager.create_container(config).await.unwrap();
+        
+        // Should not be findable by empty name
+        let result = container_manager.get_container_by_name("").await;
+        assert!(result.is_err());
+    }
+    
+    #[tokio::test]
+    async fn test_name_with_special_characters() {
+        let (_conn, container_manager) = setup_test_db().await;
+        
+        // Test various special character names
+        let test_names = vec![
+            "test-with-dash",
+            "test_with_underscore",
+            "test.with.dot",
+            "test123",
+            "TEST_UPPER",
+        ];
+        
+        for (i, name) in test_names.iter().enumerate() {
+            let config = ContainerConfig {
+                id: format!("special-char-{}", i),
+                name: Some(name.to_string()),
+                image_path: "/path/to/image".to_string(),
+                command: "echo test".to_string(),
+                environment: HashMap::new(),
+                memory_limit_mb: None,
+                cpu_limit_percent: None,
+                enable_network_namespace: true,
+                enable_pid_namespace: true,
+                enable_mount_namespace: true,
+                enable_uts_namespace: true,
+                enable_ipc_namespace: true,
+            };
+            
+            container_manager.create_container(config).await.unwrap();
+            
+            // Should be able to look up by name
+            let result = container_manager.get_container_by_name(name).await;
+            assert!(result.is_ok());
+            assert_eq!(result.unwrap(), format!("special-char-{}", i));
         }
     }
 } 

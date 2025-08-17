@@ -39,20 +39,30 @@ impl ContainerReadinessManager {
     pub fn wait_for_container_ready(
         &self, 
         container_id: &str, 
-        _pid: Pid, 
+        pid: Pid, 
         _rootfs_path: &str
     ) -> Result<(), String> {
-        ConsoleLogger::progress(&format!("🔍 Starting simplified readiness verification for container {}", container_id));
+        ConsoleLogger::progress(&format!("🔍 Starting event-driven readiness verification for container {}", container_id));
         let overall_start = SystemTime::now();
 
-        // SIMPLIFIED: Just wait a moment for container to start - skip exec test for now
-        std::thread::sleep(Duration::from_millis(2000)); // Give container time to start
-        
-        // Skip exec verification for now since we've validated the network fix
-        ConsoleLogger::debug("Skipping exec test - network fix validated, container should be running");
+        // EVENT-DRIVEN: Check if process is actually running
+        // No sleep, just immediate verification
+        use nix::sys::signal;
+        match signal::kill(pid, None) {
+            Ok(()) => {
+                // Process exists and we can signal it
+                ConsoleLogger::debug(&format!("✅ Process {} is alive and responsive", pid));
+            }
+            Err(nix::errno::Errno::ESRCH) => {
+                return Err(format!("Process {} does not exist", pid));
+            }
+            Err(e) => {
+                return Err(format!("Cannot verify process {}: {}", pid, e));
+            }
+        }
 
         let total_time = overall_start.elapsed().unwrap_or_default();
-        ConsoleLogger::success(&format!("✅ Container {} ready in {:?} (simplified)", container_id, total_time));
+        ConsoleLogger::success(&format!("✅ Container {} ready in {:?} (event-driven)", container_id, total_time));
         Ok(())
     }
 

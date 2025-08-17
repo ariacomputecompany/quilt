@@ -66,7 +66,7 @@ impl ProcessMonitorService {
         Self {
             pool,
             active_monitors: Arc::new(Mutex::new(HashSet::new())),
-            check_interval: Duration::from_secs(10), // Default 10-second polling
+            check_interval: Duration::from_millis(100), // More responsive - 100ms checks
         }
     }
     
@@ -314,26 +314,29 @@ impl ProcessMonitorService {
     }
     
     async fn check_process_status(pid: Pid) -> ProcessStatus {
-        match waitpid(pid, Some(WaitPidFlag::WNOHANG)) {
-            Ok(WaitStatus::StillAlive) => ProcessStatus::Running,
-            Ok(WaitStatus::Exited(_, exit_code)) => ProcessStatus::Exited(exit_code),
-            Ok(WaitStatus::Signaled(_, signal, _)) => {
-                tracing::debug!("Process {} terminated by signal {:?}", pid, signal);
-                ProcessStatus::Exited(128 + signal as i32) // Standard convention for signal exits
-            },
-            Ok(status) => {
-                tracing::debug!("Process {} status: {:?}", pid, status);
-                ProcessStatus::Exited(1) // Treat other statuses as generic failure
-            },
-            Err(nix::errno::Errno::ECHILD) => {
-                // Process doesn't exist or is not a child
-                ProcessStatus::Exited(0) // Assume it exited normally
-            },
-            Err(e) => {
-                tracing::error!("Error checking process status for {}: {}", pid, e);
-                ProcessStatus::Error
+        // Use tokio task to avoid blocking the async runtime
+        tokio::task::spawn_blocking(move || {
+            match waitpid(pid, Some(WaitPidFlag::WNOHANG)) {
+                Ok(WaitStatus::StillAlive) => ProcessStatus::Running,
+                Ok(WaitStatus::Exited(_, exit_code)) => ProcessStatus::Exited(exit_code),
+                Ok(WaitStatus::Signaled(_, signal, _)) => {
+                    tracing::debug!("Process {} terminated by signal {:?}", pid, signal);
+                    ProcessStatus::Exited(128 + signal as i32) // Standard convention for signal exits
+                },
+                Ok(status) => {
+                    tracing::debug!("Process {} status: {:?}", pid, status);
+                    ProcessStatus::Exited(1) // Treat other statuses as generic failure
+                },
+                Err(nix::errno::Errno::ECHILD) => {
+                    // Process doesn't exist or is not a child
+                    ProcessStatus::Exited(0) // Assume it exited normally
+                },
+                Err(e) => {
+                    tracing::error!("Error checking process status for {}: {}", pid, e);
+                    ProcessStatus::Error
+                }
             }
-        }
+        }).await.unwrap_or(ProcessStatus::Error)
     }
 }
 

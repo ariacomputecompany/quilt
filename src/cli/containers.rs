@@ -218,6 +218,9 @@ pub async fn handle_container_command(
                 enable_uts_namespace: uts_ns,
                 enable_ipc_namespace: ipc_ns,
                 enable_network_namespace: net_ns,
+                name: String::new(),
+                async_mode: false,
+                mounts: vec![],
             });
 
             match client.create_container(request).await {
@@ -240,7 +243,10 @@ pub async fn handle_container_command(
         
         ContainerCommands::Status { container_id } => {
             println!("📊 Getting status for container {}...", container_id);
-            let request = tonic::Request::new(GetContainerStatusRequest { container_id }); 
+            let request = tonic::Request::new(GetContainerStatusRequest { 
+                container_id,
+                container_name: String::new(),
+            }); 
             match client.get_container_status(request).await {
                 Ok(response) => {
                     let res: GetContainerStatusResponse = response.into_inner();
@@ -280,7 +286,10 @@ pub async fn handle_container_command(
         
         ContainerCommands::Logs { container_id } => {
             println!("📜 Getting logs for container {}...", container_id);
-            let request = tonic::Request::new(GetContainerLogsRequest { container_id: container_id.clone() });
+            let request = tonic::Request::new(GetContainerLogsRequest { 
+                container_id: container_id.clone(),
+                container_name: String::new(),
+            });
             match client.get_container_logs(request).await {
                 Ok(response) => {
                     let res: GetContainerLogsResponse = response.into_inner();
@@ -314,7 +323,8 @@ pub async fn handle_container_command(
             println!("🛑 Stopping container {}...", container_id);
             let request = tonic::Request::new(StopContainerRequest { 
                 container_id: container_id.clone(), 
-                timeout_seconds: 10 
+                timeout_seconds: 10,
+                container_name: String::new(),
             });
             match client.stop_container(request).await {
                 Ok(response) => {
@@ -337,7 +347,8 @@ pub async fn handle_container_command(
             println!("🗑️  Removing container {}...", container_id);
             let request = tonic::Request::new(RemoveContainerRequest { 
                 container_id: container_id.clone(), 
-                force 
+                force,
+                container_name: String::new(),
             });
             match client.remove_container(request).await {
                 Ok(response) => {
@@ -379,6 +390,8 @@ pub async fn handle_container_command(
                 working_directory: workdir.unwrap_or_default(),
                 environment,
                 capture_output,
+                container_name: String::new(),
+                copy_script: false,
             });
 
             match client.exec_container(request).await {
@@ -415,7 +428,8 @@ pub async fn handle_container_command(
             }
         }
         
-        ContainerCommands::CreateProduction { image_path, name, setup, env, memory, cpu, timeout, no_network, health_check } => {
+        ContainerCommands::CreateProduction { image_path, name, setup, env, memory, cpu, timeout: _, no_network, health_check: _ } => {
+            let container_name = name.clone();
             println!("🚀 Creating production container using the new event-driven readiness system...");
             
             // Parse environment variables
@@ -429,7 +443,7 @@ pub async fn handle_container_command(
             // Create production container using enhanced daemon runtime with event-driven readiness
             let create_request = CreateContainerRequest {
                 image_path,
-                command: vec!["sleep".to_string(), "infinity".to_string()], // Default persistent command
+                command: vec!["tail".to_string(), "-f".to_string(), "/dev/null".to_string()], // Default persistent command
                 environment,
                 working_directory: String::new(), // Empty string instead of None
                 setup_commands: setup,
@@ -440,6 +454,9 @@ pub async fn handle_container_command(
                 enable_mount_namespace: true,
                 enable_uts_namespace: true,
                 enable_ipc_namespace: true,
+                name: name.unwrap_or_default(),
+                async_mode: true,
+                mounts: vec![],
             };
 
             match client.create_container(tonic::Request::new(create_request)).await {
@@ -453,8 +470,8 @@ pub async fn handle_container_command(
                         println!("   Event-driven readiness: enabled");
                         println!("   Container automatically started with PID verification");
                         
-                        if let Some(container_name) = name {
-                            println!("   Custom name: {}", container_name);
+                        if let Some(ref name) = container_name {
+                            println!("   Custom name: {}", name);
                         }
                     } else {
                         eprintln!("❌ Failed to create production container: {}", res.error_message);
@@ -475,7 +492,7 @@ pub async fn handle_container_command(
             std::process::exit(1);
         }
 
-        ContainerCommands::HealthCheck { container_id } => {
+        ContainerCommands::HealthCheck { container_id: _ } => {
             // Implementation for checking health of production containers
             println!("🔍 Checking health of production containers...");
             // This command is not implemented in the provided code block
@@ -486,7 +503,8 @@ pub async fn handle_container_command(
             println!("🗑️  Removing production container {}...", container_id);
             let request = tonic::Request::new(RemoveContainerRequest { 
                 container_id: container_id.clone(), 
-                force 
+                force,
+                container_name: String::new(),
             });
             match client.remove_container(request).await {
                 Ok(response) => {

@@ -259,7 +259,8 @@ async fn handle_ping_command(
     
     // ELITE: Check source container status
     let mut from_request = tonic::Request::new(GetContainerStatusRequest { 
-        container_id: from_container.clone() 
+        container_id: from_container.clone(),
+        container_name: String::new(),
     });
     from_request.set_timeout(Duration::from_secs(30));
     
@@ -291,6 +292,7 @@ async fn handle_ping_command(
         // Container ID - get its IP
         let mut target_request = tonic::Request::new(GetContainerStatusRequest {
             container_id: target.clone(),
+            container_name: String::new(),
         });
         target_request.set_timeout(Duration::from_secs(30));
         
@@ -336,6 +338,8 @@ async fn handle_ping_command(
         working_directory: String::new(),
         environment: HashMap::new(),
         capture_output: true,
+        container_name: String::new(),
+        copy_script: false,
     });
     // ELITE: Much more generous timeout for exec under load
     exec_request.set_timeout(Duration::from_secs(adaptive_timeout as u64 + 10)); 
@@ -493,6 +497,8 @@ async fn handle_exec_command(
         working_directory: workdir.unwrap_or_default(),
         environment,
         capture_output: true,
+        container_name: String::new(),
+        copy_script: false,
     });
     exec_request.set_timeout(Duration::from_secs(30)); // Generous timeout for exec commands
 

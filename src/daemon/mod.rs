@@ -8,7 +8,7 @@ pub mod manager;
 pub mod resource;
 
 // Re-export commonly used types
-pub use runtime::{ContainerRuntime, ContainerConfig, ContainerState};
+pub use runtime::{ContainerRuntime, ContainerConfig, ContainerState, MountConfig, MountType};
 pub use cgroup::CgroupLimits;
 pub use namespace::NamespaceConfig;
 // pub use resource::ResourceManager; // Accessed directly where needed 

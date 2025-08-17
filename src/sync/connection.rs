@@ -1,4 +1,4 @@
-use sqlx::{SqlitePool, sqlite::SqliteConnectOptions, ConnectOptions};
+use sqlx::{SqlitePool, sqlite::{SqliteConnectOptions, SqlitePoolOptions}, ConnectOptions};
 use std::time::Duration;
 use crate::sync::error::SyncResult;
 
@@ -34,7 +34,13 @@ async fn create_optimized_pool(database_path: &str) -> SyncResult<SqlitePool> {
         .create_if_missing(true)
         .disable_statement_logging();
     
-    let pool = SqlitePool::connect_with(options).await?;
+    let pool = SqlitePoolOptions::new()
+        .max_connections(32) // Increased from default for concurrent operations
+        .min_connections(4)  // Keep minimum connections ready
+        .acquire_timeout(Duration::from_secs(30))
+        .idle_timeout(Duration::from_secs(600))
+        .connect_with(options)
+        .await?;
     
     // Verify connection and performance
     let start = std::time::Instant::now();

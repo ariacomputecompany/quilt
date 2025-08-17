@@ -17,6 +17,8 @@ impl SchemaManager {
         self.create_process_monitors_table().await?;
         self.create_container_logs_table().await?;
         self.create_cleanup_tasks_table().await?;
+        self.create_volumes_table().await?;
+        self.create_container_mounts_table().await?;
         self.create_indexes().await?;
         
         tracing::info!("Database schema initialized successfully");
@@ -121,12 +123,47 @@ impl SchemaManager {
             CREATE TABLE IF NOT EXISTS cleanup_tasks (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 container_id TEXT NOT NULL,
-                resource_type TEXT CHECK(resource_type IN ('rootfs', 'network', 'cgroup', 'mounts')) NOT NULL,
+                resource_type TEXT CHECK(resource_type IN ('rootfs', 'network', 'cgroup', 'mounts', 'volumes')) NOT NULL,
                 resource_path TEXT NOT NULL,
                 status TEXT CHECK(status IN ('pending', 'in_progress', 'completed', 'failed')) NOT NULL,
                 created_at INTEGER NOT NULL,
                 completed_at INTEGER,
                 error_message TEXT
+            )
+        "#).execute(&self.pool).await?;
+        
+        Ok(())
+    }
+    
+    async fn create_volumes_table(&self) -> SyncResult<()> {
+        sqlx::query(r#"
+            CREATE TABLE IF NOT EXISTS volumes (
+                name TEXT PRIMARY KEY,
+                driver TEXT NOT NULL DEFAULT 'local',
+                mount_point TEXT NOT NULL,
+                labels TEXT, -- JSON blob
+                options TEXT, -- JSON blob
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                status TEXT CHECK(status IN ('active', 'inactive', 'cleanup_pending')) NOT NULL
+            )
+        "#).execute(&self.pool).await?;
+        
+        Ok(())
+    }
+    
+    async fn create_container_mounts_table(&self) -> SyncResult<()> {
+        sqlx::query(r#"
+            CREATE TABLE IF NOT EXISTS container_mounts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                container_id TEXT NOT NULL,
+                source TEXT NOT NULL, -- host path or volume name
+                target TEXT NOT NULL, -- container path
+                mount_type TEXT CHECK(mount_type IN ('bind', 'volume', 'tmpfs')) NOT NULL,
+                readonly BOOLEAN NOT NULL DEFAULT 0,
+                options TEXT, -- JSON blob for mount options
+                created_at INTEGER NOT NULL,
+                FOREIGN KEY(container_id) REFERENCES containers(id) ON DELETE CASCADE
             )
         "#).execute(&self.pool).await?;
         
@@ -146,6 +183,10 @@ impl SchemaManager {
             "CREATE INDEX IF NOT EXISTS idx_container_logs_level ON container_logs(level)",
             "CREATE INDEX IF NOT EXISTS idx_cleanup_tasks_status ON cleanup_tasks(status)",
             "CREATE INDEX IF NOT EXISTS idx_cleanup_tasks_container ON cleanup_tasks(container_id)",
+            "CREATE INDEX IF NOT EXISTS idx_volumes_status ON volumes(status)",
+            "CREATE INDEX IF NOT EXISTS idx_volumes_name ON volumes(name)",
+            "CREATE INDEX IF NOT EXISTS idx_container_mounts_container ON container_mounts(container_id)",
+            "CREATE INDEX IF NOT EXISTS idx_container_mounts_type ON container_mounts(mount_type)",
         ];
         
         for index_sql in indexes {
@@ -196,6 +237,8 @@ mod tests {
         assert!(table_names.contains(&"containers".to_string()));
         assert!(table_names.contains(&"network_allocations".to_string()));
         assert!(table_names.contains(&"process_monitors".to_string()));
+        assert!(table_names.contains(&"volumes".to_string()));
+        assert!(table_names.contains(&"container_mounts".to_string()));
         
         conn_manager.close().await;
     }
