@@ -100,13 +100,28 @@ impl QuiltService for QuiltServiceImpl {
                 // ✅ INSTANT RETURN: Container creation is coordinated but non-blocking
                 ConsoleLogger::success(&format!("Container {} created with network config", container_id));
                 
-                // Process mounts if any
+                // Process mounts BEFORE starting container
                 for mount in req.mounts {
                     let mount_type = match mount.r#type() {
                         quilt::MountType::Bind => MountType::Bind,
                         quilt::MountType::Volume => MountType::Volume,
                         quilt::MountType::Tmpfs => MountType::Tmpfs,
                     };
+                    
+                    // For named volumes, auto-create if needed
+                    if mount_type == MountType::Volume {
+                        if let Ok(None) = self.sync_engine.get_volume(&mount.source).await {
+                            ConsoleLogger::info(&format!("Auto-creating volume '{}'", mount.source));
+                            if let Err(e) = self.sync_engine.create_volume(
+                                &mount.source,
+                                None,
+                                HashMap::new(),
+                                HashMap::new(),
+                            ).await {
+                                ConsoleLogger::warning(&format!("Failed to auto-create volume '{}': {}", mount.source, e));
+                            }
+                        }
+                    }
                     
                     if let Err(e) = self.sync_engine.add_container_mount(
                         &container_id,
@@ -116,11 +131,17 @@ impl QuiltService for QuiltServiceImpl {
                         mount.readonly,
                         mount.options,
                     ).await {
-                        ConsoleLogger::warning(&format!("Failed to add mount for container {}: {}", container_id, e));
+                        ConsoleLogger::error(&format!("Failed to add mount for container {}: {}", container_id, e));
+                        // Mount failure should be fatal
+                        return Ok(Response::new(CreateContainerResponse {
+                            container_id: String::new(),
+                            success: false,
+                            error_message: format!("Failed to configure mount: {}", e),
+                        }));
                     }
                 }
                 
-                // Start the actual container process in background
+                // Now start the container with mounts already configured
                 let sync_engine = self.sync_engine.clone();
                 let container_id_clone = container_id.clone();
                 tokio::spawn(async move {
@@ -486,10 +507,11 @@ impl QuiltService for QuiltServiceImpl {
                                 .as_secs();
                             let temp_script = format!("/tmp/quilt_exec_{}", timestamp);
                             
-                            // Copy script to container using nsenter
+                            // Copy script to container using nsenter with chroot
+                            let rootfs_path = format!("/tmp/quilt-containers/{}", container_id);
                             let copy_cmd = format!(
-                                "nsenter -t {} -p -m -n -u -i -- /bin/sh -c 'cat > {} << 'EOF'\n{}\nEOF\nchmod +x {}'",
-                                pid, temp_script, script_content, temp_script
+                                "nsenter -t {} -p -m -n -u -i -- chroot {} /bin/sh -c 'cat > {} << 'EOF'\n{}\nEOF\nchmod +x {}'",
+                                pid, rootfs_path, temp_script, script_content, temp_script
                             );
                             
                             match utils::command::CommandExecutor::execute_shell(&copy_cmd) {
@@ -523,11 +545,14 @@ impl QuiltService for QuiltServiceImpl {
                     req.command.join(" ")
                 };
 
-                // Execute command using nsenter (direct execution, not through old runtime)
+                // Execute command using nsenter with chroot to match container's view
+                // Get the rootfs path for the container
+                let rootfs_path = format!("/tmp/quilt-containers/{}", container_id);
+                
                 let exec_cmd = if req.capture_output {
-                    format!("nsenter -t {} -p -m -n -u -i -- /bin/sh -c '{}'", pid, command_to_execute)
+                    format!("nsenter -t {} -p -m -n -u -i -- chroot {} /bin/sh -c '{}'", pid, rootfs_path, command_to_execute)
                 } else {
-                    format!("nsenter -t {} -p -m -n -u -i -- /bin/sh -c '{}' >/dev/null 2>&1", pid, command_to_execute)
+                    format!("nsenter -t {} -p -m -n -u -i -- chroot {} /bin/sh -c '{}' >/dev/null 2>&1", pid, rootfs_path, command_to_execute)
                 };
 
                 match utils::command::CommandExecutor::execute_shell(&exec_cmd) {
@@ -537,8 +562,8 @@ impl QuiltService for QuiltServiceImpl {
                         // Clean up temporary script if we created one
                         if req.copy_script && command_to_execute.starts_with("/tmp/quilt_exec_") {
                             let cleanup_cmd = format!(
-                                "nsenter -t {} -p -m -n -u -i -- rm -f {}",
-                                pid, command_to_execute
+                                "nsenter -t {} -p -m -n -u -i -- chroot {} rm -f {}",
+                                pid, rootfs_path, command_to_execute
                             );
                             let _ = utils::command::CommandExecutor::execute_shell(&cleanup_cmd);
                         }
@@ -557,8 +582,8 @@ impl QuiltService for QuiltServiceImpl {
                         // Clean up temporary script on error too
                         if req.copy_script && command_to_execute.starts_with("/tmp/quilt_exec_") {
                             let cleanup_cmd = format!(
-                                "nsenter -t {} -p -m -n -u -i -- rm -f {}",
-                                pid, command_to_execute
+                                "nsenter -t {} -p -m -n -u -i -- chroot {} rm -f {}",
+                                pid, rootfs_path, command_to_execute
                             );
                             let _ = utils::command::CommandExecutor::execute_shell(&cleanup_cmd);
                         }

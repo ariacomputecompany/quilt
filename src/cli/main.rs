@@ -24,7 +24,7 @@ use quilt::{
     StartContainerRequest, StartContainerResponse,
     KillContainerRequest, KillContainerResponse,
     GetContainerByNameRequest, GetContainerByNameResponse,
-    ContainerStatus,
+    ContainerStatus, Mount, MountType,
 };
 
 // Use validation utilities from utils module
@@ -93,6 +93,19 @@ enum Commands {
         
         #[clap(long, help = "Enable all namespace isolation features")]
         enable_all_namespaces: bool,
+        
+        // Volume mounts
+        #[clap(short = 'v', long = "volume", 
+               help = "Mount volumes (format: [name:]source:dest[:options])",
+               num_args = 0..,
+               value_parser = InputValidator::parse_volume)]
+        volumes: Vec<utils::validation::VolumeMount>,
+        
+        #[clap(long = "mount",
+               help = "Advanced mount syntax (type=bind,source=/host,target=/container,readonly)",
+               num_args = 0..,
+               value_parser = InputValidator::parse_mount)]
+        mounts: Vec<utils::validation::VolumeMount>,
         
         /// The command and its arguments to run in the container
         #[clap(required = false, num_args = 0.., 
@@ -253,6 +266,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             enable_ipc_namespace,
             enable_network_namespace,
             enable_all_namespaces,
+            volumes,
+            mounts,
             command_and_args 
         } => {
             println!("🚀 Creating container...");
@@ -279,6 +294,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     enable_network_namespace
                 )
             };
+            
+            // Combine volumes and mounts, validate security
+            let mut all_mounts: Vec<utils::validation::VolumeMount> = volumes;
+            all_mounts.extend(mounts);
+            
+            // Convert to protobuf Mount format with security validation
+            let mut proto_mounts: Vec<Mount> = Vec::new();
+            for mount in all_mounts {
+                // Security validation
+                if let Err(e) = utils::security::SecurityValidator::validate_mount(&mount) {
+                    eprintln!("❌ Error: Mount validation failed: {}", e);
+                    std::process::exit(1);
+                }
+                
+                // Convert mount type
+                let proto_mount_type = match mount.mount_type {
+                    utils::validation::MountType::Bind => MountType::Bind as i32,
+                    utils::validation::MountType::Volume => MountType::Volume as i32,
+                    utils::validation::MountType::Tmpfs => MountType::Tmpfs as i32,
+                };
+                
+                proto_mounts.push(Mount {
+                    source: mount.source,
+                    target: mount.target,
+                    r#type: proto_mount_type,
+                    readonly: mount.readonly,
+                    options: mount.options,
+                });
+            }
 
             let request = tonic::Request::new(CreateContainerRequest {
                 image_path,
@@ -295,7 +339,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 enable_network_namespace: net_ns,
                 name: name.unwrap_or_default(),
                 async_mode,
-                mounts: vec![],
+                mounts: proto_mounts,
             });
 
             match client.create_container(request).await {

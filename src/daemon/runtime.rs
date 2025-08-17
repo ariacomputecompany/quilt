@@ -270,9 +270,12 @@ impl ContainerRuntime {
             
             // Setup container mounts (volumes, bind mounts, tmpfs)
             if !mounts_clone.is_empty() {
+                println!("DEBUG: Setting up {} mounts before chroot", mounts_clone.len());
                 if let Err(e) = namespace_manager.setup_container_mounts(&rootfs_path_clone, &mounts_clone) {
                     eprintln!("Failed to setup container mounts: {}", e);
                     // Non-fatal, continue - container can run without extra mounts
+                } else {
+                    println!("DEBUG: Mounts setup complete");
                 }
             }
 
@@ -293,6 +296,7 @@ impl ContainerRuntime {
             }
 
             // Change root to container filesystem
+            println!("DEBUG: About to chroot to {}", rootfs_path_clone);
             if let Err(e) = chroot(rootfs_path_clone.as_str()) {
                 eprintln!("Failed to chroot to {}: {}", rootfs_path_clone, e);
                 return 1;
@@ -302,6 +306,17 @@ impl ContainerRuntime {
             if let Err(e) = chdir("/") {
                 eprintln!("Failed to chdir to /: {}", e);
                 return 1;
+            }
+            
+            println!("DEBUG: After chroot, checking /mnt:");
+            if let Ok(entries) = std::fs::read_dir("/mnt") {
+                for entry in entries {
+                    if let Ok(e) = entry {
+                        println!("DEBUG: Found in /mnt: {:?}", e.path());
+                    }
+                }
+            } else {
+                println!("DEBUG: Cannot read /mnt directory");
             }
 
             // Initialize container system environment first

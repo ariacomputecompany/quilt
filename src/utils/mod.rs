@@ -6,6 +6,7 @@ pub mod image;
 pub mod locking;
 pub mod process;
 pub mod validation;
+pub mod security;
 
 // Re-export only currently used utilities to avoid warnings
 pub use console::ConsoleLogger;

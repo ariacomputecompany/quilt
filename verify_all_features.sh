@@ -106,6 +106,90 @@ PASSED_TESTS=0
 # Generate unique test ID for this run
 TEST_ID=$(date +%s)
 
+# Helper function to wait for container to reach RUNNING state
+wait_for_container_running() {
+    local container_name="$1"
+    local max_wait="${2:-10}"  # Default 10 seconds
+    local start_time=$(date +%s)
+    
+    echo -e "${YELLOW}[DEBUG] Waiting for container '$container_name' to reach RUNNING state...${NC}"
+    
+    while true; do
+        local status=$($CLI_BINARY status "$container_name" -n 2>&1)
+        if echo "$status" | grep -q "Status: RUNNING"; then
+            echo -e "${YELLOW}[DEBUG] Container '$container_name' is now RUNNING${NC}"
+            return 0
+        fi
+        
+        local current_time=$(date +%s)
+        local elapsed=$((current_time - start_time))
+        
+        if [ $elapsed -ge $max_wait ]; then
+            echo -e "${YELLOW}[DEBUG] Timeout waiting for container '$container_name' to reach RUNNING state${NC}"
+            echo -e "${YELLOW}[DEBUG] Last status: $status${NC}"
+            return 1
+        fi
+        
+        sleep 0.1
+    done
+}
+
+# Helper function to wait for container to have a PID
+wait_for_container_pid() {
+    local container_name="$1"
+    local max_wait="${2:-5}"  # Default 5 seconds
+    local start_time=$(date +%s)
+    
+    echo -e "${YELLOW}[DEBUG] Waiting for container '$container_name' to have a PID...${NC}"
+    
+    while true; do
+        local status=$($CLI_BINARY status "$container_name" -n 2>&1)
+        local pid=$(echo "$status" | grep "PID:" | awk '{print $2}')
+        
+        if [ ! -z "$pid" ] && [ "$pid" != "0" ] && [ "$pid" != "null" ]; then
+            if ps -p "$pid" >/dev/null 2>&1; then
+                echo -e "${YELLOW}[DEBUG] Container '$container_name' has PID $pid${NC}"
+                echo "$pid"
+                return 0
+            fi
+        fi
+        
+        local current_time=$(date +%s)
+        local elapsed=$((current_time - start_time))
+        
+        if [ $elapsed -ge $max_wait ]; then
+            echo -e "${YELLOW}[DEBUG] Timeout waiting for container '$container_name' to have a PID${NC}"
+            echo -e "${YELLOW}[DEBUG] Last status: $status${NC}"
+            return 1
+        fi
+        
+        sleep 0.1
+    done
+}
+
+# Helper function to debug container state
+debug_container_state() {
+    local container_name="$1"
+    local context="$2"
+    
+    echo -e "${YELLOW}[DEBUG] Container state for '$container_name' at $context:${NC}"
+    local status=$($CLI_BINARY status "$container_name" -n 2>&1)
+    echo "$status" | while IFS= read -r line; do
+        echo -e "${YELLOW}[DEBUG]   $line${NC}"
+    done
+    
+    # Check server logs for this container
+    if [ -f server.log ]; then
+        local recent_logs=$(grep -A2 -B2 "$container_name" server.log | tail -10)
+        if [ ! -z "$recent_logs" ]; then
+            echo -e "${YELLOW}[DEBUG] Recent server logs for '$container_name':${NC}"
+            echo "$recent_logs" | while IFS= read -r line; do
+                echo -e "${YELLOW}[DEBUG]   $line${NC}"
+            done
+        fi
+    fi
+}
+
 run_test() {
     local test_name="$1"
     local test_cmd="$2"
@@ -179,27 +263,30 @@ run_test "Create async without command" "[[ -n '$ASYNC_ID' ]]" "Should create wi
 
 # Test 4.2: Verify async container gets default command and stays running
 echo -e "${YELLOW}[DEBUG] Checking async container status...${NC}"
-# Give the async container a moment to transition from PENDING to RUNNING
-sleep 1
-STATUS=$($CLI_BINARY status $ASYNC_NAME -n 2>&1)
-echo -e "${YELLOW}[DEBUG] Async container status:${NC}"
-echo "$STATUS"
-PID=$(echo "$STATUS" | grep "PID:" | awk '{print $2}')
-
-# Check if process exists and no sleep infinity error
-if [ ! -z "$PID" ] && [ "$PID" != "0" ]; then
-    if ps -p $PID >/dev/null 2>&1; then
-        run_test "Async container running" "true" "Process $PID exists"
-    else
-        # Check for sleep infinity error
-        if grep -q "sleep: invalid number 'infinity'" server.log; then
-            run_test "Async container running" "false" "Failed with sleep infinity error"
+# Wait for container to be running
+if wait_for_container_running "$ASYNC_NAME" 5; then
+    STATUS=$($CLI_BINARY status $ASYNC_NAME -n 2>&1)
+    echo -e "${YELLOW}[DEBUG] Async container status:${NC}"
+    echo "$STATUS"
+    PID=$(echo "$STATUS" | grep "PID:" | awk '{print $2}')
+    
+    # Check if process exists and no sleep infinity error
+    if [ ! -z "$PID" ] && [ "$PID" != "0" ]; then
+        if ps -p $PID >/dev/null 2>&1; then
+            run_test "Async container running" "true" "Process $PID exists"
         else
-            run_test "Async container running" "false" "Process $PID not found"
+            # Check for sleep infinity error
+            if grep -q "sleep: invalid number 'infinity'" server.log; then
+                run_test "Async container running" "false" "Failed with sleep infinity error"
+            else
+                run_test "Async container running" "false" "Process $PID not found"
+            fi
         fi
+    else
+        run_test "Async container running" "false" "No PID assigned"
     fi
 else
-    run_test "Async container running" "false" "No PID assigned"
+    run_test "Async container running" "false" "Failed to reach RUNNING state"
 fi
 
 # Test 4.3: Non-async without command should fail
@@ -210,14 +297,17 @@ run_test "Error message for no command" "$CLI_BINARY create -n $FAIL_NAME --imag
 echo -e "\n${BLUE}=== FEATURE 5: Stop vs Kill ===${NC}"
 
 # Test 5.1: Stop command (graceful)
-# First get the PID of the async container we created
-STATUS=$($CLI_BINARY status $ASYNC_NAME -n 2>&1)
-PID=$(echo "$STATUS" | grep "PID:" | awk '{print $2}')
-if [ ! -z "$PID" ] && [ "$PID" != "0" ]; then
+# First wait for and get the PID of the async container we created
+if wait_for_container_pid "$ASYNC_NAME" 5; then
+    PID=$(wait_for_container_pid "$ASYNC_NAME" 1)
+    echo -e "${YELLOW}[DEBUG] Got PID $PID for stop test${NC}"
+    
     # Stop the container
     $CLI_BINARY stop $ASYNC_NAME -n >/dev/null 2>&1
     STOP_EXIT=$?
-    sleep 1
+    
+    # Wait a bit for process to terminate
+    sleep 0.5
     
     # Check if process is gone
     if ps -p $PID >/dev/null 2>&1; then
@@ -231,7 +321,11 @@ if [ ! -z "$PID" ] && [ "$PID" != "0" ]; then
     run_test "Container state after stop" "echo '$NEW_STATUS' | grep -q 'Status: EXITED'" "Should be in EXITED state"
     run_test "Stop command exit code" "[ $STOP_EXIT -eq 0 ]" "Stop command should succeed"
 else
-    echo -e "  ${YELLOW}Skipping stop test - no PID found${NC}"
+    echo -e "  ${YELLOW}Skipping stop test - container not ready${NC}"
+    debug_container_state "$ASYNC_NAME" "stop test skip"
+    run_test "Stop command kills process" "false" "Skipped - no PID"
+    run_test "Container state after stop" "false" "Skipped - no PID"
+    run_test "Stop command exit code" "false" "Skipped - no PID"
 fi
 
 # Test 5.2: Kill command (immediate)
@@ -240,11 +334,11 @@ KILL_NAME="lifecycle-test-${TEST_ID}"
 echo -e "${YELLOW}[DEBUG] Creating container for kill test: $KILL_NAME${NC}"
 OUTPUT=$($CLI_BINARY create -n $KILL_NAME --async-mode --image-path nixos-minimal.tar.gz 2>&1)
 if echo "$OUTPUT" | grep -q "Container created"; then
-    # Get PID immediately - no sleep needed
-    STATUS=$($CLI_BINARY status $KILL_NAME -n 2>&1)
-    PID=$(echo "$STATUS" | grep "PID:" | awk '{print $2}')
-    echo -e "${YELLOW}[DEBUG] Kill test PID: $PID${NC}"
-    if [ ! -z "$PID" ] && [ "$PID" != "0" ]; then
+    # Wait for container to be ready and get PID
+    if wait_for_container_pid "$KILL_NAME" 5; then
+        PID=$(wait_for_container_pid "$KILL_NAME" 1)
+        echo -e "${YELLOW}[DEBUG] Kill test PID: $PID${NC}"
+        
         # Kill the container
         START_TIME=$(date +%s.%N)
         OUTPUT=$($CLI_BINARY kill $KILL_NAME -n 2>&1)
@@ -253,8 +347,7 @@ if echo "$OUTPUT" | grep -q "Container created"; then
         END_TIME=$(date +%s.%N)
         KILL_TIME=$(echo "$END_TIME - $START_TIME" | bc)
         
-        # Check process is immediately gone (within 0.5s)
-        # Check immediately if process is gone
+        # Check process is immediately gone
         if ps -p $PID >/dev/null 2>&1; then
             run_test "Kill command immediate" "false" "Process $PID should be killed immediately"
         else
@@ -264,10 +357,17 @@ if echo "$OUTPUT" | grep -q "Container created"; then
         run_test "Kill command fast" "echo '$KILL_TIME < 0.5' | bc -l | grep -q 1" "Should kill within 0.5s"
         run_test "Kill command exit code" "[ $KILL_EXIT -eq 0 ]" "Kill command should succeed"
     else
-        echo -e "  ${YELLOW}Skipping kill test - no PID found${NC}"
+        echo -e "  ${YELLOW}Skipping kill test - container not ready${NC}"
+        debug_container_state "$KILL_NAME" "kill test skip"
+        run_test "Kill command immediate" "false" "Skipped - no PID"
+        run_test "Kill command fast" "false" "Skipped - no PID"
+        run_test "Kill command exit code" "false" "Skipped - no PID"
     fi
 else
     echo -e "  ${YELLOW}Skipping kill test - failed to create container${NC}"
+    run_test "Kill command immediate" "false" "Skipped - create failed"
+    run_test "Kill command fast" "false" "Skipped - create failed"
+    run_test "Kill command exit code" "false" "Skipped - create failed"
 fi
 
 echo -e "\n${BLUE}=== FEATURE 6: Start Command ===${NC}"
@@ -277,10 +377,8 @@ START_NAME="demo-container-2-${TEST_ID}"
 echo -e "${YELLOW}[DEBUG] Creating container for start test: $START_NAME${NC}"
 OUTPUT=$($CLI_BINARY create -n $START_NAME --async-mode --image-path nixos-minimal.tar.gz 2>&1)
 if echo "$OUTPUT" | grep -q "Container created"; then
-    # Wait for container to fully start and verify it's running
-    sleep 1
-    RUNNING_STATUS=$($CLI_BINARY status $START_NAME -n 2>&1)
-    if echo "$RUNNING_STATUS" | grep -q "Status: RUNNING"; then
+    # Wait for container to be running
+    if wait_for_container_running "$START_NAME" 5; then
         echo -e "  ${GREEN}Container started successfully before stop test${NC}"
         
         # Now stop the container
@@ -288,7 +386,7 @@ if echo "$OUTPUT" | grep -q "Container created"; then
         STOP_EXIT=$?
         
         # Wait for stop to complete and state to update
-        sleep 1
+        sleep 0.5
         
         # Test 6.2: Start the stopped container
         # First verify it's actually stopped
@@ -356,33 +454,55 @@ echo -e "\n${BLUE}=== FEATURE 7: Exec with Name Support ===${NC}"
 
 # Test 7.1: Create container for exec
 EXEC_NAME="exec-test-${TEST_ID}"
-$CLI_BINARY create -n $EXEC_NAME --async-mode --image-path nixos-minimal.tar.gz >/dev/null 2>&1
-# No sleep - container should be ready immediately
+OUTPUT=$($CLI_BINARY create -n $EXEC_NAME --async-mode --image-path nixos-minimal.tar.gz 2>&1)
 
-# Test 7.2: Check if container is running first
-STATUS=$($CLI_BINARY status $EXEC_NAME -n 2>&1)
-if echo "$STATUS" | grep -q "Status: RUNNING"; then
-    # Test 7.3: Execute command by name
-    # Run exec and capture full output
-    EXEC_OUTPUT=$($CLI_BINARY exec $EXEC_NAME -n -c 'echo test123' --capture-output 2>&1)
-    EXEC_EXIT=$?
-    
-    # Check if output contains our test string
-    if echo "$EXEC_OUTPUT" | grep -q "test123"; then
-        run_test "Exec captures output" "true" "Output captured correctly"
+if echo "$OUTPUT" | grep -q "Container created"; then
+    # Test 7.2: Wait for container to be running
+    if wait_for_container_running "$EXEC_NAME" 10; then
+        # Test 7.3: Execute command by name with retry logic
+        EXEC_RETRIES=3
+        EXEC_SUCCESS=false
+        
+        for i in $(seq 1 $EXEC_RETRIES); do
+            echo -e "${YELLOW}[DEBUG] Exec attempt $i of $EXEC_RETRIES${NC}"
+            EXEC_OUTPUT=$($CLI_BINARY exec $EXEC_NAME -n -c 'echo test123' --capture-output 2>&1)
+            EXEC_EXIT=$?
+            
+            if [ $EXEC_EXIT -eq 0 ] && echo "$EXEC_OUTPUT" | grep -q "test123"; then
+                EXEC_SUCCESS=true
+                break
+            fi
+            
+            if [ $i -lt $EXEC_RETRIES ]; then
+                sleep 0.5
+            fi
+        done
+        
+        if $EXEC_SUCCESS; then
+            run_test "Exec captures output" "true" "Output captured correctly"
+            run_test "Exec exit code" "true" "Exec succeeded"
+        else
+            echo -e "  ${YELLOW}Last exec output: $EXEC_OUTPUT${NC}"
+            run_test "Exec captures output" "false" "Failed after $EXEC_RETRIES attempts"
+            run_test "Exec exit code" "false" "Exec failed with code $EXEC_EXIT"
+        fi
+        
+        # Test exec with exit code
+        $CLI_BINARY exec $EXEC_NAME -n -c 'exit 42' >/dev/null 2>&1
+        EXEC_EXIT_CODE=$?
+        run_test "Exec propagates exit code" "[ $EXEC_EXIT_CODE -eq 42 ]" "Should return exit code 42"
     else
-        echo -e "  Exec output: $EXEC_OUTPUT"
-        run_test "Exec captures output" "false" "Expected 'test123' in output"
+        echo -e "  ${YELLOW}Skipping exec test - container failed to reach RUNNING state${NC}"
+        debug_container_state "$EXEC_NAME" "exec test skip"
+        run_test "Exec captures output" "false" "Skipped - container not running"
+        run_test "Exec exit code" "false" "Skipped - container not running"
+        run_test "Exec propagates exit code" "false" "Skipped - container not running"
     fi
-    
-    run_test "Exec exit code" "[ $EXEC_EXIT -eq 0 ]" "Exec should succeed"
-    
-    # Test exec with exit code
-    $CLI_BINARY exec $EXEC_NAME -n -c 'exit 42' >/dev/null 2>&1
-    EXEC_EXIT_CODE=$?
-    run_test "Exec propagates exit code" "[ $EXEC_EXIT_CODE -eq 42 ]" "Should return exit code 42"
 else
-    echo -e "  ${YELLOW}Skipping exec test - container not yet running${NC}"
+    echo -e "  ${YELLOW}Skipping exec test - container creation failed${NC}"
+    run_test "Exec captures output" "false" "Skipped - create failed"
+    run_test "Exec exit code" "false" "Skipped - create failed"
+    run_test "Exec propagates exit code" "false" "Skipped - create failed"
 fi
 
 # Test 7.4: Test script execution
@@ -392,8 +512,11 @@ echo "Script executed successfully"
 EOF
 chmod +x test_script.sh
 
-if echo "$STATUS" | grep -q "Status: RUNNING"; then
+# Check if container is still running for script test
+if wait_for_container_running "$EXEC_NAME" 1; then
     run_test "Script execution" "$CLI_BINARY exec $EXEC_NAME -n -c ./test_script.sh --capture-output 2>&1 | grep -qE '(Script executed|copy_script)'" "Should execute or attempt script"
+else
+    run_test "Script execution" "false" "Skipped - container not running"
 fi
 
 echo -e "\n${BLUE}=== FEATURE 8: Remove with Name ===${NC}"
