@@ -110,15 +110,19 @@ impl QuiltService for QuiltServiceImpl {
                     
                     // For named volumes, auto-create if needed
                     if mount_type == MountType::Volume {
-                        if let Ok(None) = self.sync_engine.get_volume(&mount.source).await {
-                            ConsoleLogger::info(&format!("Auto-creating volume '{}'", mount.source));
-                            if let Err(e) = self.sync_engine.create_volume(
-                                &mount.source,
-                                None,
-                                HashMap::new(),
-                                HashMap::new(),
-                            ).await {
-                                ConsoleLogger::warning(&format!("Failed to auto-create volume '{}': {}", mount.source, e));
+                        match self.sync_engine.get_volume(&mount.source).await {
+                            Ok(None) => {
+                                // Volume doesn't exist, create it
+                                ConsoleLogger::info(&format!("Auto-creating volume '{}'", mount.source));
+                                if let Err(e) = self.sync_engine.create_volume(&mount.source, None, HashMap::new(), HashMap::new()).await {
+                                    ConsoleLogger::warning(&format!("Failed to auto-create volume '{}': {}", mount.source, e));
+                                }
+                            }
+                            Ok(Some(_)) => {
+                                // Volume exists, nothing to do
+                            }
+                            Err(e) => {
+                                ConsoleLogger::warning(&format!("Error checking volume '{}': {}", mount.source, e));
                             }
                         }
                     }
@@ -549,10 +553,17 @@ impl QuiltService for QuiltServiceImpl {
                 // Get the rootfs path for the container
                 let rootfs_path = format!("/tmp/quilt-containers/{}", container_id);
                 
+                // Escape the command for shell execution
+                // Using double quotes to allow shell expansion (redirects, pipes, etc.)
+                let escaped_command = command_to_execute.replace("\\", "\\\\")
+                    .replace("\"", "\\\"")
+                    .replace("$", "\\$")
+                    .replace("`", "\\`");
+                
                 let exec_cmd = if req.capture_output {
-                    format!("nsenter -t {} -p -m -n -u -i -- chroot {} /bin/sh -c '{}'", pid, rootfs_path, command_to_execute)
+                    format!("nsenter -t {} -p -m -n -u -i -- chroot {} /bin/sh -c \"{}\"", pid, rootfs_path, escaped_command)
                 } else {
-                    format!("nsenter -t {} -p -m -n -u -i -- chroot {} /bin/sh -c '{}' >/dev/null 2>&1", pid, rootfs_path, command_to_execute)
+                    format!("nsenter -t {} -p -m -n -u -i -- chroot {} /bin/sh -c \"{}\" >/dev/null 2>&1", pid, rootfs_path, escaped_command)
                 };
 
                 match utils::command::CommandExecutor::execute_shell(&exec_cmd) {

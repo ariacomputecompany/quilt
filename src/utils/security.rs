@@ -10,7 +10,7 @@ impl SecurityValidator {
             MountType::Bind => {
                 // Prevent path traversal
                 if path.contains("..") {
-                    return Err("Path traversal detected in mount source".to_string());
+                    return Err("Path traversal detected".to_string());
                 }
                 
                 // Check if path exists
@@ -76,7 +76,7 @@ impl SecurityValidator {
         
         // Prevent path traversal
         if path.contains("..") {
-            return Err("Path traversal detected in mount target".to_string());
+            return Err("Path traversal detected".to_string());
         }
         
         // Prevent mounting over critical container paths

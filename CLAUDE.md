@@ -48,10 +48,40 @@ All test scripts are located in the `tests/` directory:
 # Production readiness test
 ./tests/test_production_containers.sh
 
+# Volume functionality tests
+./tests/test_volumes_comprehensive.sh
+
 # Stress tests
 ./tests/stress_test_full_e2e.sh
 ./tests/stress_test_icc.sh
 ./tests/stress_test_network_baseline.sh
+```
+
+### Running Rust Tests
+```bash
+# Run all Rust tests
+cargo test
+
+# Run sync engine tests only
+cargo test sync::
+
+# Run a specific test
+cargo test sync::engine::tests::test_container_lifecycle_integration
+
+# Run tests with output
+cargo test -- --nocapture
+```
+
+### Code Quality Commands
+```bash
+# Format code
+cargo fmt
+
+# Check linting
+cargo clippy
+
+# Type check without building
+cargo check
 ```
 
 ### Development Helper
@@ -77,7 +107,7 @@ The project uses a SQLite-based sync engine to avoid blocking operations:
 
 2. **CLI Client (`src/cli/`)**: 
    - Command-line interface for container management
-   - Supports create, status, logs, stop, remove, and ICC commands
+   - Supports create, status, logs, stop, remove, exec, and ICC commands
    - Communicates with server via gRPC on port 50051
 
 3. **Sync Engine (`src/sync/`)**: 
@@ -104,6 +134,8 @@ The sync engine uses SQLite with tables for:
 - `container_logs`: Log storage
 - `container_cleanup`: Cleanup task tracking
 - `icc_registrations`: Inter-container communication registry
+- `volumes`: Named volume management
+- `container_mounts`: Container mount configurations
 - `schema_migrations`: Database version management
 
 ### Key Architectural Patterns
@@ -121,6 +153,40 @@ The sync engine uses SQLite with tables for:
 - Use `./dev.sh generate-rootfs` to create test images
 - Automatic binary fixing for Nix-generated containers with broken symlinks
 - Custom shell binary compiled during build for environments with broken symlinks
+
+## Volume and Mount Support
+
+### Mount Types Supported
+- **Bind Mounts**: `-v /host/path:/container/path[:ro]`
+- **Named Volumes**: `-v volume-name:/container/path` (auto-created in `/var/lib/quilt/volumes`)
+- **Tmpfs**: `--mount type=tmpfs,target=/container/path,size=10m`
+
+### Volume Commands
+```bash
+# Create container with bind mount
+./target/debug/cli create \
+  --image-path ./nixos-minimal.tar.gz \
+  -v /host/path:/container/path \
+  --async-mode
+
+# Create with read-only mount
+./target/debug/cli create \
+  --image-path ./nixos-minimal.tar.gz \
+  -v /host/path:/container/path:ro \
+  --async-mode
+
+# Create with named volume (auto-created)
+./target/debug/cli create \
+  --image-path ./nixos-minimal.tar.gz \
+  -v my-data:/app/data \
+  --async-mode
+
+# Advanced mount syntax
+./target/debug/cli create \
+  --image-path ./nixos-minimal.tar.gz \
+  --mount type=bind,source=/host/path,target=/container/path,readonly \
+  --async-mode
+```
 
 ## Protocol Buffers
 
@@ -160,6 +226,9 @@ The sync engine uses SQLite with tables for:
 
 # Execute command in container
 ./target/debug/cli exec <container-id> <command>
+
+# Execute with output capture
+./target/debug/cli exec <container-id> -c "ls -la" --capture-output
 ```
 
 ### Inter-Container Communication
@@ -179,3 +248,6 @@ The sync engine uses SQLite with tables for:
 - Network namespace requires special handling for container connectivity
 - Cgroup v1/v2 compatibility is handled automatically
 - Custom shell binary is built in `build.rs` for Nix environments
+- Shell command execution in containers uses double quotes to allow redirects and pipes
+- Volume security validation blocks path traversal and sensitive system paths
+- Mounts are setup before chroot to ensure visibility in container

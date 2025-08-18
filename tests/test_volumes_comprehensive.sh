@@ -30,7 +30,6 @@ info() {
 
 success() {
     echo -e "${GREEN}[PASS]${NC} $1"
-    PASSED_TESTS=$((PASSED_TESTS + 1))
 }
 
 fail() {
@@ -162,14 +161,14 @@ if echo "$OUTPUT" | grep -q "Container created successfully"; then
     EXEC_OUTPUT=$( ./target/debug/cli exec "$CONTAINER_ID" -c "ls /mnt/test" --capture-output 2>&1 )
     
     run_test "Bind mount accessible" \
-        "echo '$EXEC_OUTPUT' | grep -q 'test_file.txt'" \
+        "printf '%s\n' \"\$EXEC_OUTPUT\" | grep -q 'test_file.txt'" \
         "Should see test_file.txt in mount"
     
     # Test file read
     EXEC_OUTPUT=$( ./target/debug/cli exec "$CONTAINER_ID" -c "cat /mnt/test/test_file.txt" --capture-output 2>&1 )
     
     run_test "Read file from bind mount" \
-        "echo '$EXEC_OUTPUT' | grep -q 'test content'" \
+        "printf '%s\n' \"\$EXEC_OUTPUT\" | grep -q 'test content'" \
         "Should read file content"
     
     # Test write to bind mount
@@ -210,7 +209,7 @@ if echo "$OUTPUT" | grep -q "Container created successfully"; then
         --capture-output 2>&1 )
     
     run_test "Read-only mount prevents writes" \
-        "echo '$EXEC_OUTPUT' | grep -qE '(Read-only|Permission denied)'" \
+        "printf '%s\n' \"\$EXEC_OUTPUT\" | grep -qE '(Read-only|Permission denied)'" \
         "Write should be denied"
     
     # Verify file was NOT created
@@ -243,7 +242,7 @@ if echo "$OUTPUT" | grep -q "Container created successfully"; then
     EXEC_OUTPUT=$( ./target/debug/cli exec "$CONTAINER_ID" -c "ls /mnt/data && ls /etc/app" --capture-output 2>&1 )
     
     run_test "Both mounts accessible" \
-        "echo '$EXEC_OUTPUT' | grep -q 'app.conf'" \
+        "printf '%s\n' \"\$EXEC_OUTPUT\" | grep -q 'app.conf'" \
         "Should see config file"
     
     ./target/debug/cli stop "$CONTAINER_ID" >/dev/null 2>&1
@@ -262,7 +261,7 @@ OUTPUT=$( ./target/debug/cli create \
     --async-mode 2>&1 )
 
 run_test "Path traversal blocked" \
-    "echo '$OUTPUT' | grep -q 'Path traversal detected'" \
+    "printf '%s\n' \"\$OUTPUT\" | grep -q 'Path traversal detected'" \
     "Should detect and block .."
 
 # Try to mount sensitive path
@@ -272,7 +271,7 @@ OUTPUT=$( ./target/debug/cli create \
     --async-mode 2>&1 )
 
 run_test "Sensitive path blocked" \
-    "echo '$OUTPUT' | grep -q 'not allowed'" \
+    "printf '%s\n' \"\$OUTPUT\" | grep -q 'not allowed'" \
     "Should block /etc/passwd"
 
 # Try to mount over critical container path
@@ -282,7 +281,7 @@ OUTPUT=$( ./target/debug/cli create \
     --async-mode 2>&1 )
 
 run_test "Critical container path protected" \
-    "echo '$OUTPUT' | grep -q 'protected path'" \
+    "printf '%s\n' \"\$OUTPUT\" | grep -q 'protected path'" \
     "Should protect /etc in container"
 
 # Test 5: Advanced mount syntax
@@ -303,7 +302,7 @@ if echo "$OUTPUT" | grep -q "Container created successfully"; then
     EXEC_OUTPUT=$( ./target/debug/cli exec "$CONTAINER_ID" -c "ls /mnt/advanced" --capture-output 2>&1 )
     
     run_test "Advanced mount syntax works" \
-        "echo '$EXEC_OUTPUT' | grep -q 'test_file.txt'" \
+        "printf '%s\n' \"\$EXEC_OUTPUT\" | grep -q 'test_file.txt'" \
         "Mount should be accessible"
     
     # Verify readonly
@@ -312,7 +311,7 @@ if echo "$OUTPUT" | grep -q "Container created successfully"; then
         --capture-output 2>&1 )
     
     run_test "Advanced mount readonly option" \
-        "echo '$EXEC_OUTPUT' | grep -qE '(Read-only|Permission denied)'" \
+        "printf '%s\n' \"\$EXEC_OUTPUT\" | grep -qE '(Read-only|Permission denied)'" \
         "Should be read-only"
     
     ./target/debug/cli stop "$CONTAINER_ID" >/dev/null 2>&1
@@ -360,7 +359,7 @@ if echo "$OUTPUT" | grep -q "Container created successfully"; then
         --capture-output 2>&1 )
     
     run_test "Tmpfs mount is writable" \
-        "echo '$EXEC_OUTPUT' | grep -q 'tmpfs test'" \
+        "printf '%s\n' \"\$EXEC_OUTPUT\" | grep -q 'tmpfs test'" \
         "Should write and read from tmpfs"
     
     ./target/debug/cli stop "$CONTAINER_ID" >/dev/null 2>&1
@@ -402,7 +401,7 @@ if echo "$OUTPUT" | grep -q "Container created successfully"; then
         --capture-output 2>&1 )
     
     run_test "Data persists across restart" \
-        "echo '$EXEC_OUTPUT' | grep -q 'persist data'" \
+        "printf '%s\n' \"\$EXEC_OUTPUT\" | grep -q 'persist data'" \
         "Should see persisted data"
     
     ./target/debug/cli stop "$CONTAINER_ID" >/dev/null 2>&1
@@ -454,13 +453,17 @@ if [ ! -z "$CONTAINER1_ID" ] && [ ! -z "$CONTAINER2_ID" ]; then
         --capture-output 2>&1 )
     
     run_test "Shared mount accessible" \
-        "echo '$EXEC_OUTPUT' | grep -q 'from container 1'" \
+        "printf '%s\n' \"\$EXEC_OUTPUT\" | grep -q 'from container 1'" \
         "Container 2 should see container 1's write"
     
     # Concurrent writes test
     ./target/debug/cli exec "$CONTAINER1_ID" -c "echo 'c1' >> /mnt/shared/concurrent.txt" 2>&1 &
+    PID1=$!
     ./target/debug/cli exec "$CONTAINER2_ID" -c "echo 'c2' >> /mnt/shared/concurrent.txt" 2>&1 &
-    wait
+    PID2=$!
+    
+    # Wait for both commands to complete with timeout
+    wait $PID1 $PID2
     
     run_test "Concurrent writes complete" \
         "[ -f '$TEST_DIR/shared/concurrent.txt' ]" \
@@ -483,7 +486,7 @@ OUTPUT=$( ./target/debug/cli create \
     --async-mode 2>&1 )
 
 run_test "Non-existent source rejected" \
-    "echo '$OUTPUT' | grep -q 'does not exist'" \
+    "printf '%s\n' \"\$OUTPUT\" | grep -q 'does not exist'" \
     "Should fail with clear error"
 
 # Invalid mount format
@@ -493,7 +496,7 @@ OUTPUT=$( ./target/debug/cli create \
     --async-mode 2>&1 )
 
 run_test "Invalid format rejected" \
-    "echo '$OUTPUT' | grep -q 'format'" \
+    "printf '%s\n' \"\$OUTPUT\" | grep -q 'format'" \
     "Should fail with format error"
 
 # Summary

@@ -220,7 +220,8 @@ impl InputValidator {
         } else if source.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
             MountType::Volume
         } else {
-            return Err("Invalid volume source format".to_string());
+            // Assume bind mount for other patterns (security validation will catch issues later)
+            MountType::Bind
         };
         
         // Parse options
