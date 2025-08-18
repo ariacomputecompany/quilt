@@ -19,6 +19,7 @@ impl SchemaManager {
         self.create_cleanup_tasks_table().await?;
         self.create_volumes_table().await?;
         self.create_container_mounts_table().await?;
+        self.create_container_metrics_table().await?;
         self.create_indexes().await?;
         
         tracing::info!("Database schema initialized successfully");
@@ -170,6 +171,47 @@ impl SchemaManager {
         Ok(())
     }
     
+    async fn create_container_metrics_table(&self) -> SyncResult<()> {
+        sqlx::query(r#"
+            CREATE TABLE IF NOT EXISTS container_metrics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                container_id TEXT NOT NULL,
+                timestamp INTEGER NOT NULL,
+                
+                -- CPU metrics (microseconds)
+                cpu_usage_usec INTEGER,
+                cpu_user_usec INTEGER,
+                cpu_system_usec INTEGER,
+                cpu_throttled_usec INTEGER,
+                
+                -- Memory metrics (bytes)
+                memory_current_bytes INTEGER,
+                memory_peak_bytes INTEGER,
+                memory_limit_bytes INTEGER,
+                memory_cache_bytes INTEGER,
+                memory_rss_bytes INTEGER,
+                
+                -- Network metrics
+                network_rx_bytes INTEGER,
+                network_tx_bytes INTEGER,
+                network_rx_packets INTEGER,
+                network_tx_packets INTEGER,
+                network_rx_errors INTEGER,
+                network_tx_errors INTEGER,
+                
+                -- Disk I/O metrics
+                disk_read_bytes INTEGER,
+                disk_write_bytes INTEGER,
+                disk_read_ops INTEGER,
+                disk_write_ops INTEGER,
+                
+                FOREIGN KEY(container_id) REFERENCES containers(id) ON DELETE CASCADE
+            )
+        "#).execute(&self.pool).await?;
+        
+        Ok(())
+    }
+    
     async fn create_indexes(&self) -> SyncResult<()> {
         // Performance indexes as specified in the documentation
         let indexes = [
@@ -187,6 +229,8 @@ impl SchemaManager {
             "CREATE INDEX IF NOT EXISTS idx_volumes_name ON volumes(name)",
             "CREATE INDEX IF NOT EXISTS idx_container_mounts_container ON container_mounts(container_id)",
             "CREATE INDEX IF NOT EXISTS idx_container_mounts_type ON container_mounts(mount_type)",
+            "CREATE INDEX IF NOT EXISTS idx_container_metrics_container_time ON container_metrics(container_id, timestamp)",
+            "CREATE INDEX IF NOT EXISTS idx_container_metrics_timestamp ON container_metrics(timestamp)",
         ];
         
         for index_sql in indexes {

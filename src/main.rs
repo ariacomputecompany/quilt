@@ -5,7 +5,7 @@ mod sync;
 
 use daemon::{ContainerConfig, CgroupLimits, NamespaceConfig};
 use utils::console::ConsoleLogger;
-use sync::{SyncEngine, containers::ContainerState, MountType};
+use sync::{SyncEngine, ContainerState, MountType};
 
 use std::sync::Arc;
 use std::collections::HashMap;
@@ -34,12 +34,17 @@ use quilt::{
     RemoveVolumeRequest, RemoveVolumeResponse,
     ListVolumesRequest, ListVolumesResponse,
     InspectVolumeRequest, InspectVolumeResponse,
-    ContainerStatus,
+    GetHealthRequest, GetHealthResponse,
+    GetMetricsRequest, GetMetricsResponse,
+    GetSystemInfoRequest, GetSystemInfoResponse,
+    StreamEventsRequest, ContainerEvent as ProtoContainerEvent,
+    ContainerStatus, HealthCheck, ContainerMetric, SystemMetrics as ProtoSystemMetrics,
 };
 
 #[derive(Clone)]
 pub struct QuiltServiceImpl {
     sync_engine: Arc<SyncEngine>,
+    start_time: std::time::SystemTime,
 }
 
 impl QuiltServiceImpl {
@@ -54,6 +59,7 @@ impl QuiltServiceImpl {
         
         Ok(Self {
             sync_engine,
+            start_time: std::time::SystemTime::now(),
         })
     }
 }
@@ -68,6 +74,13 @@ impl QuiltService for QuiltServiceImpl {
         let container_id = Uuid::new_v4().to_string();
 
         ConsoleLogger::container_created(&container_id);
+        
+        // Emit container created event
+        sync::events::global_event_buffer().emit(
+            sync::events::EventType::Created,
+            &container_id,
+            None,
+        );
 
         // Convert gRPC request to sync engine container config
         let config = sync::containers::ContainerConfig {
@@ -329,6 +342,13 @@ impl QuiltService for QuiltServiceImpl {
                             }
                             
                             ConsoleLogger::success(&format!("Container {} stopped", container_id));
+                            
+                            // Emit container stopped event
+                            sync::events::global_event_buffer().emit(
+                                sync::events::EventType::Stopped,
+                                &container_id,
+                                None,
+                            );
                             Ok(Response::new(StopContainerResponse {
                                 success: true,
                                 error_message: String::new(),
@@ -397,6 +417,13 @@ impl QuiltService for QuiltServiceImpl {
         match self.sync_engine.delete_container(&container_id).await {
             Ok(()) => {
                 ConsoleLogger::success(&format!("Container {} removed", container_id));
+                
+                // Emit container removed event
+                sync::events::global_event_buffer().emit(
+                    sync::events::EventType::Removed,
+                    &container_id,
+                    None,
+                );
                 Ok(Response::new(RemoveContainerResponse {
                     success: true,
                     error_message: String::new(),
@@ -934,6 +961,245 @@ impl QuiltService for QuiltServiceImpl {
             }
         }
     }
+
+    async fn get_health(
+        &self,
+        _request: Request<GetHealthRequest>,
+    ) -> Result<Response<GetHealthResponse>, Status> {
+        use crate::utils::logger::Timer;
+        
+        let mut checks = Vec::new();
+        let mut overall_healthy = true;
+        
+        // Check database connection
+        let db_timer = Timer::new("database_check");
+        let db_healthy = match sqlx::query("SELECT 1").fetch_one(self.sync_engine.pool()).await {
+            Ok(_) => true,
+            Err(_) => {
+                overall_healthy = false;
+                false
+            }
+        };
+        checks.push(HealthCheck {
+            name: "database".to_string(),
+            healthy: db_healthy,
+            message: if db_healthy { "Connected".to_string() } else { "Connection failed".to_string() },
+            duration_ms: db_timer.elapsed_ms(),
+        });
+        
+        // Check cgroups availability
+        let cgroup_timer = Timer::new("cgroup_check");
+        let cgroup_healthy = std::path::Path::new("/sys/fs/cgroup").exists();
+        if !cgroup_healthy {
+            overall_healthy = false;
+        }
+        checks.push(HealthCheck {
+            name: "cgroups".to_string(),
+            healthy: cgroup_healthy,
+            message: if cgroup_healthy { "Available".to_string() } else { "Not available".to_string() },
+            duration_ms: cgroup_timer.elapsed_ms(),
+        });
+        
+        // Get container counts
+        let (containers_total, containers_running) = match self.sync_engine.get_container_counts().await {
+            Ok((total, running)) => (total as u32, running as u32),
+            Err(_) => (0, 0),
+        };
+        
+        // Calculate uptime
+        let uptime_seconds = self.start_time.elapsed().unwrap_or_default().as_secs();
+        
+        Ok(Response::new(GetHealthResponse {
+            healthy: overall_healthy,
+            status: if overall_healthy { "healthy".to_string() } else { "degraded".to_string() },
+            uptime_seconds,
+            containers_running,
+            containers_total,
+            checks,
+        }))
+    }
+
+    async fn get_metrics(
+        &self,
+        request: Request<GetMetricsRequest>,
+    ) -> Result<Response<GetMetricsResponse>, Status> {
+        let req = request.into_inner();
+        use crate::daemon::metrics::{MetricsCollector, SystemMetrics};
+        
+        let mut container_metrics = Vec::new();
+        
+        // Get container metrics
+        if !req.container_id.is_empty() {
+            // Get specific container metrics
+            if let Ok(status) = self.sync_engine.get_container_status(&req.container_id).await {
+                let collector = MetricsCollector::new();
+                if let Ok(metrics) = collector.collect_container_metrics(&req.container_id, status.pid.map(|p| p as i32)) {
+                    container_metrics.push(ContainerMetric {
+                            container_id: metrics.container_id.clone(),
+                            timestamp: metrics.timestamp,
+                            cpu_usage_usec: metrics.cpu.usage_usec,
+                            cpu_user_usec: metrics.cpu.user_usec,
+                            cpu_system_usec: metrics.cpu.system_usec,
+                            cpu_throttled_usec: metrics.cpu.throttled_usec,
+                            memory_current_bytes: metrics.memory.current_bytes,
+                            memory_peak_bytes: metrics.memory.peak_bytes,
+                            memory_limit_bytes: metrics.memory.limit_bytes,
+                            memory_cache_bytes: metrics.memory.cache_bytes,
+                            memory_rss_bytes: metrics.memory.rss_bytes,
+                            network_rx_bytes: metrics.network.rx_bytes,
+                            network_tx_bytes: metrics.network.tx_bytes,
+                            network_rx_packets: metrics.network.rx_packets,
+                            network_tx_packets: metrics.network.tx_packets,
+                            disk_read_bytes: metrics.disk.read_bytes,
+                            disk_write_bytes: metrics.disk.write_bytes,
+                        });
+                    
+                    // Store metrics in database for history
+                    let _ = self.sync_engine.store_metrics(&metrics).await;
+                }
+            }
+        } else {
+            // Get metrics for all running containers
+            if let Ok(containers) = self.sync_engine.list_containers(Some(ContainerState::Running)).await {
+                let collector = MetricsCollector::new();
+                for container in containers {
+                    if let Ok(metrics) = collector.collect_container_metrics(&container.id, container.pid.map(|p| p as i32)) {
+                        container_metrics.push(ContainerMetric {
+                            container_id: metrics.container_id.clone(),
+                            timestamp: metrics.timestamp,
+                            cpu_usage_usec: metrics.cpu.usage_usec,
+                            cpu_user_usec: metrics.cpu.user_usec,
+                            cpu_system_usec: metrics.cpu.system_usec,
+                            cpu_throttled_usec: metrics.cpu.throttled_usec,
+                            memory_current_bytes: metrics.memory.current_bytes,
+                            memory_peak_bytes: metrics.memory.peak_bytes,
+                            memory_limit_bytes: metrics.memory.limit_bytes,
+                            memory_cache_bytes: metrics.memory.cache_bytes,
+                            memory_rss_bytes: metrics.memory.rss_bytes,
+                            network_rx_bytes: metrics.network.rx_bytes,
+                            network_tx_bytes: metrics.network.tx_bytes,
+                            network_rx_packets: metrics.network.rx_packets,
+                            network_tx_packets: metrics.network.tx_packets,
+                            disk_read_bytes: metrics.disk.read_bytes,
+                            disk_write_bytes: metrics.disk.write_bytes,
+                        });
+                    
+                    // Store metrics in database for history
+                    let _ = self.sync_engine.store_metrics(&metrics).await;
+                    }
+                }
+            }
+        }
+        
+        // Get system metrics if requested
+        let system_metrics = if req.include_system {
+            if let Ok(mut sys_metrics) = SystemMetrics::collect() {
+                // Update container counts
+                if let Ok((total, running)) = self.sync_engine.get_container_counts().await {
+                    sys_metrics.containers_total = total as u64;
+                    sys_metrics.containers_running = running as u64;
+                    sys_metrics.containers_stopped = (total - running) as u64;
+                }
+                
+                Some(ProtoSystemMetrics {
+                    timestamp: sys_metrics.timestamp,
+                    memory_used_mb: sys_metrics.memory_used_mb,
+                    memory_total_mb: sys_metrics.memory_total_mb,
+                    cpu_count: sys_metrics.cpu_count as u32,
+                    load_average: sys_metrics.load_average.to_vec(),
+                    containers_total: sys_metrics.containers_total,
+                    containers_running: sys_metrics.containers_running,
+                    containers_stopped: sys_metrics.containers_stopped,
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        
+        Ok(Response::new(GetMetricsResponse {
+            container_metrics,
+            system_metrics,
+        }))
+    }
+
+    async fn get_system_info(
+        &self,
+        _request: Request<GetSystemInfoRequest>,
+    ) -> Result<Response<GetSystemInfoResponse>, Status> {
+        let mut features = HashMap::new();
+        features.insert("namespaces".to_string(), "pid,mount,uts,ipc,network".to_string());
+        features.insert("cgroups".to_string(), "v1,v2".to_string());
+        features.insert("storage".to_string(), "sqlite".to_string());
+        features.insert("networking".to_string(), "bridge,veth".to_string());
+        features.insert("volumes".to_string(), "bind,volume,tmpfs".to_string());
+        
+        let mut limits = HashMap::new();
+        limits.insert("max_containers".to_string(), "1000".to_string());
+        limits.insert("max_memory_per_container".to_string(), "unlimited".to_string());
+        limits.insert("max_cpus_per_container".to_string(), "unlimited".to_string());
+        
+        Ok(Response::new(GetSystemInfoResponse {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            runtime: format!("{}/{}", std::env::consts::OS, std::env::consts::ARCH),
+            start_time: self.start_time.duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64,
+            features,
+            limits,
+        }))
+    }
+
+    async fn stream_events(
+        &self,
+        request: Request<StreamEventsRequest>,
+    ) -> Result<Response<Self::StreamEventsStream>, Status> {
+        use tokio_stream::wrappers::IntervalStream;
+        use futures::stream::StreamExt;
+        
+        let req = request.into_inner();
+        let event_buffer = sync::events::global_event_buffer();
+        
+        // Parse event type filters
+        let event_types: Option<Vec<sync::events::EventType>> = if req.event_types.is_empty() {
+            None
+        } else {
+            let types: Vec<_> = req.event_types.iter()
+                .filter_map(|s| sync::events::EventType::from_str(s))
+                .collect();
+            if types.is_empty() {
+                None
+            } else {
+                Some(types)
+            }
+        };
+        
+        // Create a stream that polls for new events every 100ms
+        let stream = IntervalStream::new(tokio::time::interval(Duration::from_millis(100)))
+            .map(move |_| {
+                let events = event_buffer.get_filtered(
+                    if req.container_ids.is_empty() { None } else { Some(&req.container_ids) },
+                    event_types.as_deref(),
+                    None,
+                );
+                
+                // Convert to proto events
+                let proto_events: Vec<ProtoContainerEvent> = events.into_iter()
+                    .map(|e| ProtoContainerEvent {
+                        event_type: e.event_type.as_str().to_string(),
+                        container_id: e.container_id,
+                        timestamp: e.timestamp,
+                        attributes: e.attributes,
+                    })
+                    .collect();
+                
+                futures::stream::iter(proto_events.into_iter().map(Ok))
+            })
+            .flatten();
+        
+        Ok(Response::new(Box::pin(stream)))
+    }
+    
+    type StreamEventsStream = std::pin::Pin<Box<dyn futures::Stream<Item = Result<ProtoContainerEvent, Status>> + Send>>;
 }
 
 // ✅ BACKGROUND CONTAINER PROCESS STARTUP
@@ -942,7 +1208,7 @@ async fn start_container_process(sync_engine: &SyncEngine, container_id: &str) -
     use std::path::Path;
     
     // Get container configuration from sync engine
-    let status = sync_engine.get_container_status(container_id).await
+    let _status = sync_engine.get_container_status(container_id).await
         .map_err(|e| format!("Failed to get container config: {}", e))?;
 
     // Get full container config from database to get image_path and command
@@ -1048,6 +1314,14 @@ async fn start_container_process(sync_engine: &SyncEngine, container_id: &str) -
             }
             
             ConsoleLogger::success(&format!("Container {} started successfully", container_id));
+            
+            // Emit container started event
+            sync::events::global_event_buffer().emit(
+                sync::events::EventType::Started,
+                container_id,
+                None,
+            );
+            
             Ok(())
         }
         Err(e) => {
@@ -1059,6 +1333,9 @@ async fn start_container_process(sync_engine: &SyncEngine, container_id: &str) -
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Initialize logger
+    utils::logger::Logger::init();
+    
     // ✅ SYNC ENGINE INITIALIZATION
     let service = QuiltServiceImpl::new().await
         .map_err(|e| format!("Failed to initialize sync engine: {}", e))?;

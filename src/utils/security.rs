@@ -180,7 +180,7 @@ impl SecurityValidator {
     }
     
     /// Validate that volume operations won't compromise security
-    pub fn validate_volume_operation(operation: &str, volume_name: &str, user_id: Option<u32>) -> Result<(), String> {
+    pub fn validate_volume_operation(_operation: &str, volume_name: &str, _user_id: Option<u32>) -> Result<(), String> {
         // Check volume name
         if !Self::is_valid_volume_name(volume_name) {
             return Err("Invalid volume name".to_string());

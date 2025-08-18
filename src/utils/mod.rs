@@ -4,6 +4,7 @@ pub mod console;
 pub mod filesystem;
 pub mod image;
 pub mod locking;
+pub mod logger;
 pub mod process;
 pub mod validation;
 pub mod security;

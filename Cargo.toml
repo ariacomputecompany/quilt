@@ -17,6 +17,7 @@ tonic = "0.8"
 prost = "0.11"
 tokio = { version = "1.21.2", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
+futures = "0.3"
 nix = "0.26.1"
 uuid = { version = "1.1.2", features = ["v4"] }
 serde = { version = "1.0", features = ["derive"] }
@@ -36,6 +37,7 @@ dashmap = "5.5"
 parking_lot = "0.12"
 scopeguard = "1.2"
 inotify = "0.10"
+num_cpus = "1.16"
 
 # Sync engine dependencies
 sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "sqlite", "chrono", "migrate"] }

@@ -231,6 +231,9 @@ async fn resolve_container_id(
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Initialize logger
+    utils::logger::Logger::init();
+    
     let cli = Cli::parse();
 
     // Create a channel with extended timeout configuration for concurrent operations

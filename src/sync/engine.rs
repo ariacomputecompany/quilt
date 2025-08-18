@@ -289,6 +289,24 @@ impl SyncEngine {
         self.connection_manager.pool()
     }
     
+    /// Get container counts (total and running)
+    pub async fn get_container_counts(&self) -> SyncResult<(usize, usize)> {
+        let containers = self.list_containers(None).await?;
+        let total = containers.len();
+        let running = containers.iter()
+            .filter(|c| matches!(c.state, ContainerState::Running))
+            .count();
+        Ok((total, running))
+    }
+    
+    /// Store container metrics
+    pub async fn store_metrics(&self, metrics: &crate::daemon::metrics::ContainerMetrics) -> SyncResult<()> {
+        use crate::sync::metrics::MetricsStore;
+        let store = MetricsStore::new(self.connection_manager.pool().clone());
+        store.store_metrics(metrics).await
+    }
+    
+    
     /// Get sync engine statistics
     pub async fn get_stats(&self) -> SyncResult<SyncEngineStats> {
         let containers = self.container_manager.list_containers(None).await?;

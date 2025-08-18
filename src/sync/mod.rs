@@ -7,6 +7,8 @@ pub mod monitor;
 pub mod cleanup;
 pub mod error;
 pub mod volumes;
+pub mod metrics;
+pub mod events;
 
 pub use engine::SyncEngine;
 pub use error::SyncError;

@@ -6,6 +6,7 @@ pub mod readiness;
 pub mod system;
 pub mod manager;
 pub mod resource;
+pub mod metrics;
 
 // Re-export commonly used types
 pub use runtime::{ContainerRuntime, ContainerConfig, ContainerState, MountConfig, MountType};

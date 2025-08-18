@@ -28,6 +28,12 @@ service QuiltService {
     rpc RemoveVolume (RemoveVolumeRequest) returns (RemoveVolumeResponse);
     rpc ListVolumes (ListVolumesRequest) returns (ListVolumesResponse);
     rpc InspectVolume (InspectVolumeRequest) returns (InspectVolumeResponse);
+    
+    // Health and monitoring
+    rpc GetHealth (GetHealthRequest) returns (GetHealthResponse);
+    rpc GetMetrics (GetMetricsRequest) returns (GetMetricsResponse);
+    rpc GetSystemInfo (GetSystemInfoRequest) returns (GetSystemInfoResponse);
+    rpc StreamEvents (StreamEventsRequest) returns (stream ContainerEvent);
 }
 
 // Container status enumeration
@@ -242,4 +248,102 @@ message InspectVolumeResponse {
     bool found = 1;                               // Whether volume was found
     Volume volume = 2;                            // Volume information
     string error_message = 3;                     // Error message if inspection failed
+}
+
+// Health and monitoring messages
+message GetHealthRequest {
+    // Empty request
+}
+
+message GetHealthResponse {
+    bool healthy = 1;                             // Overall health status
+    string status = 2;                            // Status message (e.g., "healthy", "degraded")
+    uint64 uptime_seconds = 3;                    // Server uptime in seconds
+    uint32 containers_running = 4;                // Number of running containers
+    uint32 containers_total = 5;                  // Total number of containers
+    repeated HealthCheck checks = 6;              // Individual health check results
+}
+
+message HealthCheck {
+    string name = 1;                              // Check name (e.g., "database", "cgroups")
+    bool healthy = 2;                             // Whether this check passed
+    string message = 3;                           // Check result message
+    uint64 duration_ms = 4;                       // Time taken for check
+}
+
+message GetMetricsRequest {
+    string container_id = 1;                      // Optional: specific container ID
+    bool include_system = 2;                      // Include system-wide metrics
+    uint64 start_time = 3;                        // Start time for historical data (unix timestamp ms)
+    uint64 end_time = 4;                          // End time for historical data (unix timestamp ms)
+    uint32 interval_seconds = 5;                  // Aggregation interval for historical data
+}
+
+message GetMetricsResponse {
+    repeated ContainerMetric container_metrics = 1; // Container-specific metrics
+    SystemMetrics system_metrics = 2;              // System-wide metrics
+}
+
+message ContainerMetric {
+    string container_id = 1;                      // Container ID
+    uint64 timestamp = 2;                         // Metric timestamp
+    
+    // CPU metrics
+    uint64 cpu_usage_usec = 3;                    // Total CPU usage in microseconds
+    uint64 cpu_user_usec = 4;                     // User CPU time in microseconds
+    uint64 cpu_system_usec = 5;                   // System CPU time in microseconds
+    uint64 cpu_throttled_usec = 6;                // Time throttled due to limits
+    
+    // Memory metrics
+    uint64 memory_current_bytes = 7;              // Current memory usage
+    uint64 memory_peak_bytes = 8;                 // Peak memory usage
+    uint64 memory_limit_bytes = 9;                // Memory limit
+    uint64 memory_cache_bytes = 10;               // Page cache memory
+    uint64 memory_rss_bytes = 11;                 // RSS memory
+    
+    // Network metrics
+    uint64 network_rx_bytes = 12;                 // Bytes received
+    uint64 network_tx_bytes = 13;                 // Bytes transmitted
+    uint64 network_rx_packets = 14;               // Packets received
+    uint64 network_tx_packets = 15;               // Packets transmitted
+    
+    // Disk I/O metrics
+    uint64 disk_read_bytes = 16;                  // Bytes read from disk
+    uint64 disk_write_bytes = 17;                 // Bytes written to disk
+}
+
+message SystemMetrics {
+    uint64 timestamp = 1;                         // Metric timestamp
+    uint64 memory_used_mb = 2;                    // System memory used (MB)
+    uint64 memory_total_mb = 3;                   // System memory total (MB)
+    uint32 cpu_count = 4;                         // Number of CPUs
+    repeated double load_average = 5;             // Load average (1, 5, 15 min)
+    uint64 containers_total = 6;                  // Total containers
+    uint64 containers_running = 7;                // Running containers
+    uint64 containers_stopped = 8;                // Stopped containers
+}
+
+message GetSystemInfoRequest {
+    // Empty request
+}
+
+message GetSystemInfoResponse {
+    string version = 1;                           // Quilt version
+    string runtime = 2;                           // Runtime info (e.g., "linux/amd64")
+    uint64 start_time = 3;                        // Server start time
+    map<string, string> features = 4;             // Enabled features
+    map<string, string> limits = 5;               // System limits
+}
+
+// Event streaming
+message StreamEventsRequest {
+    repeated string container_ids = 1;            // Filter by container IDs (empty = all)
+    repeated string event_types = 2;              // Filter by event types (empty = all)
+}
+
+message ContainerEvent {
+    string event_type = 1;                        // Event type (e.g., "created", "started", "died")
+    string container_id = 2;                      // Container ID
+    uint64 timestamp = 3;                         // Event timestamp
+    map<string, string> attributes = 4;           // Event-specific attributes
 } 
