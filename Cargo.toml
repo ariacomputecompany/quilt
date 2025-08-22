@@ -39,6 +39,10 @@ scopeguard = "1.2"
 inotify = "0.10"
 num_cpus = "1.16"
 
+# DNS server dependencies
+trust-dns-proto = "0.23"
+trust-dns-resolver = "0.23"
+
 # Sync engine dependencies
 sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "sqlite", "chrono", "migrate"] }
 thiserror = "1.0"

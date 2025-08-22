@@ -60,7 +60,14 @@ create_minimal_rootfs() {
         cp "$(which busybox)" "$temp_dir/bin/"
         # Create common command symlinks
         cd "$temp_dir/bin"
-        for cmd in sh ls cat echo mkdir rm cp mv pwd ps grep sed awk tar gzip; do
+        for cmd in sh ls cat echo mkdir rm cp mv pwd ps grep sed awk tar gzip ping nslookup \
+                   sleep tail head test true false which find touch chmod chown df du kill \
+                   pkill pgrep top free uptime hostname uname date whoami id groups \
+                   wc sort uniq cut tr expr basename dirname realpath readlink \
+                   xargs env printenv export type alias unalias hash ulimit \
+                   mount umount pidof killall nc netstat ifconfig ip route \
+                   wget curl telnet ssh scp ftp tftp vi less more zcat gunzip \
+                   bunzip2 unzip base64 md5sum sha1sum sha256sum; do
             ln -sf busybox "$cmd" 2>/dev/null || true
         done
         cd - >/dev/null

@@ -1,0 +1,157 @@
+#!/bin/bash
+
+# ICC and Networking Test - Direct validation, no false positives
+set -euo pipefail
+
+# Test results
+PASSED=0
+FAILED=0
+
+# Colors
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+echo -e "${BLUE}=== ICC & Networking Validation Test ===${NC}"
+
+# 1. Build check
+echo -n "Building project... "
+if cargo build --quiet 2>/dev/null; then
+    echo -e "${GREEN}PASSED${NC}"
+    ((PASSED++))
+else
+    echo -e "${RED}FAILED${NC}"
+    ((FAILED++))
+    exit 1
+fi
+
+# 2. Start server
+echo -n "Starting server... "
+./target/debug/quilt > server.log 2>&1 &
+SERVER_PID=$!
+sleep 2
+
+if kill -0 $SERVER_PID 2>/dev/null; then
+    echo -e "${GREEN}PASSED${NC} (PID: $SERVER_PID)"
+    ((PASSED++))
+else
+    echo -e "${RED}FAILED${NC} - Server not running"
+    ((FAILED++))
+    exit 1
+fi
+
+# 3. Check bridge exists
+echo -n "Checking network bridge... "
+if ip link show quilt0 >/dev/null 2>&1; then
+    echo -e "${GREEN}PASSED${NC}"
+    ((PASSED++))
+else
+    echo -e "${RED}FAILED${NC} - Bridge 'quilt0' not found"
+    ((FAILED++))
+fi
+
+# 4. Check DNS port
+echo -n "Checking DNS server... "
+if ss -ulpn 2>/dev/null | grep -q ":53 "; then
+    echo -e "${GREEN}PASSED${NC}"
+    ((PASSED++))
+else
+    echo -e "${RED}FAILED${NC} - DNS not listening on port 53"
+    ((FAILED++))
+fi
+
+# 5. Create containers and validate networking
+echo -n "Creating container A... "
+CONTAINER_A=$(./target/debug/cli create --image-path ./nixos-minimal.tar.gz --enable-network-namespace -- /bin/sh -c "sleep 120" 2>&1 | grep "Container ID:" | awk '{print $NF}')
+if [ ! -z "$CONTAINER_A" ]; then
+    echo -e "${GREEN}PASSED${NC} ($CONTAINER_A)"
+    ((PASSED++))
+else
+    echo -e "${RED}FAILED${NC}"
+    ((FAILED++))
+fi
+
+echo -n "Creating container B... "
+CONTAINER_B=$(./target/debug/cli create --image-path ./nixos-minimal.tar.gz --enable-network-namespace -- /bin/sh -c "sleep 120" 2>&1 | grep "Container ID:" | awk '{print $NF}')
+if [ ! -z "$CONTAINER_B" ]; then
+    echo -e "${GREEN}PASSED${NC} ($CONTAINER_B)"
+    ((PASSED++))
+else
+    echo -e "${RED}FAILED${NC}"
+    ((FAILED++))
+fi
+
+# 6. Get IPs
+if [ ! -z "$CONTAINER_A" ] && [ ! -z "$CONTAINER_B" ]; then
+    echo -n "Waiting for containers to start... "
+    sleep 5
+    echo -e "${GREEN}DONE${NC}"
+    echo -n "Getting container IPs... "
+    IP_A=$(./target/debug/cli status $CONTAINER_A 2>/dev/null | grep "IP:" | awk '{print $2}')
+    IP_B=$(./target/debug/cli status $CONTAINER_B 2>/dev/null | grep "IP:" | awk '{print $2}')
+    
+    if [ ! -z "$IP_A" ] && [ ! -z "$IP_B" ] && [ "$IP_A" != "N/A" ] && [ "$IP_B" != "N/A" ]; then
+        echo -e "${GREEN}PASSED${NC} (A: $IP_A, B: $IP_B)"
+        ((PASSED++))
+    else
+        echo -e "${RED}FAILED${NC} - No IPs assigned"
+        ((FAILED++))
+    fi
+    
+    # 7. Test ping
+    if [ ! -z "$IP_B" ]; then
+        echo -n "Testing ping A->B... "
+        if ./target/debug/cli exec $CONTAINER_A ping -c 1 -W 2 $IP_B >/dev/null 2>&1; then
+            echo -e "${GREEN}PASSED${NC}"
+            ((PASSED++))
+        else
+            echo -e "${RED}FAILED${NC}"
+            ((FAILED++))
+        fi
+    fi
+    
+    # 8. Test ICC ping command
+    echo -n "Testing ICC ping... "
+    if ./target/debug/cli icc ping $CONTAINER_A $CONTAINER_B --count 1 --timeout 5 2>&1 | grep -q "bytes from"; then
+        echo -e "${GREEN}PASSED${NC}"
+        ((PASSED++))
+    else
+        echo -e "${RED}FAILED${NC}"
+        ((FAILED++))
+    fi
+    
+    # 9. Test DNS
+    echo -n "Testing DNS resolution... "
+    NAME_B=$(./target/debug/cli status $CONTAINER_B 2>/dev/null | grep "Name:" | awk '{print $2}')
+    if [ ! -z "$NAME_B" ]; then
+        if ./target/debug/cli exec $CONTAINER_A nslookup $NAME_B 10.42.0.1 2>&1 | grep -q "$IP_B"; then
+            echo -e "${GREEN}PASSED${NC}"
+            ((PASSED++))
+        else
+            echo -e "${RED}FAILED${NC}"
+            ((FAILED++))
+        fi
+    fi
+fi
+
+# Cleanup
+echo -n "Cleaning up... "
+kill $SERVER_PID 2>/dev/null || true
+pkill -f quilt 2>/dev/null || true
+rm -rf /tmp/quilt-containers/* 2>/dev/null || true
+rm -f server.log 2>/dev/null || true
+echo -e "${GREEN}DONE${NC}"
+
+# Summary
+echo -e "\n${BLUE}=== Test Summary ===${NC}"
+echo -e "Passed: ${GREEN}$PASSED${NC}"
+echo -e "Failed: ${RED}$FAILED${NC}"
+
+if [ $FAILED -eq 0 ]; then
+    echo -e "\n${GREEN}✓ All tests passed${NC}"
+    exit 0
+else
+    echo -e "\n${RED}✗ Some tests failed${NC}"
+    exit 1
+fi

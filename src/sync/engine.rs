@@ -111,19 +111,20 @@ impl SyncEngine {
     
     /// Create a new container with coordinated network allocation
     pub async fn create_container(&self, config: ContainerConfig) -> SyncResult<NetworkConfig> {
-        // 1. Allocate network resources if networking is enabled
-        let network_config = if config.enable_network_namespace {
-            Some(self.network_manager.allocate_network(&config.id).await?)
+        // Store container ID and network namespace flag before moving config
+        let container_id = config.id.clone();
+        let enable_network = config.enable_network_namespace;
+        
+        // 1. Create container record in database FIRST (to satisfy foreign key constraints)
+        self.container_manager.create_container(config).await?;
+        
+        // 2. Allocate network resources if networking is enabled
+        let network_config = if enable_network {
+            Some(self.network_manager.allocate_network(&container_id).await?)
         } else {
-            self.network_manager.mark_network_disabled(&config.id).await?;
+            self.network_manager.mark_network_disabled(&container_id).await?;
             None
         };
-        
-        // Store container ID before moving config
-        let container_id = config.id.clone();
-        
-        // 2. Create container record in database
-        self.container_manager.create_container(config).await?;
         
         // 3. Return network configuration for setup
         Ok(network_config.unwrap_or(NetworkConfig {

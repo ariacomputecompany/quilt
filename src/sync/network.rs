@@ -67,8 +67,8 @@ impl NetworkManager {
     pub fn new(pool: SqlitePool) -> Self {
         Self {
             pool,
-            ip_range_start: Ipv4Addr::new(172, 16, 0, 10),
-            ip_range_end: Ipv4Addr::new(172, 16, 0, 250),
+            ip_range_start: Ipv4Addr::new(10, 42, 0, 10),
+            ip_range_end: Ipv4Addr::new(10, 42, 0, 250),
         }
     }
     
@@ -407,17 +407,17 @@ mod tests {
         // Create network manager with very small IP range
         let network_manager = NetworkManager::with_ip_range(
             conn_manager.pool().clone(),
-            Ipv4Addr::new(172, 16, 0, 10),
-            Ipv4Addr::new(172, 16, 0, 11) // Only 2 IPs available
+            Ipv4Addr::new(10, 42, 0, 10),
+            Ipv4Addr::new(10, 42, 0, 11) // Only 2 IPs available
         );
         
         // Allocate first IP
         let config1 = network_manager.allocate_network("container1").await.unwrap();
-        assert_eq!(config1.ip_address, "172.16.0.10");
+        assert_eq!(config1.ip_address, "10.42.0.10");
         
         // Allocate second IP
         let config2 = network_manager.allocate_network("container2").await.unwrap();
-        assert_eq!(config2.ip_address, "172.16.0.11");
+        assert_eq!(config2.ip_address, "10.42.0.11");
         
         // Third allocation should fail
         let result = network_manager.allocate_network("container3").await;

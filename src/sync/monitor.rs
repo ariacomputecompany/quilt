@@ -279,22 +279,41 @@ impl ProcessMonitorService {
     }
     
     async fn complete_process_monitor(pool: &SqlitePool, container_id: &str, exit_code: i32) -> SyncResult<()> {
+        // Update process monitor status
         sqlx::query("UPDATE process_monitors SET status = ? WHERE container_id = ?")
             .bind(MonitorStatus::Completed.to_string())
             .bind(container_id)
             .execute(pool)
             .await?;
         
-        // Also update container state if we have access to container manager
-        // This would be injected in the real implementation
-        tracing::debug!("Process monitor completed for container {} with exit code {}", container_id, exit_code);
+        // Update container state to Exited
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
+        sqlx::query("UPDATE containers SET state = ?, exit_code = ?, updated_at = ? WHERE id = ?")
+            .bind("exited")
+            .bind(exit_code as i64)
+            .bind(now)
+            .bind(container_id)
+            .execute(pool)
+            .await?;
+        
+        tracing::info!("Container {} exited with code {}", container_id, exit_code);
         
         Ok(())
     }
     
     async fn fail_process_monitor(pool: &SqlitePool, container_id: &str, error_message: &str) -> SyncResult<()> {
+        // Update process monitor status
         sqlx::query("UPDATE process_monitors SET status = ? WHERE container_id = ?")
             .bind(MonitorStatus::Failed.to_string())
+            .bind(container_id)
+            .execute(pool)
+            .await?;
+        
+        // Update container state to Error
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
+        sqlx::query("UPDATE containers SET state = ?, updated_at = ? WHERE id = ?")
+            .bind("error")
+            .bind(now)
             .bind(container_id)
             .execute(pool)
             .await?;

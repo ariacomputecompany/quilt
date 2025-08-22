@@ -482,6 +482,10 @@ async fn handle_exec_command(
 
     // Parse environment variables from "KEY=VALUE" format
     let mut environment = HashMap::new();
+    
+    // Always add QUILT_SERVER to point to the bridge IP for nested container access
+    environment.insert("QUILT_SERVER".to_string(), "10.42.0.1:50051".to_string());
+    
     for env_var in env {
         if let Some((key, value)) = env_var.split_once('=') {
             environment.insert(key.to_string(), value.to_string());

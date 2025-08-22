@@ -157,21 +157,40 @@ impl ContainerRuntime {
         ConsoleLogger::progress(&format!("Creating container: {}", id));
         
         let container = Container::new(id.clone(), config);
+        let rootfs_path = container.rootfs_path.clone();
 
         // Lock-free container insertion
         self.containers.insert(id.clone(), container);
 
         // Setup rootfs
+        ConsoleLogger::debug(&format!("Setting up rootfs for {} at {}", id, rootfs_path));
         if let Err(e) = self.setup_rootfs(&id) {
             ConsoleLogger::error(&format!("[CREATE] Rootfs setup failed for {}: {}", id, e));
             // Rollback: remove container from map
             self.containers.remove(&id);
             return Err(e);
         }
+        
+        // Verify rootfs was actually created and has content
+        if !std::path::Path::new(&rootfs_path).exists() {
+            ConsoleLogger::error(&format!("Rootfs path {} was not created after setup", rootfs_path));
+            self.containers.remove(&id);
+            return Err(format!("Rootfs creation failed for container {}", id));
+        }
+        
+        // Check if rootfs has any content
+        let entries = std::fs::read_dir(&rootfs_path)
+            .map_err(|e| format!("Failed to read rootfs directory: {}", e))?;
+        if entries.count() == 0 {
+            ConsoleLogger::error(&format!("Rootfs {} is empty after extraction", rootfs_path));
+            self.containers.remove(&id);
+            return Err(format!("Rootfs extraction failed - directory is empty", ));
+        }
 
         self.update_container_state(&id, ContainerState::PENDING);
 
         ConsoleLogger::container_created(&id);
+        ConsoleLogger::success(&format!("Container {} created with rootfs at {}", id, rootfs_path));
         Ok(())
     }
     
@@ -308,6 +327,40 @@ impl ContainerRuntime {
                 return 1;
             }
             
+            // NOW wait for network configuration AFTER chroot if networking is enabled
+            if network_enabled {
+                // Ensure /tmp exists in container
+                if !std::path::Path::new("/tmp").exists() {
+                    println!("Creating /tmp directory in container");
+                    if let Err(e) = std::fs::create_dir_all("/tmp") {
+                        eprintln!("Failed to create /tmp in container: {}", e);
+                        // Try to continue anyway
+                    }
+                }
+                
+                println!("Waiting for network configuration from parent process...");
+                let network_ready_path = format!("/tmp/quilt-network-ready-{}", id_for_logs);
+                let start_time = std::time::Instant::now();
+                let timeout = std::time::Duration::from_secs(60);
+                
+                loop {
+                    if std::path::Path::new(&network_ready_path).exists() {
+                        println!("Network configuration ready, proceeding...");
+                        // Clean up the flag file
+                        let _ = std::fs::remove_file(&network_ready_path);
+                        break;
+                    }
+                    
+                    if start_time.elapsed() > timeout {
+                        eprintln!("Timeout waiting for network configuration");
+                        eprintln!("Expected signal file: {}", network_ready_path);
+                        return 1;
+                    }
+                    
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            }
+            
             println!("DEBUG: After chroot, checking /mnt:");
             if let Ok(entries) = std::fs::read_dir("/mnt") {
                 for entry in entries {
@@ -344,19 +397,38 @@ impl ContainerRuntime {
             println!("Executing main command in container: {:?}", command_clone);
             
             // Verify shell exists and find appropriate shell
+            println!("DEBUG: Looking for shell in container...");
             let shell_path = if std::path::Path::new("/bin/sh").exists() {
+                println!("DEBUG: Found /bin/sh");
+                // Check if it's a symlink and where it points to
+                if let Ok(target) = std::fs::read_link("/bin/sh") {
+                    println!("DEBUG: /bin/sh is a symlink to: {:?}", target);
+                }
                 "/bin/sh"
             } else if std::path::Path::new("/bin/bash").exists() {
+                println!("DEBUG: Found /bin/bash");
                 "/bin/bash"
             } else if std::path::Path::new("/usr/bin/sh").exists() {
+                println!("DEBUG: Found /usr/bin/sh");
                 "/usr/bin/sh"
             } else if std::path::Path::new("/usr/bin/bash").exists() {
+                println!("DEBUG: Found /usr/bin/bash");
                 "/usr/bin/bash"
             } else if std::path::Path::new("/nix/var/nix/profiles/default/bin/sh").exists() {
+                println!("DEBUG: Found /nix/var/nix/profiles/default/bin/sh");
                 "/nix/var/nix/profiles/default/bin/sh"
             } else {
                 eprintln!("ERROR: No shell found in container! Tried /bin/sh, /bin/bash, /usr/bin/sh, /usr/bin/bash, /nix/var/nix/profiles/default/bin/sh");
                 eprintln!("Container filesystem might be incomplete or corrupted");
+                // List what's in /bin for debugging
+                eprintln!("DEBUG: Contents of /bin:");
+                if let Ok(entries) = std::fs::read_dir("/bin") {
+                    for entry in entries {
+                        if let Ok(entry) = entry {
+                            eprintln!("  - {:?}", entry.path());
+                        }
+                    }
+                }
                 return 1;
             };
             
@@ -584,6 +656,13 @@ impl ContainerRuntime {
         // First, ensure we have essential library directories
         self.setup_library_directories(rootfs_path)?;
 
+        // Copy essential libraries early
+        self.copy_essential_libraries(rootfs_path)?;
+
+        // Install busybox FIRST so it's available for shell symlinks
+        self.install_busybox(rootfs_path)?;
+
+        // Now fix broken binaries (shell will use busybox if available)
         for (binary_name, host_paths) in essential_binaries {
             let container_binary_path = format!("{}/bin/{}", rootfs_path, binary_name);
             
@@ -604,9 +683,6 @@ impl ContainerRuntime {
                 self.fix_broken_binary(&container_binary_path, binary_name, &host_paths)?;
             }
         }
-
-        // Copy essential libraries
-        self.copy_essential_libraries(rootfs_path)?;
 
         // Ensure basic shell works
         self.verify_container_shell(rootfs_path)?;
@@ -693,10 +769,27 @@ impl ContainerRuntime {
                     }
                 }
 
-        // If no suitable host binary found, create a custom shell
+        // If no suitable host binary found, try to use busybox
         if binary_name == "sh" {
-            ConsoleLogger::progress("Creating custom shell binary as fallback");
-            return self.create_robust_shell(container_binary_path);
+            ConsoleLogger::progress("Creating shell symlink to busybox");
+            
+            // Check if busybox is already installed
+            let busybox_path = format!("{}/busybox", container_binary_path.rsplit_once('/').unwrap().0);
+            if FileSystemUtils::is_file(&busybox_path) {
+                // Create symlink to busybox with absolute path
+                let _ = std::fs::remove_file(container_binary_path);
+                if let Err(e) = std::os::unix::fs::symlink("/bin/busybox", container_binary_path) {
+                    ConsoleLogger::warning(&format!("Failed to create symlink to busybox: {}", e));
+                    // Fall back to custom shell if symlink fails
+                    return self.create_robust_shell(container_binary_path);
+                } else {
+                    ConsoleLogger::success("Created shell symlink to busybox (/bin/sh -> /bin/busybox)");
+                    return Ok(());
+                }
+            } else {
+                ConsoleLogger::progress("Busybox not found, creating custom shell binary as fallback");
+                return self.create_robust_shell(container_binary_path);
+            }
         }
 
         // For other binaries, create simple scripts
@@ -1187,6 +1280,103 @@ done
             .map_err(|e| format!("Failed to set cat permissions: {}", e))?;
 
         println!("  ✅ Created cat script at {}", cat_path);
+        Ok(())
+    }
+
+    /// Install busybox and create symlinks for all applets
+    fn install_busybox(&self, rootfs_path: &str) -> Result<(), String> {
+        ConsoleLogger::info("Installing busybox for comprehensive container utilities...");
+        ConsoleLogger::debug(&format!("Installing busybox to rootfs: {}", rootfs_path));
+        
+        // Try multiple locations for busybox binary
+        let busybox_sources = vec![
+            "/usr/bin/busybox",  // System busybox
+            "./busybox",         // Local busybox
+            "src/daemon/resources/busybox", // Build-time downloaded busybox
+        ];
+        
+        let mut busybox_source_path = None;
+        for source in &busybox_sources {
+            if FileSystemUtils::is_file(source) {
+                busybox_source_path = Some(source);
+                break;
+            }
+        }
+        
+        let busybox_source = match busybox_source_path {
+            Some(path) => path,
+            None => {
+                ConsoleLogger::warning("Busybox not found, downloading...");
+                // Download busybox if not found
+                let download_path = "/tmp/quilt-busybox";
+                let download_cmd = format!(
+                    "curl -L -o {} https://busybox.net/downloads/binaries/1.35.0-x86_64-linux-musl/busybox && chmod +x {}",
+                    download_path, download_path
+                );
+                
+                CommandExecutor::execute_shell(&download_cmd)
+                    .map_err(|e| format!("Failed to download busybox: {}", e))?;
+                
+                download_path
+            }
+        };
+        
+        let busybox_target = format!("{}/bin/busybox", rootfs_path);
+        
+        // Ensure /bin directory exists
+        let bin_dir = format!("{}/bin", rootfs_path);
+        FileSystemUtils::create_dir_all_with_logging(&bin_dir, "busybox bin directory")?;
+        
+        // Copy busybox binary
+        ConsoleLogger::debug(&format!("Copying busybox from {} to {}", busybox_source, busybox_target));
+        FileSystemUtils::copy_file(busybox_source, &busybox_target)?;
+        
+        // Make it executable
+        CommandExecutor::execute_shell(&format!("chmod +x {}", busybox_target))?;
+        ConsoleLogger::success(&format!("Busybox installed to {}", busybox_target));
+        
+        // Get list of all busybox applets
+        let applets_output = CommandExecutor::execute_shell(&format!("{} --list", busybox_target))?;
+        let applets: Vec<&str> = applets_output.stdout.lines().collect();
+        
+        // Create symlinks for essential networking and system utilities
+        let essential_applets = vec![
+            "sh", "bash", "ash",  // Shells - ensure we have a working shell
+            "nslookup", "ping", "wget", "nc", "telnet", "traceroute",
+            "hostname", "ifconfig", "route", "arp", "netstat",
+            "ps", "top", "kill", "grep", "sed", "awk", "find",
+            "tar", "gzip", "gunzip", "base64", "md5sum", "sha256sum",
+            "head", "tail", "less", "more", "sort", "uniq",
+            "test", "[", "[[", "expr", "seq", "sleep", "timeout"
+        ];
+        
+        for applet in essential_applets {
+            if applets.contains(&applet) {
+                let symlink_path = format!("{}/bin/{}", rootfs_path, applet);
+                // Remove existing file/symlink if it exists
+                let _ = std::fs::remove_file(&symlink_path);
+                
+                // Create symlink with absolute path to busybox
+                if let Err(e) = std::os::unix::fs::symlink("/bin/busybox", &symlink_path) {
+                    ConsoleLogger::debug(&format!("Failed to create symlink for {}: {}", applet, e));
+                } else {
+                    ConsoleLogger::debug(&format!("Created busybox symlink: {} -> /bin/busybox", applet));
+                }
+            }
+        }
+        
+        // Also ensure /usr/bin exists and has key symlinks
+        let usr_bin_dir = format!("{}/usr/bin", rootfs_path);
+        let _ = FileSystemUtils::create_dir_all_with_logging(&usr_bin_dir, "usr/bin directory");
+        
+        // Create some symlinks in /usr/bin for common paths
+        for applet in &["nslookup", "wget", "nc"] {
+            let usr_symlink = format!("{}/usr/bin/{}", rootfs_path, applet);
+            let _ = std::fs::remove_file(&usr_symlink);
+            let _ = std::os::unix::fs::symlink("/bin/busybox", &usr_symlink);
+        }
+        
+        ConsoleLogger::success("Busybox installed with all networking utilities");
         Ok(())
     }
 

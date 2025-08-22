@@ -2,10 +2,12 @@ mod daemon;
 mod utils;
 mod icc;
 mod sync;
+mod grpc;
 
 use daemon::{ContainerConfig, CgroupLimits, NamespaceConfig};
 use utils::console::ConsoleLogger;
 use sync::{SyncEngine, ContainerState, MountType};
+use grpc::start_container_process;
 
 use std::sync::Arc;
 use std::collections::HashMap;
@@ -44,6 +46,7 @@ use quilt::{
 #[derive(Clone)]
 pub struct QuiltServiceImpl {
     sync_engine: Arc<SyncEngine>,
+    network_manager: Arc<tokio::sync::Mutex<icc::network::NetworkManager>>,
     start_time: std::time::SystemTime,
 }
 
@@ -57,8 +60,32 @@ impl QuiltServiceImpl {
         
         ConsoleLogger::success("Sync engine initialized with background services");
         
+        // Initialize ICC network manager
+        let mut network_manager = icc::network::NetworkManager::new("quilt0", "10.42.0.0/16")
+            .map_err(|e| format!("Failed to create network manager: {}", e))?;
+        
+        // CRITICAL: Ensure bridge is ready before any other network operations
+        network_manager.ensure_bridge_ready()
+            .map_err(|e| format!("Failed to setup network bridge: {}", e))?;
+        
+        ConsoleLogger::success("Bridge network initialized - containers can now communicate");
+        
+        // Start DNS server (non-critical - bridge networking works without DNS)
+        match network_manager.start_dns_server().await {
+            Ok(()) => {
+                ConsoleLogger::success("DNS server started - containers can resolve names");
+            }
+            Err(e) => {
+                ConsoleLogger::warning(&format!("DNS server startup failed (non-critical): {}", e));
+                ConsoleLogger::info("Bridge networking is fully functional - containers can communicate via IP addresses");
+            }
+        }
+        
+        ConsoleLogger::success("Network manager initialized with bridge networking");
+        
         Ok(Self {
             sync_engine,
+            network_manager: Arc::new(tokio::sync::Mutex::new(network_manager)),
             start_time: std::time::SystemTime::now(),
         })
     }
@@ -160,11 +187,36 @@ impl QuiltService for QuiltServiceImpl {
                 
                 // Now start the container with mounts already configured
                 let sync_engine = self.sync_engine.clone();
+                let network_manager = self.network_manager.clone();
                 let container_id_clone = container_id.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = start_container_process(&sync_engine, &container_id_clone).await {
-                        ConsoleLogger::error(&format!("Failed to start container process {}: {}", container_id_clone, e));
-                        let _ = sync_engine.update_container_state(&container_id_clone, ContainerState::Error).await;
+                    // Add timeout to prevent hanging containers
+                    let startup_timeout = std::time::Duration::from_secs(120); // 2 minute timeout
+                    let task_start = std::time::Instant::now();
+                    
+                    ConsoleLogger::info(&format!("⏰ [TASK-SPAWN] Starting container {} with {:?} timeout", 
+                        container_id_clone, startup_timeout));
+                    
+                    let startup_result = tokio::time::timeout(
+                        startup_timeout,
+                        start_container_process(&sync_engine, &container_id_clone, network_manager)
+                    ).await;
+                    
+                    match startup_result {
+                        Ok(Ok(())) => {
+                            ConsoleLogger::success(&format!("🎯 [TASK-COMPLETE] Container {} startup completed successfully in {:?}", 
+                                container_id_clone, task_start.elapsed()));
+                        }
+                        Ok(Err(e)) => {
+                            ConsoleLogger::error(&format!("💥 [TASK-ERROR] Failed to start container process {} after {:?}: {}", 
+                                container_id_clone, task_start.elapsed(), e));
+                            let _ = sync_engine.update_container_state(&container_id_clone, ContainerState::Error).await;
+                        }
+                        Err(_) => {
+                            ConsoleLogger::error(&format!("⏰ [TASK-TIMEOUT] Container {} startup timed out after {:?} (limit: {:?})", 
+                                container_id_clone, task_start.elapsed(), startup_timeout));
+                            let _ = sync_engine.update_container_state(&container_id_clone, ContainerState::Error).await;
+                        }
                     }
                 });
                 
@@ -416,6 +468,12 @@ impl QuiltService for QuiltServiceImpl {
         // ✅ NON-BLOCKING: Coordinated cleanup through sync engine
         match self.sync_engine.delete_container(&container_id).await {
             Ok(()) => {
+                // Unregister from DNS
+                {
+                    let nm = self.network_manager.lock().await;
+                    let _ = nm.unregister_container_dns(&container_id);
+                }
+                
                 ConsoleLogger::success(&format!("Container {} removed", container_id));
                 
                 // Emit container removed event
@@ -541,7 +599,7 @@ impl QuiltService for QuiltServiceImpl {
                             // Copy script to container using nsenter with chroot
                             let rootfs_path = format!("/tmp/quilt-containers/{}", container_id);
                             let copy_cmd = format!(
-                                "nsenter -t {} -p -m -n -u -i -- chroot {} /bin/sh -c 'cat > {} << 'EOF'\n{}\nEOF\nchmod +x {}'",
+                                "nsenter -t {} -p -m -n -u -- chroot {} /bin/sh -c 'cat > {} << 'EOF'\n{}\nEOF\nchmod +x {}'",
                                 pid, rootfs_path, temp_script, script_content, temp_script
                             );
                             
@@ -587,10 +645,13 @@ impl QuiltService for QuiltServiceImpl {
                     .replace("$", "\\$")
                     .replace("`", "\\`");
                 
+                // Set PATH to include busybox binaries
+                let path_prefix = "export PATH=/bin:/usr/bin:/sbin:/usr/sbin:$PATH; ";
+                // Note: We're not using IPC namespace (-i) by default as it's disabled in NamespaceConfig::default()
                 let exec_cmd = if req.capture_output {
-                    format!("nsenter -t {} -p -m -n -u -i -- chroot {} /bin/sh -c \"{}\"", pid, rootfs_path, escaped_command)
+                    format!("nsenter -t {} -p -m -n -u -- chroot {} /bin/sh -c \"{}{}\"", pid, rootfs_path, path_prefix, escaped_command)
                 } else {
-                    format!("nsenter -t {} -p -m -n -u -i -- chroot {} /bin/sh -c \"{}\" >/dev/null 2>&1", pid, rootfs_path, escaped_command)
+                    format!("nsenter -t {} -p -m -n -u -- chroot {} /bin/sh -c \"{}{}\" >/dev/null 2>&1", pid, rootfs_path, path_prefix, escaped_command)
                 };
 
                 match utils::command::CommandExecutor::execute_shell(&exec_cmd) {
@@ -600,18 +661,33 @@ impl QuiltService for QuiltServiceImpl {
                         // Clean up temporary script if we created one
                         if req.copy_script && command_to_execute.starts_with("/tmp/quilt_exec_") {
                             let cleanup_cmd = format!(
-                                "nsenter -t {} -p -m -n -u -i -- chroot {} rm -f {}",
+                                "nsenter -t {} -p -m -n -u -- chroot {} rm -f {}",
                                 pid, rootfs_path, command_to_execute
                             );
                             let _ = utils::command::CommandExecutor::execute_shell(&cleanup_cmd);
                         }
                         
+                        // Check if command failed due to "command not found" or similar
+                        let command_not_found = result.stderr.contains("not found") || 
+                                              result.stderr.contains("No such file") ||
+                                              result.stderr.contains("can't execute");
+                        
+                        // Set success based on exit code AND command existence
+                        let success = result.success && !command_not_found;
+                        let error_message = if command_not_found {
+                            format!("Command not found: {}", req.command.join(" "))
+                        } else if !result.success {
+                            format!("Command failed with exit code {}", result.exit_code.unwrap_or(-1))
+                        } else {
+                            String::new()
+                        };
+                        
                         Ok(Response::new(ExecContainerResponse {
-                            success: result.success,
+                            success,
                             exit_code: result.exit_code.unwrap_or(-1),
                             stdout: result.stdout,
                             stderr: result.stderr,
-                            error_message: String::new(),
+                            error_message,
                         }))
                     }
                     Err(e) => {
@@ -620,7 +696,7 @@ impl QuiltService for QuiltServiceImpl {
                         // Clean up temporary script on error too
                         if req.copy_script && command_to_execute.starts_with("/tmp/quilt_exec_") {
                             let cleanup_cmd = format!(
-                                "nsenter -t {} -p -m -n -u -i -- chroot {} rm -f {}",
+                                "nsenter -t {} -p -m -n -u -- chroot {} rm -f {}",
                                 pid, rootfs_path, command_to_execute
                             );
                             let _ = utils::command::CommandExecutor::execute_shell(&cleanup_cmd);
@@ -694,9 +770,10 @@ impl QuiltService for QuiltServiceImpl {
         
         // Start the container process in background
         let sync_engine = self.sync_engine.clone();
+        let network_manager = self.network_manager.clone();
         let container_id_clone = container_id.clone();
         tokio::spawn(async move {
-            if let Err(e) = start_container_process(&sync_engine, &container_id_clone).await {
+            if let Err(e) = start_container_process(&sync_engine, &container_id_clone, network_manager).await {
                 ConsoleLogger::error(&format!("Failed to start container process {}: {}", container_id_clone, e));
                 let _ = sync_engine.update_container_state(&container_id_clone, ContainerState::Error).await;
             }
@@ -1202,135 +1279,6 @@ impl QuiltService for QuiltServiceImpl {
     type StreamEventsStream = std::pin::Pin<Box<dyn futures::Stream<Item = Result<ProtoContainerEvent, Status>> + Send>>;
 }
 
-// ✅ BACKGROUND CONTAINER PROCESS STARTUP
-async fn start_container_process(sync_engine: &SyncEngine, container_id: &str) -> Result<(), String> {
-    use daemon::runtime::ContainerRuntime;
-    use std::path::Path;
-    
-    // Get container configuration from sync engine
-    let _status = sync_engine.get_container_status(container_id).await
-        .map_err(|e| format!("Failed to get container config: {}", e))?;
-
-    // Get full container config from database to get image_path and command
-    let container_record = sqlx::query("SELECT image_path, command, rootfs_path FROM containers WHERE id = ?")
-        .bind(container_id)
-        .fetch_one(sync_engine.pool())
-        .await
-        .map_err(|e| format!("Failed to get container details: {}", e))?;
-    
-    let image_path: String = container_record.get("image_path");
-    let command: String = container_record.get("command");
-    let rootfs_path: Option<String> = container_record.get("rootfs_path");
-
-    // Get mounts for the container
-    let sync_mounts = sync_engine.get_container_mounts(container_id).await
-        .map_err(|e| format!("Failed to get mounts: {}", e))?;
-    
-    // Convert mounts from sync engine to daemon format
-    let mut daemon_mounts: Vec<daemon::MountConfig> = Vec::new();
-    for m in sync_mounts {
-        let source = match m.mount_type {
-            sync::MountType::Volume => {
-                // For volumes, convert volume name to actual path
-                sync_engine.get_volume_path(&m.source).to_string_lossy().to_string()
-            }
-            _ => m.source,
-        };
-        
-        daemon_mounts.push(daemon::MountConfig {
-            source,
-            target: m.target,
-            mount_type: match m.mount_type {
-                sync::MountType::Bind => daemon::MountType::Bind,
-                sync::MountType::Volume => daemon::MountType::Volume,
-                sync::MountType::Tmpfs => daemon::MountType::Tmpfs,
-            },
-            readonly: m.readonly,
-            options: m.options,
-        });
-    }
-    
-    // Convert sync engine config back to legacy format for actual container startup
-    // TODO: Eventually replace this with native sync engine container startup
-    let legacy_config = ContainerConfig {
-        image_path,
-        command: vec!["/bin/sh".to_string(), "-c".to_string(), command],
-        environment: HashMap::new(), // TODO: Get from sync engine
-        setup_commands: vec![],
-        resource_limits: Some(CgroupLimits::default()),
-        namespace_config: Some(NamespaceConfig::default()),
-        working_directory: None,
-        mounts: daemon_mounts,
-    };
-
-    // Create legacy runtime for actual process management (temporary)
-    let runtime = ContainerRuntime::new();
-    
-    // Update state to Starting
-    sync_engine.update_container_state(container_id, ContainerState::Starting).await
-        .map_err(|e| format!("Failed to update state: {}", e))?;
-
-    // Check if this is a restart (container already has rootfs)
-    let needs_creation = if let Some(ref rootfs) = rootfs_path {
-        !Path::new(rootfs).exists()
-    } else {
-        true
-    };
-
-    if needs_creation {
-        // First time starting - create container in legacy runtime
-        ConsoleLogger::debug(&format!("Creating new container runtime for {}", container_id));
-        runtime.create_container(container_id.to_string(), legacy_config)
-            .map_err(|e| format!("Failed to create legacy container: {}", e))?;
-            
-        // Save the rootfs path back to sync engine
-        if let Some(container) = runtime.get_container_info(container_id) {
-            sync_engine.set_rootfs_path(container_id, &container.rootfs_path).await
-                .map_err(|e| format!("Failed to save rootfs path: {}", e))?;
-        }
-    } else {
-        // Restarting existing container - just add to runtime registry without recreating rootfs
-        ConsoleLogger::debug(&format!("Restarting existing container {}", container_id));
-        
-        // Add container to runtime's registry without creating rootfs
-        // We'll implement a new method for this
-        runtime.register_existing_container(container_id.to_string(), legacy_config, rootfs_path.unwrap())
-            .map_err(|e| format!("Failed to register existing container: {}", e))?;
-    }
-
-    // Start the container
-    match runtime.start_container(container_id, None) {
-        Ok(()) => {
-            // Get the PID from legacy runtime and store in sync engine
-            if let Some(container) = runtime.get_container_info(container_id) {
-                if let Some(pid) = container.pid {
-                    sync_engine.set_container_pid(container_id, pid).await
-                        .map_err(|e| format!("Failed to set PID: {}", e))?;
-                }
-                
-                // Update state to Running
-                sync_engine.update_container_state(container_id, ContainerState::Running).await
-                    .map_err(|e| format!("Failed to update to running: {}", e))?;
-            }
-            
-            ConsoleLogger::success(&format!("Container {} started successfully", container_id));
-            
-            // Emit container started event
-            sync::events::global_event_buffer().emit(
-                sync::events::EventType::Started,
-                container_id,
-                None,
-            );
-            
-            Ok(())
-        }
-        Err(e) => {
-            sync_engine.update_container_state(container_id, ContainerState::Error).await.ok();
-            Err(format!("Failed to start container: {}", e))
-        }
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize logger
@@ -1340,7 +1288,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let service = QuiltServiceImpl::new().await
         .map_err(|e| format!("Failed to initialize sync engine: {}", e))?;
     
-    let addr: std::net::SocketAddr = "127.0.0.1:50051".parse()?;
+    // Bind to all interfaces so containers can access the gRPC server
+    let addr: std::net::SocketAddr = "0.0.0.0:50051".parse()?;
 
     ConsoleLogger::server_starting(&addr.to_string());
     ConsoleLogger::success("🚀 Quilt server running with SQLite sync engine - non-blocking operations enabled");
@@ -1366,215 +1315,3 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tokio::sync::Mutex as TokioMutex;
-    use std::sync::Arc;
-    
-    // Mock sync engine for testing
-    struct MockSyncEngine {
-        containers: Arc<TokioMutex<HashMap<String, ContainerState>>>,
-        names: Arc<TokioMutex<HashMap<String, String>>>, // name -> id
-    }
-    
-    impl MockSyncEngine {
-        fn new() -> Self {
-            Self {
-                containers: Arc::new(TokioMutex::new(HashMap::new())),
-                names: Arc::new(TokioMutex::new(HashMap::new())),
-            }
-        }
-        
-        async fn create_container(&self, config: sync::containers::ContainerConfig) -> Result<(), String> {
-            let mut containers = self.containers.lock().await;
-            let mut names = self.names.lock().await;
-            
-            // Check name uniqueness
-            if let Some(ref name) = config.name {
-                if !name.is_empty() && names.contains_key(name) {
-                    return Err(format!("Container with name '{}' already exists", name));
-                }
-            }
-            
-            containers.insert(config.id.clone(), ContainerState::Created);
-            
-            if let Some(ref name) = config.name {
-                if !name.is_empty() {
-                    names.insert(name.clone(), config.id.clone());
-                }
-            }
-            
-            Ok(())
-        }
-        
-        async fn get_container_by_name(&self, name: &str) -> Result<String, String> {
-            let names = self.names.lock().await;
-            names.get(name)
-                .cloned()
-                .ok_or_else(|| format!("Container with name '{}' not found", name))
-        }
-        
-        async fn get_container_status(&self, id: &str) -> Result<ContainerState, String> {
-            let containers = self.containers.lock().await;
-            containers.get(id)
-                .cloned()
-                .ok_or_else(|| format!("Container {} not found", id))
-        }
-        
-        async fn update_container_state(&self, id: &str, state: ContainerState) -> Result<(), String> {
-            let mut containers = self.containers.lock().await;
-            if let Some(container_state) = containers.get_mut(id) {
-                *container_state = state;
-                Ok(())
-            } else {
-                Err(format!("Container {} not found", id))
-            }
-        }
-    }
-    
-    #[tokio::test]
-    async fn test_create_container_with_name() {
-        let sync_engine = Arc::new(SyncEngine::new(":memory:").await.unwrap());
-        let service = QuiltServiceImpl { sync_engine };
-        
-        let request = tonic::Request::new(CreateContainerRequest {
-            image_path: "test.tar.gz".to_string(),
-            command: vec!["echo".to_string(), "test".to_string()],
-            environment: HashMap::new(),
-            working_directory: String::new(),
-            setup_commands: vec![],
-            memory_limit_mb: 0,
-            cpu_limit_percent: 0.0,
-            enable_pid_namespace: true,
-            enable_mount_namespace: true,
-            enable_uts_namespace: true,
-            enable_ipc_namespace: true,
-            enable_network_namespace: true,
-            name: "test-container".to_string(),
-            async_mode: false,
-        });
-        
-        let response = service.create_container(request).await;
-        assert!(response.is_ok());
-        
-        let res = response.unwrap().into_inner();
-        assert!(res.success);
-        assert!(!res.container_id.is_empty());
-    }
-    
-    #[tokio::test]
-    async fn test_async_container_without_command() {
-        let sync_engine = Arc::new(SyncEngine::new(":memory:").await.unwrap());
-        let service = QuiltServiceImpl { sync_engine };
-        
-        let request = tonic::Request::new(CreateContainerRequest {
-            image_path: "test.tar.gz".to_string(),
-            command: vec![], // Empty command
-            environment: HashMap::new(),
-            working_directory: String::new(),
-            setup_commands: vec![],
-            memory_limit_mb: 0,
-            cpu_limit_percent: 0.0,
-            enable_pid_namespace: true,
-            enable_mount_namespace: true,
-            enable_uts_namespace: true,
-            enable_ipc_namespace: true,
-            enable_network_namespace: true,
-            name: "async-test".to_string(),
-            async_mode: true, // Async mode
-        });
-        
-        let response = service.create_container(request).await;
-        assert!(response.is_ok());
-        
-        let res = response.unwrap().into_inner();
-        assert!(res.success);
-        // Verify it used default command
-    }
-    
-    #[tokio::test]
-    async fn test_non_async_without_command_fails() {
-        let sync_engine = Arc::new(SyncEngine::new(":memory:").await.unwrap());
-        let service = QuiltServiceImpl { sync_engine };
-        
-        let request = tonic::Request::new(CreateContainerRequest {
-            image_path: "test.tar.gz".to_string(),
-            command: vec![], // Empty command
-            environment: HashMap::new(),
-            working_directory: String::new(),
-            setup_commands: vec![],
-            memory_limit_mb: 0,
-            cpu_limit_percent: 0.0,
-            enable_pid_namespace: true,
-            enable_mount_namespace: true,
-            enable_uts_namespace: true,
-            enable_ipc_namespace: true,
-            enable_network_namespace: true,
-            name: "fail-test".to_string(),
-            async_mode: false, // Not async
-        });
-        
-        let response = service.create_container(request).await;
-        assert!(response.is_err());
-        
-        let err = response.unwrap_err();
-        assert_eq!(err.code(), tonic::Code::InvalidArgument);
-        assert!(err.message().contains("Command required"));
-    }
-    
-    #[tokio::test]
-    async fn test_get_container_by_name_rpc() {
-        let sync_engine = Arc::new(SyncEngine::new(":memory:").await.unwrap());
-        let service = QuiltServiceImpl { sync_engine: sync_engine.clone() };
-        
-        // Create a container with name first
-        let config = sync::containers::ContainerConfig {
-            id: "test-id-123".to_string(),
-            name: Some("lookup-test".to_string()),
-            image_path: "test.tar.gz".to_string(),
-            command: "echo test".to_string(),
-            environment: HashMap::new(),
-            memory_limit_mb: None,
-            cpu_limit_percent: None,
-            enable_network_namespace: true,
-            enable_pid_namespace: true,
-            enable_mount_namespace: true,
-            enable_uts_namespace: true,
-            enable_ipc_namespace: true,
-        };
-        
-        sync_engine.create_container(config).await.unwrap();
-        
-        // Test the RPC
-        let request = tonic::Request::new(GetContainerByNameRequest {
-            name: "lookup-test".to_string(),
-        });
-        
-        let response = service.get_container_by_name(request).await;
-        assert!(response.is_ok());
-        
-        let res = response.unwrap().into_inner();
-        assert!(res.found);
-        assert_eq!(res.container_id, "test-id-123");
-        assert!(res.error_message.is_empty());
-    }
-    
-    #[tokio::test]
-    async fn test_get_container_by_name_not_found() {
-        let sync_engine = Arc::new(SyncEngine::new(":memory:").await.unwrap());
-        let service = QuiltServiceImpl { sync_engine };
-        
-        let request = tonic::Request::new(GetContainerByNameRequest {
-            name: "non-existent".to_string(),
-        });
-        
-        let response = service.get_container_by_name(request).await;
-        assert!(response.is_ok());
-        
-        let res = response.unwrap().into_inner();
-        assert!(!res.found);
-        assert!(res.container_id.is_empty());
-        assert!(res.error_message.contains("not found"));
-    }
-}

@@ -236,8 +236,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     let cli = Cli::parse();
 
+    // Check for QUILT_SERVER environment variable (used by nested containers)
+    let server_addr = if let Ok(env_server) = std::env::var("QUILT_SERVER") {
+        format!("http://{}", env_server)
+    } else {
+        cli.server_addr.clone()
+    };
+
     // Create a channel with extended timeout configuration for concurrent operations
-    let channel = tonic::transport::Channel::from_shared(cli.server_addr.clone())?
+    let channel = tonic::transport::Channel::from_shared(server_addr.clone())?
         .timeout(Duration::from_secs(60))  // Increased from 10s to handle concurrent load
         .connect_timeout(Duration::from_secs(10))  // Increased connection timeout
         .tcp_keepalive(Some(Duration::from_secs(60)))
@@ -246,7 +253,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .connect()
         .await
         .map_err(|e| {
-            eprintln!("❌ Failed to connect to server at {}: {}", cli.server_addr, e);
+            eprintln!("❌ Failed to connect to server at {}: {}", server_addr, e);
             eprintln!("   Make sure quiltd is running: ./dev.sh server-bg");
             e
         })?;
@@ -381,6 +388,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         0 => ContainerStatus::Pending,
                         1 => ContainerStatus::Running,
                         2 => ContainerStatus::Exited,
+                        3 => ContainerStatus::Failed,
                         _ => ContainerStatus::Failed,
                     };
                     let status_str = match status_enum {

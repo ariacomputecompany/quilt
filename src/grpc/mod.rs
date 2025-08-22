@@ -1,7 +1,9 @@
-pub mod service;
 pub mod container_ops;
 pub mod volume_ops;
 pub mod monitoring_ops;
 pub mod helpers;
 
-pub use service::QuiltServiceImpl;
+#[cfg(test)]
+pub mod tests;
+
+pub use container_ops::start_container_process;

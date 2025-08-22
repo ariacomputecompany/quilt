@@ -136,7 +136,7 @@ main() {
     
     # Create Container A
     log "Creating container A..."
-    CONTAINER_A_ID=$(timeout 20 $CLI_BINARY create --image-path ./nixos-minimal.tar.gz -- /bin/sh -c "sleep 60" | grep "Container ID" | awk '{print $3}')
+    CONTAINER_A_ID=$(timeout 20 $CLI_BINARY create --image-path ./nixos-minimal.tar.gz --enable-network-namespace -- /bin/sh -c "sleep 60" | grep "Container ID" | awk '{print $3}')
     if [ -z "$CONTAINER_A_ID" ]; then 
         fail "Failed to create container A - no container ID returned"; 
     fi
@@ -144,7 +144,7 @@ main() {
     
     # Create Container B
     log "Creating container B..."
-    CONTAINER_B_ID=$(timeout 20 $CLI_BINARY create --image-path ./nixos-minimal.tar.gz -- /bin/sh -c "sleep 60" | grep "Container ID" | awk '{print $3}')
+    CONTAINER_B_ID=$(timeout 20 $CLI_BINARY create --image-path ./nixos-minimal.tar.gz --enable-network-namespace -- /bin/sh -c "sleep 60" | grep "Container ID" | awk '{print $3}')
     if [ -z "$CONTAINER_B_ID" ]; then 
         fail "Failed to create container B - no container ID returned"; 
     fi
@@ -152,7 +152,7 @@ main() {
     
     # Get IPs
     log "Waiting for containers to get IP addresses..."
-    sleep 5 
+    sleep 7 
     
     IP_A=$(timeout 10 $CLI_BINARY status $CONTAINER_A_ID | grep "IP:" | awk '{print $2}')
     IP_B=$(timeout 10 $CLI_BINARY status $CONTAINER_B_ID | grep "IP:" | awk '{print $2}')
@@ -170,7 +170,7 @@ main() {
     
     # Ping from A to B
     log "Pinging from A to B..."
-    if timeout 15 $CLI_BINARY exec $CONTAINER_A_ID -- ping -c 3 $IP_B; then
+    if timeout 15 $CLI_BINARY exec $CONTAINER_A_ID -c "ping -c 3 $IP_B"; then
         success "Container A successfully pinged B"
     else
         fail "Container A failed to ping B"
@@ -178,7 +178,7 @@ main() {
     
     # Ping from B to A
     log "Pinging from B to A..."
-    if timeout 15 $CLI_BINARY exec $CONTAINER_B_ID -- ping -c 3 $IP_A; then
+    if timeout 15 $CLI_BINARY exec $CONTAINER_B_ID -c "ping -c 3 $IP_A"; then
         success "Container B successfully pinged A"
     else
         fail "Container B failed to ping A"
