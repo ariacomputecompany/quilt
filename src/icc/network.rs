@@ -467,27 +467,61 @@ impl NetworkManager {
         self.verify_container_network_ready(config, container_pid)?;
         
         // Write DNS configuration to container
-        // Use nsenter to write resolv.conf inside the container's mount namespace
+        // SECURITY CRITICAL: This nsenter command MUST NOT run if namespace entry fails
+        // If nsenter fails, the shell command would execute on the HOST and corrupt host DNS
         let dns_content = format!("nameserver {}\nsearch quilt.local\n", self.config.bridge_ip);
+        
+        // First validate the container PID exists and is accessible
+        if !self.validate_container_namespace(container_pid) {
+            ConsoleLogger::warning(&format!("⚠️ [SECURITY] Container PID {} namespace validation failed - skipping unsafe DNS operation", container_pid));
+            return self.configure_dns_safe_fallback(config, &dns_content);
+        }
+        
         let write_resolv_cmd = format!(
-            "nsenter -t {} -m -p -- sh -c 'mkdir -p /etc && echo \"{}\" > /etc/resolv.conf'",
+            "nsenter -t {} -m -p -- sh -c 'mkdir -p /etc && rm -f /etc/resolv.conf && echo \"{}\" > /etc/resolv.conf && ls -la /etc/resolv.conf'",
             container_pid, dns_content
         );
         
+        let mut dns_written = false;
         match CommandExecutor::execute_shell(&write_resolv_cmd) {
-            Ok(_) => {
-                ConsoleLogger::debug("DNS configuration written to container's /etc/resolv.conf");
-            }
-            Err(e) => {
-                ConsoleLogger::warning(&format!("Failed to write DNS configuration: {}", e));
-                // Try alternative method if rootfs_path is available
-                if let Some(rootfs_path) = &config.rootfs_path {
-                    let resolv_conf_path = format!("{}/etc/resolv.conf", rootfs_path);
-                    if let Err(e) = std::fs::write(&resolv_conf_path, &dns_content) {
-                        ConsoleLogger::warning(&format!("Alternative DNS write also failed: {}", e));
+            Ok(result) => {
+                if result.success {
+                    // Additional verification that we actually wrote to container's resolv.conf
+                    if self.verify_dns_container_isolation(container_pid, &dns_content) {
+                        ConsoleLogger::debug(&format!("✅ DNS configuration written to container's /etc/resolv.conf: {}", result.stdout.trim()));
+                        dns_written = true;
+                    } else {
+                        ConsoleLogger::error("🚨 [SECURITY] DNS write may have affected host - using safe fallback");
+                        dns_written = false;
                     }
+                } else {
+                    ConsoleLogger::warning(&format!("DNS write command failed: {}", result.stderr));
                 }
             }
+            Err(e) => {
+                ConsoleLogger::warning(&format!("Failed to execute DNS write command: {}", e));
+            }
+        }
+        
+        // Try alternative method if primary method failed
+        if !dns_written {
+            return self.configure_dns_safe_fallback(config, &dns_content);
+        }
+        
+        // Verify DNS configuration was written
+        if dns_written {
+            // Verify the file exists and is readable from inside container
+            let verify_cmd = format!("nsenter -t {} -m -p -- cat /etc/resolv.conf", container_pid);
+            match CommandExecutor::execute_shell(&verify_cmd) {
+                Ok(result) if result.success => {
+                    ConsoleLogger::debug(&format!("✅ DNS configuration verified in container: {}", result.stdout.trim()));
+                }
+                _ => {
+                    ConsoleLogger::warning("DNS configuration may not be accessible from inside container");
+                }
+            }
+        } else {
+            ConsoleLogger::error("❌ Failed to write DNS configuration - containers may not be able to resolve names");
         }
         
         ConsoleLogger::success(&format!("Ultra-batched network setup completed: {} = {}/{}", interface_name, config.ip_address, config.subnet_mask));
@@ -2050,6 +2084,94 @@ impl NetworkManager {
                 return Err(format!("Failed to execute MAC lookup command for {} in container {}: {}", 
                     interface_name, container_pid, e));
             }
+        }
+    }
+
+    /// SECURITY CRITICAL: Validate that container namespace exists and is accessible
+    /// This prevents nsenter commands from falling back to host execution
+    fn validate_container_namespace(&self, container_pid: i32) -> bool {
+        // Check if PID exists and is a valid container process
+        let pid_check = format!("test -d /proc/{} && cat /proc/{}/comm | grep -q quilt", container_pid, container_pid);
+        if let Ok(result) = CommandExecutor::execute_shell(&pid_check) {
+            if !result.success {
+                ConsoleLogger::warning(&format!("🚨 [SECURITY] Container PID {} validation failed - process not found or invalid", container_pid));
+                return false;
+            }
+        } else {
+            ConsoleLogger::warning(&format!("🚨 [SECURITY] Container PID {} validation check failed", container_pid));
+            return false;
+        }
+
+        // Test namespace entry without dangerous operations
+        let ns_test = format!("nsenter -t {} -m -p -- echo 'namespace_test_ok'", container_pid);
+        match CommandExecutor::execute_shell(&ns_test) {
+            Ok(result) => {
+                if result.success && result.stdout.trim() == "namespace_test_ok" {
+                    return true;
+                } else {
+                    ConsoleLogger::warning(&format!("🚨 [SECURITY] Namespace entry test failed for PID {}: {}", container_pid, result.stderr));
+                    return false;
+                }
+            }
+            Err(e) => {
+                ConsoleLogger::warning(&format!("🚨 [SECURITY] Failed to test namespace entry for PID {}: {}", container_pid, e));
+                return false;
+            }
+        }
+    }
+
+    /// SECURITY CRITICAL: Verify DNS changes only affected container, not host
+    fn verify_dns_container_isolation(&self, container_pid: i32, expected_content: &str) -> bool {
+        // Check host DNS was not modified
+        if let Ok(host_resolv) = std::fs::read_to_string("/etc/resolv.conf") {
+            if host_resolv.contains(&self.config.bridge_ip.to_string()) {
+                ConsoleLogger::error("🚨 [SECURITY BREACH] Host /etc/resolv.conf was modified by container DNS operation!");
+                return false;
+            }
+        }
+
+        // Verify container DNS contains expected content
+        let verify_cmd = format!("nsenter -t {} -m -p -- cat /etc/resolv.conf", container_pid);
+        if let Ok(result) = CommandExecutor::execute_shell(&verify_cmd) {
+            if result.success && result.stdout.contains(&self.config.bridge_ip.to_string()) {
+                return true;
+            }
+        }
+        
+        ConsoleLogger::warning(&format!("🚨 [SECURITY] Could not verify container DNS isolation for PID {}", container_pid));
+        false
+    }
+
+    /// Safe fallback DNS configuration using filesystem operations within container rootfs
+    fn configure_dns_safe_fallback(&self, config: &ContainerNetworkConfig, dns_content: &str) -> Result<(), String> {
+        ConsoleLogger::debug("Using safe DNS configuration fallback method...");
+        if let Some(rootfs_path) = &config.rootfs_path {
+            // Validate rootfs path is within expected container directory
+            if !rootfs_path.starts_with("/tmp/quilt-containers/") {
+                return Err(format!("🚨 [SECURITY] Unsafe rootfs path: {}", rootfs_path));
+            }
+
+            // Ensure /etc directory exists
+            let etc_path = format!("{}/etc", rootfs_path);
+            if let Err(e) = std::fs::create_dir_all(&etc_path) {
+                return Err(format!("Failed to create /etc directory: {}", e));
+            }
+            
+            let resolv_conf_path = format!("{}/etc/resolv.conf", rootfs_path);
+            // Remove any existing file/symlink first
+            let _ = std::fs::remove_file(&resolv_conf_path);
+            
+            match std::fs::write(&resolv_conf_path, dns_content) {
+                Ok(_) => {
+                    ConsoleLogger::debug(&format!("✅ DNS configuration written via safe fallback method: {}", resolv_conf_path));
+                    Ok(())
+                }
+                Err(e) => {
+                    Err(format!("Safe DNS fallback also failed: {}", e))
+                }
+            }
+        } else {
+            Err("No rootfs path available for safe DNS fallback".to_string())
         }
     }
 } 

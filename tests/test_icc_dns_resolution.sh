@@ -87,30 +87,35 @@ wait_for_ip() {
     return 1
 }
 
-# Wait for container to reach Running state
+# Wait for container to reach Running state - using proven logic from working tests
 wait_for_running() {
     local container_id="$1"
-    local max_wait=100
-    local count=0
+    local max_iterations=20
     
-    while [ $count -lt $max_wait ]; do
+    debug "Waiting for container $container_id to reach RUNNING state..."
+    
+    for i in $(seq 1 $max_iterations); do
         local status_output=$(./target/debug/cli status "$container_id" 2>&1)
+        local status=$(echo "$status_output" | grep "Status:" | awk '{print $2}')
+        
+        debug "Status check $i/20: $status"
         
         if echo "$status_output" | grep -q "Status: RUNNING"; then
+            debug "Container $container_id reached RUNNING state on attempt $i"
             return 0
-        fi
-        
-        if echo "$status_output" | grep -q "Status: FAILED"; then
-            echo "Container $container_id is in FAILED state!"
+        elif echo "$status_output" | grep -q "Status: FAILED"; then
+            echo "Container $container_id is in FAILED state on attempt $i!"
+            echo "Full status output:"
             echo "$status_output"
             return 1
         fi
         
-        sleep 0.5
-        count=$((count + 1))
+        sleep 1
     done
     
-    echo "Container $container_id did not reach RUNNING state"
+    echo "Container $container_id did not reach RUNNING state after $max_iterations attempts"
+    echo "Final status output:"
+    ./target/debug/cli status "$container_id" 2>&1
     return 1
 }
 
@@ -194,9 +199,13 @@ CONTAINER_A=$(echo "$CREATE_A" | grep "Container ID:" | tail -1 | awk '{print $N
 
 if [ -z "$CONTAINER_A" ]; then
     fail "Failed to create container A" "$CREATE_A"
+    debug "Full create output: $CREATE_A"
     exit 1
 fi
 success "Created container A: $CONTAINER_A"
+
+# Brief delay to avoid race conditions
+sleep 0.5
 
 info "Creating container B..."
 CREATE_B=$(./target/debug/cli create --image-path "$TEST_IMAGE" --enable-network-namespace -- sleep 3600 2>&1)
@@ -204,6 +213,7 @@ CONTAINER_B=$(echo "$CREATE_B" | grep "Container ID:" | tail -1 | awk '{print $N
 
 if [ -z "$CONTAINER_B" ]; then
     fail "Failed to create container B" "$CREATE_B"
+    debug "Full create output: $CREATE_B"
     exit 1
 fi
 success "Created container B: $CONTAINER_B"
@@ -211,11 +221,23 @@ success "Created container B: $CONTAINER_B"
 echo -e "\n${BLUE}=== Test 3: Wait for Containers ===${NC}"
 info "Waiting for containers to start..."
 if ! wait_for_running "$CONTAINER_A"; then
-    fail "Container A failed to start" "Check server logs"
+    fail "Container A failed to start" "Check server logs and container status below"
+    echo "=== Container A Status ==="
+    ./target/debug/cli status "$CONTAINER_A" 2>&1 || echo "Status command failed"
+    echo "=== Recent Server Log ==="
+    tail -20 server.log
+    echo "========================="
     exit 1
 fi
 if ! wait_for_running "$CONTAINER_B"; then
-    fail "Container B failed to start" "Check server logs"
+    fail "Container B failed to start" "Check server logs and container status below"
+    echo "=== Container B Status ==="
+    ./target/debug/cli status "$CONTAINER_B" 2>&1 || echo "Status command failed"
+    echo "=== Container A Status (for comparison) ==="
+    ./target/debug/cli status "$CONTAINER_A" 2>&1 || echo "Status command failed"
+    echo "=== Recent Server Log ==="
+    tail -30 server.log
+    echo "========================="
     exit 1
 fi
 success "Both containers are running"

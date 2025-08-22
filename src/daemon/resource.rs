@@ -106,6 +106,7 @@ impl ResourceManager {
 
         // Clean up container side veth if container is still running
         if let Some(pid) = container_pid {
+            // SECURITY NOTE: Safe cleanup operation - only deletes interface, with || true fallback
             let cleanup_container_veth = format!("nsenter -t {} -n ip link delete {} 2>/dev/null || true", pid.as_raw(), network_config.veth_container_name);
             if let Err(e) = CommandExecutor::execute_shell(&cleanup_container_veth) {
                 ConsoleLogger::debug(&format!("Container veth cleanup attempt failed (expected if container exited): {}", e));

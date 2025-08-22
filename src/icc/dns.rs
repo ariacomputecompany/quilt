@@ -40,6 +40,8 @@ impl DnsServer {
         let ip = ip_address.parse::<IpAddr>()
             .map_err(|e| format!("Invalid IP address {}: {}", ip_address, e))?;
         
+        ConsoleLogger::debug(&format!("🔧 [DNS-REG] Registering container DNS: id={}, name={}, ip={}", container_id, container_name, ip_address));
+        
         let entry = DnsEntry {
             container_id: container_id.to_string(),
             container_name: container_name.to_string(),
@@ -56,7 +58,14 @@ impl DnsServer {
         
         // Also register with domain suffix
         let fqdn = format!("{}.{}", container_name, self.domain_suffix);
-        entries.insert(fqdn, entry);
+        entries.insert(fqdn, entry.clone());
+        
+        ConsoleLogger::success(&format!("✅ [DNS-REG] DNS registration complete: {} entries now registered", entries.len()));
+        
+        // Debug: List all registered entries
+        for (name, entry) in entries.iter() {
+            ConsoleLogger::debug(&format!("📋 [DNS-REG] Entry: {} -> {} ({})", name, entry.ip_address, entry.container_id));
+        }
         
         ConsoleLogger::info(&format!("DNS: Registered {} ({}) -> {}", 
             container_name, container_id, ip_address));
@@ -101,14 +110,22 @@ impl DnsServer {
                     Ok((len, src)) => {
                         match Message::from_vec(&buf[..len]) {
                             Ok(query) => {
+                                ConsoleLogger::debug(&format!("🔍 [DNS-QUERY] Received DNS query from {}: {} queries", src, query.query_count()));
+                                for q in query.queries() {
+                                    ConsoleLogger::debug(&format!("🔍 [DNS-QUERY] Query: {} (type: {:?})", q.name(), q.query_type()));
+                                }
+                                
                                 if let Ok(response) = Self::handle_query(query, &entries, &domain_suffix) {
+                                    ConsoleLogger::debug(&format!("📤 [DNS-RESPONSE] Sending response with {} answers", response.answer_count()));
                                     if let Ok(response_bytes) = response.to_vec() {
                                         let _ = socket.send_to(&response_bytes, src).await;
                                     }
+                                } else {
+                                    ConsoleLogger::warning(&format!("❌ [DNS-QUERY] Failed to handle query from {}", src));
                                 }
                             }
                             Err(e) => {
-                                ConsoleLogger::debug(&format!("DNS: Failed to parse query: {}", e));
+                                ConsoleLogger::debug(&format!("❌ [DNS-PARSE] Failed to parse query: {}", e));
                             }
                         }
                     }
