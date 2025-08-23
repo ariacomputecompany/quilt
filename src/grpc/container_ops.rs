@@ -287,121 +287,55 @@ pub async fn start_container_process(
                     ConsoleLogger::debug(&format!("⏱️ [STARTUP-PID] PID handling completed for {} in {:?}", 
                         container_id, pid_start.elapsed()));
                     
-                    // Step 10: Network setup (if needed)
+                    // Step 10: Schedule background network setup (if needed) - NON-BLOCKING
                     if needs_network_setup {
-                        let network_start = std::time::Instant::now();
-                        ConsoleLogger::info(&format!("🌐 [STARTUP-NET] Setting up network for container {} (PID: {})", 
+                        ConsoleLogger::info(&format!("🌐 [STARTUP-NET] Scheduling background network setup for container {} (PID: {})", 
                             container_id, pid.as_raw()));
-                        // Get network allocation from sync engine
-                        ConsoleLogger::debug(&format!("📡 [STARTUP-NET] Retrieving network allocation for {}", container_id));
-                        let network_alloc = sync_engine.get_network_allocation(container_id).await
-                            .map_err(|e| {
-                                ConsoleLogger::error(&format!("❌ [STARTUP-NET] Failed to get network allocation for {}: {}", container_id, e));
-                                format!("Failed to get network allocation: {}", e)
-                            })?;
                         
-                        ConsoleLogger::debug(&format!("🌐 [STARTUP-NET] Network allocation for {}: IP={}", 
-                            container_id, network_alloc.ip_address));
-                        
-                        // Get rootfs path for DNS configuration
-                        ConsoleLogger::debug(&format!("📁 [STARTUP-NET] Getting rootfs path for DNS config for {}", container_id));
-                        let rootfs_path = if let Ok(status) = sync_engine.get_container_status(container_id).await {
-                            ConsoleLogger::debug(&format!("📁 [STARTUP-NET] Got rootfs path for {}: {:?}", container_id, status.rootfs_path));
-                            status.rootfs_path
-                        } else {
-                            ConsoleLogger::warning(&format!("⚠️ [STARTUP-NET] Could not get rootfs path for {}", container_id));
-                            None
-                        };
-                        
-                        // Create ContainerNetworkConfig for ICC network manager using sync engine's allocation
-                        let veth_host_name = format!("veth-{}", &container_id[..8]);
-                        let veth_container_name = format!("vethc-{}", &container_id[..8]);
-                        
-                        ConsoleLogger::debug(&format!("🔗 [STARTUP-NET] Creating network config for {}: veth_host={}, veth_container={}", 
-                            container_id, veth_host_name, veth_container_name));
-                        
-                        let icc_network_config = icc::network::ContainerNetworkConfig {
-                            ip_address: network_alloc.ip_address.clone(),
-                            subnet_mask: "16".to_string(),
-                            gateway_ip: "10.42.0.1".to_string(),
-                            container_id: container_id.to_string(),
-                            veth_host_name: veth_host_name.clone(),
-                            veth_container_name: veth_container_name.clone(),
-                            rootfs_path,
-                        };
-                        
-                        ConsoleLogger::debug(&format!("📋 [STARTUP-NET] Network config created for {}: IP={}, gateway=10.42.0.1, subnet=/16", 
-                            container_id, network_alloc.ip_address));
-                        
-                        // Create network ready signal BEFORE starting network setup 
-                        // This prevents container from timing out while we set up the network
-                        let network_ready_path_in_container = format!("{}/tmp/quilt-network-ready-{}", actual_rootfs_path, container_id);
-                        ConsoleLogger::debug(&format!("📝 [STARTUP-NET] Creating network ready signal for {} at {}", 
-                            container_id, network_ready_path_in_container));
-                            
-                        std::fs::write(&network_ready_path_in_container, "ready")
-                            .map_err(|e| {
-                                ConsoleLogger::error(&format!("❌ [STARTUP-NET] Failed to create network ready signal for {}: {}", container_id, e));
-                                format!("Failed to create network ready signal: {}", e)
-                            })?;
-                        ConsoleLogger::debug(&format!("✅ [STARTUP-NET] Created network ready signal at {}", network_ready_path_in_container));
+                        // Clone necessary data for background task
+                        let bg_container_id = container_id.to_string();
+                        let bg_sync_engine = sync_engine.clone();
+                        let bg_network_manager = Arc::clone(&network_manager);
+                        let bg_pid = pid.as_raw();
+                        let bg_actual_rootfs_path = actual_rootfs_path.clone();
                         
                         // Emit network setup started event
                         crate::emit_network_setup_started!(container_id);
                         
-                        // Now setup container network using ICC network manager (lock-free)
-                        ConsoleLogger::debug(&format!("🔧 [STARTUP-NET] Setting up container network for {} (PID: {})", 
-                            container_id, pid.as_raw()));
-                        let network_setup_result = network_manager.setup_container_network(&icc_network_config, pid.as_raw());
-                        
-                        // Check if network setup succeeded
-                        network_setup_result.map_err(|e| {
-                            ConsoleLogger::error(&format!("❌ [STARTUP-NET] Network setup failed for {}: {}", container_id, e));
+                        // Launch network setup in background task - PARALLEL EXECUTION
+                        ConsoleLogger::debug(&format!("🚀 [STARTUP-NET] Spawning background network setup task for {}", container_id));
+                        tokio::spawn(async move {
+                            let network_start = std::time::Instant::now();
+                            ConsoleLogger::info(&format!("📡 [BACKGROUND-NET] Starting background network setup for {} (PID: {})", 
+                                bg_container_id, bg_pid));
                             
-                            // Emit network setup failed event
-                            crate::emit_network_setup_failed!(container_id, &e);
+                            // Background network setup - this runs in parallel with other containers
+                            let setup_result: Result<crate::sync::network::NetworkAllocation, String> = setup_container_network_async(
+                                &bg_sync_engine,
+                                &bg_network_manager, 
+                                &bg_container_id,
+                                bg_pid,
+                                &bg_actual_rootfs_path
+                            ).await;
                             
-                            e
-                        })?;
+                            match setup_result {
+                                Ok(network_alloc) => {
+                                    ConsoleLogger::success(&format!("🎉 [BACKGROUND-NET] Background network setup completed for {} with IP {} in {:?}", 
+                                        bg_container_id, network_alloc.ip_address, network_start.elapsed()));
+                                    
+                                    // Emit network setup completed event
+                                    crate::emit_network_setup_completed!(bg_container_id, &network_alloc.ip_address);
+                                }
+                                Err(e) => {
+                                    ConsoleLogger::error(&format!("❌ [BACKGROUND-NET] Background network setup failed for {}: {}", bg_container_id, e));
+                                    
+                                    // Emit network setup failed event
+                                    crate::emit_network_setup_failed!(bg_container_id, &e);
+                                }
+                            }
+                        });
                         
-                        ConsoleLogger::success(&format!("✅ [STARTUP-NET] Container network setup succeeded for {}", container_id));
-                        
-                        // Emit network setup completed event
-                        crate::emit_network_setup_completed!(container_id, &network_alloc.ip_address);
-                        
-                        // Mark network setup complete in sync engine
-                        ConsoleLogger::debug(&format!("📝 [STARTUP-NET] Marking network setup complete in sync engine for {}", container_id));
-                        sync_engine.mark_network_setup_complete(
-                            container_id,
-                            "quilt0",
-                            &veth_host_name,
-                            &veth_container_name
-                        ).await
-                            .map_err(|e| {
-                                ConsoleLogger::error(&format!("❌ [STARTUP-NET] Failed to mark network setup complete for {}: {}", container_id, e));
-                                format!("Failed to mark network setup complete: {}", e)
-                            })?;
-                        
-                        // Register container with DNS
-                        ConsoleLogger::debug(&format!("🌐 [STARTUP-NET] Registering DNS for {}", container_id));
-                        let container_name = if let Ok(status) = sync_engine.get_container_status(container_id).await {
-                            status.name.unwrap_or_else(|| container_id.to_string())
-                        } else {
-                            container_id.to_string()
-                        };
-                        
-                        ConsoleLogger::debug(&format!("🌐 [STARTUP-NET] DNS name for {}: {}", container_id, container_name));
-                        
-                        {
-                            network_manager.register_container_dns(container_id, &container_name, &network_alloc.ip_address)
-                                .map_err(|e| {
-                                    ConsoleLogger::error(&format!("❌ [STARTUP-NET] DNS registration failed for {}: {}", container_id, e));
-                                    e
-                                })?;
-                        }
-                        
-                        ConsoleLogger::success(&format!("✅ [STARTUP-NET] Network setup complete for container {} with IP {} in {:?}", 
-                            container_id, network_alloc.ip_address, network_start.elapsed()));
+                        ConsoleLogger::success(&format!("✅ [STARTUP-NET] Background network setup scheduled for {} - container startup continues", container_id));
                     }
                 } else {
                     ConsoleLogger::error(&format!("❌ [STARTUP-PID] Container {} started but has no PID!", container_id));
@@ -452,4 +386,114 @@ pub async fn start_container_process(
             Err(format!("Failed to start container: {}", e))
         }
     }
+}
+
+/// Background async network setup function for parallel container networking
+/// This function handles all network setup operations in the background without blocking container startup
+async fn setup_container_network_async(
+    sync_engine: &SyncEngine,
+    network_manager: &Arc<icc::network::NetworkManager>,
+    container_id: &str,
+    container_pid: i32,
+    actual_rootfs_path: &str,
+) -> Result<crate::sync::network::NetworkAllocation, String> {
+    ConsoleLogger::debug(&format!("📡 [ASYNC-NET] Retrieving network allocation for {}", container_id));
+    
+    // Get network allocation from sync engine
+    let network_alloc = sync_engine.get_network_allocation(container_id).await
+        .map_err(|e| {
+            ConsoleLogger::error(&format!("❌ [ASYNC-NET] Failed to get network allocation for {}: {}", container_id, e));
+            format!("Failed to get network allocation: {}", e)
+        })?;
+    
+    ConsoleLogger::debug(&format!("🌐 [ASYNC-NET] Network allocation for {}: IP={}", 
+        container_id, network_alloc.ip_address));
+    
+    // Get rootfs path for DNS configuration
+    ConsoleLogger::debug(&format!("📁 [ASYNC-NET] Getting rootfs path for DNS config for {}", container_id));
+    let rootfs_path = if let Ok(status) = sync_engine.get_container_status(container_id).await {
+        ConsoleLogger::debug(&format!("📁 [ASYNC-NET] Got rootfs path for {}: {:?}", container_id, status.rootfs_path));
+        status.rootfs_path
+    } else {
+        ConsoleLogger::warning(&format!("⚠️ [ASYNC-NET] Could not get rootfs path for {}", container_id));
+        None
+    };
+    
+    // Create ContainerNetworkConfig for ICC network manager
+    let veth_host_name = format!("veth-{}", &container_id[..8]);
+    let veth_container_name = format!("vethc-{}", &container_id[..8]);
+    
+    ConsoleLogger::debug(&format!("🔗 [ASYNC-NET] Creating network config for {}: veth_host={}, veth_container={}", 
+        container_id, veth_host_name, veth_container_name));
+    
+    let icc_network_config = icc::network::ContainerNetworkConfig {
+        ip_address: network_alloc.ip_address.clone(),
+        subnet_mask: "16".to_string(),
+        gateway_ip: "10.42.0.1".to_string(),
+        container_id: container_id.to_string(),
+        veth_host_name: veth_host_name.clone(),
+        veth_container_name: veth_container_name.clone(),
+        rootfs_path,
+    };
+    
+    ConsoleLogger::debug(&format!("📋 [ASYNC-NET] Network config created for {}: IP={}, gateway=10.42.0.1, subnet=/16", 
+        container_id, network_alloc.ip_address));
+    
+    // Create network ready signal BEFORE starting network setup 
+    // This prevents container from timing out while we set up the network
+    let network_ready_path_in_container = format!("{}/tmp/quilt-network-ready-{}", actual_rootfs_path, container_id);
+    ConsoleLogger::debug(&format!("📝 [ASYNC-NET] Creating network ready signal for {} at {}", 
+        container_id, network_ready_path_in_container));
+        
+    std::fs::write(&network_ready_path_in_container, "ready")
+        .map_err(|e| {
+            ConsoleLogger::error(&format!("❌ [ASYNC-NET] Failed to create network ready signal for {}: {}", container_id, e));
+            format!("Failed to create network ready signal: {}", e)
+        })?;
+    ConsoleLogger::debug(&format!("✅ [ASYNC-NET] Created network ready signal at {}", network_ready_path_in_container));
+    
+    // Setup container network using ICC network manager (lock-free, parallel-safe)
+    ConsoleLogger::debug(&format!("🔧 [ASYNC-NET] Setting up container network for {} (PID: {})", 
+        container_id, container_pid));
+    network_manager.setup_container_network(&icc_network_config, container_pid)
+        .map_err(|e| {
+            ConsoleLogger::error(&format!("❌ [ASYNC-NET] Network setup failed for {}: {}", container_id, e));
+            e
+        })?;
+    
+    ConsoleLogger::success(&format!("✅ [ASYNC-NET] Container network setup succeeded for {}", container_id));
+    
+    // Mark network setup complete in sync engine
+    ConsoleLogger::debug(&format!("📝 [ASYNC-NET] Marking network setup complete in sync engine for {}", container_id));
+    sync_engine.mark_network_setup_complete(
+        container_id,
+        "quilt0",
+        &veth_host_name,
+        &veth_container_name
+    ).await
+        .map_err(|e| {
+            ConsoleLogger::error(&format!("❌ [ASYNC-NET] Failed to mark network setup complete for {}: {}", container_id, e));
+            format!("Failed to mark network setup complete: {}", e)
+        })?;
+    
+    // Register container with DNS
+    ConsoleLogger::debug(&format!("🌐 [ASYNC-NET] Registering DNS for {}", container_id));
+    let container_name = if let Ok(status) = sync_engine.get_container_status(container_id).await {
+        status.name.unwrap_or_else(|| container_id.to_string())
+    } else {
+        container_id.to_string()
+    };
+    
+    ConsoleLogger::debug(&format!("🌐 [ASYNC-NET] DNS name for {}: {}", container_id, container_name));
+    
+    network_manager.register_container_dns(container_id, &container_name, &network_alloc.ip_address)
+        .map_err(|e| {
+            ConsoleLogger::error(&format!("❌ [ASYNC-NET] DNS registration failed for {}: {}", container_id, e));
+            e
+        })?;
+    
+    ConsoleLogger::success(&format!("🎉 [ASYNC-NET] All network setup operations complete for {} with IP {}", 
+        container_id, network_alloc.ip_address));
+    
+    Ok(network_alloc)
 }

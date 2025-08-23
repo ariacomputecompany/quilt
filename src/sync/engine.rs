@@ -25,6 +25,20 @@ pub struct SyncEngine {
     background_tasks: Arc<RwLock<Vec<tokio::task::JoinHandle<()>>>>,
 }
 
+impl Clone for SyncEngine {
+    fn clone(&self) -> Self {
+        Self {
+            connection_manager: Arc::clone(&self.connection_manager),
+            container_manager: Arc::clone(&self.container_manager),
+            network_manager: Arc::clone(&self.network_manager),
+            volume_manager: Arc::clone(&self.volume_manager),
+            monitor_service: Arc::clone(&self.monitor_service),
+            cleanup_service: Arc::clone(&self.cleanup_service),
+            background_tasks: Arc::clone(&self.background_tasks),
+        }
+    }
+}
+
 impl SyncEngine {
     /// Create a new sync engine with the given database path
     pub async fn new(database_path: &str) -> SyncResult<Self> {
