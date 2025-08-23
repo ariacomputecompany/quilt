@@ -1,3 +1,5 @@
+#![deny(warnings)]
+
 use clap::{Parser, Subcommand};
 use std::collections::HashMap;
 use std::time::Duration;
@@ -23,7 +25,7 @@ use quilt::{
     ExecContainerRequest, ExecContainerResponse,
     StartContainerRequest, StartContainerResponse,
     KillContainerRequest, KillContainerResponse,
-    GetContainerByNameRequest, GetContainerByNameResponse,
+    GetContainerByNameRequest,
     ContainerStatus, Mount, MountType,
 };
 

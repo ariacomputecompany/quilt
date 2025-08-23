@@ -1,6 +1,8 @@
 // src/icc/network.rs
 // Optimized Inter-Container Communication using Linux Bridge
 
+//#![deny(warnings)] // Temporarily disabled during implementation
+
 use crate::utils::{CommandExecutor, ConsoleLogger};
 use crate::icc::dns::{DnsServer, DnsEntry};
 use std::sync::Arc;

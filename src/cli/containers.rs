@@ -1,7 +1,7 @@
 // src/cli/containers.rs
 // Container management CLI commands
 
-use clap::{Parser, Subcommand};
+use clap::Subcommand;
 use std::collections::HashMap;
 use tonic::transport::Channel;
 

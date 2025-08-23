@@ -1,6 +1,8 @@
 // src/icc/dns.rs
 // DNS server for container name resolution
 
+//#![deny(warnings)] // Temporarily disabled during implementation
+
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, RwLock};

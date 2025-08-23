@@ -1,10 +1,11 @@
+#![deny(warnings)]
+
 mod daemon;
 mod utils;
 mod icc;
 mod sync;
 mod grpc;
 
-use daemon::{ContainerConfig, CgroupLimits, NamespaceConfig};
 use utils::console::ConsoleLogger;
 use sync::{SyncEngine, ContainerState, MountType};
 use grpc::start_container_process;
@@ -15,6 +16,7 @@ use std::time::Duration;
 use tonic::{transport::Server, Request, Response, Status};
 use uuid::Uuid;
 use sqlx::Row;
+use nix::errno::Errno;
 
 // Include the generated protobuf code
 pub mod quilt {
@@ -341,7 +343,6 @@ impl QuiltService for QuiltServiceImpl {
                     // Use nix to send signal
                     use nix::sys::signal::{kill, Signal};
                     use nix::unistd::Pid;
-                    use nix::errno::Errno;
                     
                     match kill(Pid::from_raw(pid as i32), Some(Signal::SIGTERM)) {
                         Ok(()) => {

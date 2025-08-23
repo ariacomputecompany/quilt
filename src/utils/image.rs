@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Condvar};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::fs;
 use std::time::{Duration, Instant};
 use flate2::read::GzDecoder;
