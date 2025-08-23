@@ -27,7 +27,7 @@ echo "🐛 Test 1: Status Conversion Bug Fix"
 echo "Creating container A..."
 CONTAINER_A=$(cargo run --bin cli create \
     --image-path ./nixos-minimal.tar.gz \
-    --enable-network-namespace \
+    --enable-all-namespaces --async-mode \
     -- sh -c "echo 'Container A ready'; sleep 300" | grep "Container ID:" | cut -d' ' -f4)
 
 if [ -z "$CONTAINER_A" ]; then
@@ -60,7 +60,7 @@ echo "🔒 Test 2: gRPC Deadlock Fix"
 echo "Creating container B..."
 CONTAINER_B=$(cargo run --bin cli create \
     --image-path ./nixos-minimal.tar.gz \
-    --enable-network-namespace \
+    --enable-all-namespaces --async-mode \
     -- sh -c "echo 'Container B ready'; sleep 300" | grep "Container ID:" | cut -d' ' -f4)
 
 if [ -z "$CONTAINER_B" ]; then

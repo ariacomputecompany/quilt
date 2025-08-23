@@ -216,7 +216,7 @@ success "Bridge has valid MAC address: $BRIDGE_MAC"
 
 echo -e "\n${BLUE}=== Test 2: Container Creation and MAC Verification ===${NC}"
 info "Creating container with network namespace..."
-CREATE_OUTPUT=$(./target/debug/cli create --image-path "$TEST_IMAGE" --enable-network-namespace -- sleep 3600 2>&1)
+CREATE_OUTPUT=$(./target/debug/cli create --image-path "$TEST_IMAGE" --enable-all-namespaces --async-mode -- sleep 3600 2>&1)
 CONTAINER_ID=$(echo "$CREATE_OUTPUT" | grep "Container ID:" | tail -1 | awk '{print $NF}')
 
 if [ -z "$CONTAINER_ID" ]; then

@@ -373,7 +373,7 @@ info "Creating test containers..."
 
 # Create container A with detailed error checking
 debug "Creating container A with command: sleep 3600"
-CREATE_OUTPUT_A=$(./target/debug/cli create --image-path "$TEST_IMAGE" --enable-network-namespace -- sleep 3600 2>&1)
+CREATE_OUTPUT_A=$(./target/debug/cli create --image-path "$TEST_IMAGE" --enable-all-namespaces --async-mode -- sleep 3600 2>&1)
 CREATE_RESULT_A=$?
 debug "Container A creation exit code: $CREATE_RESULT_A"
 debug "Container A creation output: $CREATE_OUTPUT_A"
@@ -395,7 +395,7 @@ debug "Container A initial status: $STATUS_A"
 
 # Create container B with detailed error checking  
 debug "Creating container B with command: sleep 3600"
-CREATE_OUTPUT_B=$(./target/debug/cli create --image-path "$TEST_IMAGE" --enable-network-namespace -- sleep 3600 2>&1)
+CREATE_OUTPUT_B=$(./target/debug/cli create --image-path "$TEST_IMAGE" --enable-all-namespaces --async-mode -- sleep 3600 2>&1)
 CREATE_RESULT_B=$?
 debug "Container B creation exit code: $CREATE_RESULT_B"
 debug "Container B creation output: $CREATE_OUTPUT_B"
@@ -515,7 +515,7 @@ echo -e "\n${BLUE}=== TEST 5: ICC Exec Command ===${NC}"
 
 # Create a container with CLI binary
 info "Creating container with CLI binary for ICC exec tests..."
-CONTAINER_C=$(./target/debug/cli create --image-path "$DEV_IMAGE" --enable-network-namespace --setup "copy:./target/debug/cli:/usr/bin/quilt-cli" -- sleep 3600 2>&1 | grep "Container ID:" | tail -1 | awk '{print $NF}')
+CONTAINER_C=$(./target/debug/cli create --image-path "$DEV_IMAGE" --enable-all-namespaces --async-mode --setup "copy:./target/debug/cli:/usr/bin/quilt-cli" -- sleep 3600 2>&1 | grep "Container ID:" | tail -1 | awk '{print $NF}')
 
 if [ -z "$CONTAINER_C" ]; then
     fail "Failed to create container C" "Check server logs"
@@ -541,8 +541,8 @@ else
         "Should pass environment variables"
     
     run_test "ICC exec create nested container" \
-        "./target/debug/cli icc exec $CONTAINER_C -- /usr/bin/quilt-cli create --image-path /nixos-minimal.tar.gz --enable-network-namespace -- echo 'Nested container'" \
-        "./target/debug/cli icc exec $CONTAINER_C -- /usr/bin/quilt-cli create --image-path /nixos-minimal.tar.gz --enable-network-namespace -- echo 'Nested' | grep -q 'Container ID:'" \
+        "./target/debug/cli icc exec $CONTAINER_C -- /usr/bin/quilt-cli create --image-path /nixos-minimal.tar.gz --enable-all-namespaces --async-mode -- echo 'Nested container'" \
+        "./target/debug/cli icc exec $CONTAINER_C -- /usr/bin/quilt-cli create --image-path /nixos-minimal.tar.gz --enable-all-namespaces --async-mode -- echo 'Nested' | grep -q 'Container ID:'" \
         "Should create nested container via ICC"
 fi
 
@@ -552,7 +552,7 @@ echo -e "\n${BLUE}=== TEST 6: Network Stress Test ===${NC}"
 info "Creating multiple containers for stress test..."
 STRESS_CONTAINERS=()
 for i in {1..5}; do
-    container_id=$(./target/debug/cli create --image-path "$TEST_IMAGE" --enable-network-namespace -- sleep 120 2>&1 | grep "Container ID:" | tail -1 | awk '{print $NF}')
+    container_id=$(./target/debug/cli create --image-path "$TEST_IMAGE" --enable-all-namespaces --async-mode -- sleep 120 2>&1 | grep "Container ID:" | tail -1 | awk '{print $NF}')
     if [ ! -z "$container_id" ]; then
         STRESS_CONTAINERS+=("$container_id")
         debug "Created stress container $i: $container_id"
@@ -651,7 +651,7 @@ run_test "DNS lookup for non-existent name" \
 echo -e "\n${BLUE}=== TEST 9: Container Lifecycle and DNS ===${NC}"
 
 info "Creating container for lifecycle test..."
-LIFECYCLE_CONTAINER=$(./target/debug/cli create --image-path "$TEST_IMAGE" --enable-network-namespace -- sleep 60 2>&1 | grep "Container ID:" | tail -1 | awk '{print $NF}')
+LIFECYCLE_CONTAINER=$(./target/debug/cli create --image-path "$TEST_IMAGE" --enable-all-namespaces --async-mode -- sleep 60 2>&1 | grep "Container ID:" | tail -1 | awk '{print $NF}')
 LIFECYCLE_IP=$(wait_for_ip "$LIFECYCLE_CONTAINER")
 LIFECYCLE_NAME=$(./target/debug/cli status "$LIFECYCLE_CONTAINER" | grep "Name:" | awk '{print $2}')
 

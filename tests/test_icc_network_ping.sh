@@ -160,7 +160,7 @@ fi
 
 echo -e "\n${BLUE}=== Test 1: Create Two Containers ===${NC}"
 info "Creating container A..."
-CREATE_A=$(./target/debug/cli create --image-path "$TEST_IMAGE" --enable-network-namespace -- sleep 3600 2>&1)
+CREATE_A=$(./target/debug/cli create --image-path "$TEST_IMAGE" --enable-all-namespaces --async-mode -- sleep 3600 2>&1)
 CONTAINER_A=$(echo "$CREATE_A" | grep "Container ID:" | tail -1 | awk '{print $NF}')
 
 if [ -z "$CONTAINER_A" ]; then
@@ -170,7 +170,7 @@ fi
 success "Created container A: $CONTAINER_A"
 
 info "Creating container B..."
-CREATE_B=$(./target/debug/cli create --image-path "$TEST_IMAGE" --enable-network-namespace -- sleep 3600 2>&1)
+CREATE_B=$(./target/debug/cli create --image-path "$TEST_IMAGE" --enable-all-namespaces --async-mode -- sleep 3600 2>&1)
 CONTAINER_B=$(echo "$CREATE_B" | grep "Container ID:" | tail -1 | awk '{print $NF}')
 
 if [ -z "$CONTAINER_B" ]; then
@@ -274,8 +274,8 @@ fi
 
 echo -e "\n${BLUE}=== Test 7: Multiple Container Connectivity ===${NC}"
 info "Creating additional containers..."
-CONTAINER_C=$(./target/debug/cli create --image-path "$TEST_IMAGE" --enable-network-namespace -- sleep 3600 2>&1 | grep "Container ID:" | tail -1 | awk '{print $NF}')
-CONTAINER_D=$(./target/debug/cli create --image-path "$TEST_IMAGE" --enable-network-namespace -- sleep 3600 2>&1 | grep "Container ID:" | tail -1 | awk '{print $NF}')
+CONTAINER_C=$(./target/debug/cli create --image-path "$TEST_IMAGE" --enable-all-namespaces --async-mode -- sleep 3600 2>&1 | grep "Container ID:" | tail -1 | awk '{print $NF}')
+CONTAINER_D=$(./target/debug/cli create --image-path "$TEST_IMAGE" --enable-all-namespaces --async-mode -- sleep 3600 2>&1 | grep "Container ID:" | tail -1 | awk '{print $NF}')
 
 if [ ! -z "$CONTAINER_C" ] && [ ! -z "$CONTAINER_D" ]; then
     wait_for_running "$CONTAINER_C"

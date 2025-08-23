@@ -63,7 +63,7 @@ fi
 
 # 5. Create containers and validate networking
 echo -n "Creating container A... "
-CONTAINER_A=$(./target/debug/cli create --image-path ./nixos-minimal.tar.gz --enable-network-namespace -- /bin/sh -c "sleep 120" 2>&1 | grep "Container ID:" | awk '{print $NF}')
+CONTAINER_A=$(./target/debug/cli create --image-path ./nixos-minimal.tar.gz --enable-all-namespaces --async-mode -- /bin/sh -c "sleep 120" 2>&1 | grep "Container ID:" | awk '{print $NF}')
 if [ ! -z "$CONTAINER_A" ]; then
     echo -e "${GREEN}PASSED${NC} ($CONTAINER_A)"
     ((PASSED++))
@@ -73,7 +73,7 @@ else
 fi
 
 echo -n "Creating container B... "
-CONTAINER_B=$(./target/debug/cli create --image-path ./nixos-minimal.tar.gz --enable-network-namespace -- /bin/sh -c "sleep 120" 2>&1 | grep "Container ID:" | awk '{print $NF}')
+CONTAINER_B=$(./target/debug/cli create --image-path ./nixos-minimal.tar.gz --enable-all-namespaces --async-mode -- /bin/sh -c "sleep 120" 2>&1 | grep "Container ID:" | awk '{print $NF}')
 if [ ! -z "$CONTAINER_B" ]; then
     echo -e "${GREEN}PASSED${NC} ($CONTAINER_B)"
     ((PASSED++))

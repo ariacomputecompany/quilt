@@ -136,7 +136,7 @@ main() {
     
     # Create Container A
     log "Creating container A..."
-    CONTAINER_A_ID=$(timeout 20 $CLI_BINARY create --image-path ./nixos-minimal.tar.gz --enable-network-namespace -- /bin/sh -c "sleep 60" | grep "Container ID" | awk '{print $3}')
+    CONTAINER_A_ID=$(timeout 20 $CLI_BINARY create --image-path ./nixos-minimal.tar.gz --enable-all-namespaces --async-mode -- /bin/sleep 60 | grep "Container ID" | awk '{print $3}')
     if [ -z "$CONTAINER_A_ID" ]; then 
         fail "Failed to create container A - no container ID returned"; 
     fi
@@ -144,29 +144,75 @@ main() {
     
     # Create Container B
     log "Creating container B..."
-    CONTAINER_B_ID=$(timeout 20 $CLI_BINARY create --image-path ./nixos-minimal.tar.gz --enable-network-namespace -- /bin/sh -c "sleep 60" | grep "Container ID" | awk '{print $3}')
+    CONTAINER_B_ID=$(timeout 20 $CLI_BINARY create --image-path ./nixos-minimal.tar.gz --enable-all-namespaces --async-mode -- /bin/sleep 60 | grep "Container ID" | awk '{print $3}')
     if [ -z "$CONTAINER_B_ID" ]; then 
         fail "Failed to create container B - no container ID returned"; 
     fi
     success "Container B created: $CONTAINER_B_ID"
     
-    # Get IPs
-    log "Waiting for containers to get IP addresses..."
-    sleep 7 
+    # PARALLEL ARCHITECTURE: Wait for both containers to reach RUNNING state
+    log "Phase 1: Waiting for containers to reach RUNNING state..."
     
-    IP_A=$(timeout 10 $CLI_BINARY status $CONTAINER_A_ID | grep "IP:" | awk '{print $2}')
-    IP_B=$(timeout 10 $CLI_BINARY status $CONTAINER_B_ID | grep "IP:" | awk '{print $2}')
+    # Wait for both containers to be running with retry logic
+    for attempt in $(seq 1 10); do
+        sleep 2
+        
+        # Check both containers
+        container_a_running=false
+        container_b_running=false
+        
+        if timeout 10 $CLI_BINARY status $CONTAINER_A_ID | grep -q "RUNNING"; then
+            container_a_running=true
+        fi
+        
+        if timeout 10 $CLI_BINARY status $CONTAINER_B_ID | grep -q "RUNNING"; then
+            container_b_running=true
+        fi
+        
+        if [ "$container_a_running" = true ] && [ "$container_b_running" = true ]; then
+            success "✅ Both containers are RUNNING (parallel startup successful)"
+            break
+        else
+            log "Containers starting... A: $container_a_running, B: $container_b_running (attempt $attempt/10)"
+        fi
+        
+        # On final attempt, show detailed status if failed
+        if [ $attempt -eq 10 ]; then
+            log "❌ Container startup verification failed after 20s"
+            log "Container A final status:"
+            timeout 10 $CLI_BINARY status $CONTAINER_A_ID || echo "Status check failed"
+            log "Container B final status:"  
+            timeout 10 $CLI_BINARY status $CONTAINER_B_ID || echo "Status check failed"
+            fail "Containers failed to start properly"
+        fi
+    done
+    
+    # PARALLEL ARCHITECTURE: Wait for background network setup completion (secondary metric)
+    log "Phase 2: Waiting for background network setup to complete..."
+    
+    # Network readiness retry logic for parallel architecture
+    IP_A=""
+    IP_B=""
+    for attempt in $(seq 1 15); do
+        IP_A=$(timeout 5 $CLI_BINARY status $CONTAINER_A_ID | grep -oE "IP: [0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}" | cut -d' ' -f2 || echo "")
+        IP_B=$(timeout 5 $CLI_BINARY status $CONTAINER_B_ID | grep -oE "IP: [0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}" | cut -d' ' -f2 || echo "")
+        
+        if [ -n "$IP_A" ] && [ -n "$IP_B" ]; then
+            success "✅ Network setup completed: Container A IP: $IP_A, Container B IP: $IP_B"
+            break
+        fi
+        
+        log "Network setup in progress... (attempt $attempt/15) A:${IP_A:-pending} B:${IP_B:-pending}"
+        sleep 2
+    done
     
     if [ -z "$IP_A" ] || [ -z "$IP_B" ]; then
-        log "Failed to get container IPs. Container A status:"
+        log "❌ Background network setup failed after 30s. Container A status:"
         $CLI_BINARY status $CONTAINER_A_ID || true
         log "Container B status:"
         $CLI_BINARY status $CONTAINER_B_ID || true
-        log "Server logs:"
-        cat server.log || true
-        fail "Failed to get container IPs. Check server logs above."
+        fail "Background network setup failed - containers running but no IPs assigned"
     fi
-    success "Container A IP: $IP_A, Container B IP: $IP_B"
     
     # Ping from A to B
     log "Pinging from A to B..."

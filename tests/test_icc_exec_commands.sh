@@ -84,7 +84,7 @@ echo -e "\n${BLUE}=== Test 1: Container Setup ===${NC}"
 
 # Create a container
 info "Creating container..."
-CREATE_OUTPUT=$(./target/debug/cli create --image-path "$TEST_IMAGE" --enable-network-namespace -- sleep 3600 2>&1)
+CREATE_OUTPUT=$(./target/debug/cli create --image-path "$TEST_IMAGE" --enable-all-namespaces --async-mode -- sleep 3600 2>&1)
 CONTAINER_ID=$(echo "$CREATE_OUTPUT" | grep "Container ID:" | awk '{print $NF}')
 
 if [ -z "$CONTAINER_ID" ]; then

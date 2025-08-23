@@ -84,7 +84,7 @@ echo -e "\n${BLUE}=== Test 1: Basic Container Creation ===${NC}"
 
 # Create a simple container with sleep command
 info "Creating container with sleep 3600..."
-CREATE_OUTPUT=$(./target/debug/cli create --image-path "$TEST_IMAGE" --enable-network-namespace -- sleep 3600 2>&1)
+CREATE_OUTPUT=$(./target/debug/cli create --image-path "$TEST_IMAGE" --enable-all-namespaces --async-mode -- sleep 3600 2>&1)
 CREATE_RESULT=$?
 
 debug "Create exit code: $CREATE_RESULT"

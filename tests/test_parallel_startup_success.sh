@@ -83,15 +83,28 @@ log "Starting Quilt server..."
 SERVER_PID=$!
 echo $SERVER_PID > server.pid
 
-# Wait for server startup
-sleep 3
-
-if ! kill -0 $SERVER_PID 2>/dev/null; then
-    fail "Server failed to start"
-    exit 1
-fi
-
-pass "Server started (PID: $SERVER_PID)"
+# Wait for server to be ready on port 50051
+info "Waiting for server to be ready..."
+for i in {1..20}; do
+    if kill -0 $SERVER_PID 2>/dev/null; then
+        if nc -z 127.0.0.1 50051 2>/dev/null; then
+            pass "Server ready on port 50051 (attempt $i)"
+            break
+        fi
+        info "Server starting... (attempt $i/20)"
+        sleep 1
+    else
+        fail "Server process died during startup"
+        cat "$SERVER_LOG"
+        exit 1
+    fi
+    
+    if [ $i -eq 20 ]; then
+        fail "Server failed to become ready after 20 seconds"
+        cat "$SERVER_LOG"
+        exit 1
+    fi
+done
 
 # Test 1: Create 10 containers simultaneously and measure startup success
 log "Creating 10 containers simultaneously..."
@@ -142,18 +155,18 @@ for CONTAINER_ID in "${CONTAINER_IDS[@]}"; do
     # Get container status
     STATUS_OUTPUT=$(./target/debug/cli status "$CONTAINER_ID" 2>&1)
     
-    if echo "$STATUS_OUTPUT" | grep -q "State: Running"; then
+    if echo "$STATUS_OUTPUT" | grep -q "Status: RUNNING"; then
         RUNNING_COUNT=$((RUNNING_COUNT + 1))
         STARTUP_SUCCESS_COUNT=$((STARTUP_SUCCESS_COUNT + 1))
-        info "✅ Container $CONTAINER_ID: Running"
-    elif echo "$STATUS_OUTPUT" | grep -q "State: Starting"; then
+        info "✅ Container $CONTAINER_ID: RUNNING"
+    elif echo "$STATUS_OUTPUT" | grep -q "Status: PENDING"; then
         STARTING_COUNT=$((STARTING_COUNT + 1))
-        info "🔄 Container $CONTAINER_ID: Starting (still in progress)"
-    elif echo "$STATUS_OUTPUT" | grep -q "State: Error"; then
+        info "🔄 Container $CONTAINER_ID: PENDING (still in progress)"
+    elif echo "$STATUS_OUTPUT" | grep -q "Status: FAILED"; then
         ERROR_COUNT=$((ERROR_COUNT + 1))
-        info "❌ Container $CONTAINER_ID: Error"
+        info "❌ Container $CONTAINER_ID: FAILED"
     else
-        info "❓ Container $CONTAINER_ID: Unknown state"
+        info "❓ Container $CONTAINER_ID: Unknown state - $STATUS_OUTPUT"
     fi
 done
 
