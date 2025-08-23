@@ -183,7 +183,12 @@ impl NetworkManager {
         let verify_cmd = format!("ip link show {} && ip link show {}", 
             config.veth_host_name, config.veth_container_name);
         match CommandExecutor::execute_shell(&verify_cmd) {
-            Ok(r) if r.success => ConsoleLogger::debug("✅ Veth pair created successfully"),
+            Ok(r) if r.success => {
+                ConsoleLogger::debug("✅ Veth pair created successfully");
+                
+                // Emit veth pair created event
+                crate::emit_veth_pair_created!(config.container_id, config.veth_host_name, config.veth_container_name);
+            },
             _ => return Err("Failed to verify veth pair creation".to_string()),
         }
         
@@ -1412,23 +1417,47 @@ impl NetworkManager {
     
     /// Update iptables DNS redirect rules for fallback port
     fn update_dns_redirect_rules(&self, actual_port: u16) -> Result<(), String> {
-        if actual_port == 1053 {
-            return Ok(()); // No update needed for primary port
-        }
-        
         ConsoleLogger::debug(&format!("🔧 [DNS-REDIRECT] Updating iptables to redirect DNS to port {}", actual_port));
         
-        // Remove old redirect rules (ignore errors)
-        let cleanup_cmds = vec![
-            format!("iptables -t nat -D PREROUTING -i {} -p udp --dport 53 -j DNAT --to-destination {}:1053 2>/dev/null || true", self.config.bridge_name, self.config.bridge_ip),
-            format!("iptables -t nat -D PREROUTING -i {} -p tcp --dport 53 -j DNAT --to-destination {}:1053 2>/dev/null || true", self.config.bridge_name, self.config.bridge_ip),
-        ];
+        // COMPREHENSIVE CLEANUP: Remove ALL possible DNS redirect rules to prevent accumulation
+        // We try to remove rules for all possible ports that might have been used
+        let all_possible_ports = vec![1053, 1153, 1253, 1353, 1453];
         
-        for cmd in cleanup_cmds {
-            let _ = CommandExecutor::execute_shell(&cmd);
+        for port in all_possible_ports {
+            let cleanup_cmds = vec![
+                format!("iptables -t nat -D PREROUTING -i {} -p udp --dport 53 -j DNAT --to-destination {}:{} 2>/dev/null || true", self.config.bridge_name, self.config.bridge_ip, port),
+                format!("iptables -t nat -D PREROUTING -i {} -p tcp --dport 53 -j DNAT --to-destination {}:{} 2>/dev/null || true", self.config.bridge_name, self.config.bridge_ip, port),
+            ];
+            
+            for cmd in cleanup_cmds {
+                let _ = CommandExecutor::execute_shell(&cmd);
+            }
         }
         
-        // Add new redirect rules
+        // Also use a more aggressive cleanup approach to handle duplicates
+        // Keep trying to remove rules until no more can be removed (max 10 attempts to prevent infinite loops)
+        for _attempt in 0..10 {
+            let generic_cleanup_cmds = vec![
+                format!("iptables -t nat -D PREROUTING -i {} -p udp --dport 53 -j DNAT 2>/dev/null", self.config.bridge_name),
+                format!("iptables -t nat -D PREROUTING -i {} -p tcp --dport 53 -j DNAT 2>/dev/null", self.config.bridge_name),
+            ];
+            
+            let mut rules_removed = false;
+            for cmd in generic_cleanup_cmds {
+                if let Ok(result) = CommandExecutor::execute_shell(&cmd) {
+                    if result.success {
+                        rules_removed = true;
+                        ConsoleLogger::debug(&format!("🧹 [DNS-CLEANUP] Removed duplicate rule: {}", cmd));
+                    }
+                }
+            }
+            
+            if !rules_removed {
+                break; // No more rules to remove
+            }
+        }
+        
+        // Now add the clean, correct rules
         let new_rules = vec![
             format!("iptables -t nat -A PREROUTING -i {} -p udp --dport 53 -j DNAT --to-destination {}:{}", self.config.bridge_name, self.config.bridge_ip, actual_port),
             format!("iptables -t nat -A PREROUTING -i {} -p tcp --dport 53 -j DNAT --to-destination {}:{}", self.config.bridge_name, self.config.bridge_ip, actual_port),
@@ -2007,6 +2036,15 @@ impl NetworkManager {
         
         ConsoleLogger::success(&format!("✅ [BRIDGE-VERIFY] {} is properly attached to bridge {}", 
             veth_name, self.config.bridge_name));
+        
+        // Emit bridge attached event - need to extract container_id from veth name
+        // Veth names follow pattern "veth-{container_id[..8]}"
+        if let Some(container_id_prefix) = veth_name.strip_prefix("veth-") {
+            // This is a crude way to get container ID, but it works for our naming convention
+            // In production, we'd pass container_id as parameter
+            crate::emit_bridge_attached!(format!("{}*", container_id_prefix), self.config.bridge_name);
+        }
+        
         Ok(())
     }
 
@@ -2173,5 +2211,49 @@ impl NetworkManager {
         } else {
             Err("No rootfs path available for safe DNS fallback".to_string())
         }
+    }
+    
+    /// Comprehensive cleanup of network manager resources
+    /// This should be called when the server shuts down to clean up all resources
+    pub fn cleanup_all_resources(&self) -> Result<(), String> {
+        ConsoleLogger::info("🧹 [CLEANUP] Starting comprehensive network cleanup");
+        
+        // Step 1: Clean up all DNS redirect rules 
+        let all_possible_ports = vec![1053, 1153, 1253, 1353, 1453];
+        for port in all_possible_ports {
+            let cleanup_cmds = vec![
+                format!("iptables -t nat -D PREROUTING -i {} -p udp --dport 53 -j DNAT --to-destination {}:{} 2>/dev/null || true", self.config.bridge_name, self.config.bridge_ip, port),
+                format!("iptables -t nat -D PREROUTING -i {} -p tcp --dport 53 -j DNAT --to-destination {}:{} 2>/dev/null || true", self.config.bridge_name, self.config.bridge_ip, port),
+            ];
+            
+            for cmd in cleanup_cmds {
+                let _ = CommandExecutor::execute_shell(&cmd);
+            }
+        }
+        
+        // Step 2: Aggressive cleanup of any remaining DNS DNAT rules
+        for _attempt in 0..10 {
+            let generic_cleanup_cmds = vec![
+                format!("iptables -t nat -D PREROUTING -i {} -p udp --dport 53 -j DNAT 2>/dev/null", self.config.bridge_name),
+                format!("iptables -t nat -D PREROUTING -i {} -p tcp --dport 53 -j DNAT 2>/dev/null", self.config.bridge_name),
+            ];
+            
+            let mut rules_removed = false;
+            for cmd in generic_cleanup_cmds {
+                if let Ok(result) = CommandExecutor::execute_shell(&cmd) {
+                    if result.success {
+                        rules_removed = true;
+                        ConsoleLogger::debug(&format!("🧹 [CLEANUP] Removed rule: {}", cmd));
+                    }
+                }
+            }
+            
+            if !rules_removed {
+                break;
+            }
+        }
+        
+        ConsoleLogger::success("✅ [CLEANUP] Network cleanup completed - all DNS rules cleaned up");
+        Ok(())
     }
 } 

@@ -352,16 +352,72 @@ impl CleanupService {
     }
     
     async fn cleanup_network(container_id: &str) -> SyncResult<()> {
-        // This would integrate with the network manager to clean up
-        // network interfaces, IP allocations, etc.
-        // For now, we'll just log the operation
-        tracing::debug!("Cleaning up network resources for container: {}", container_id);
+        tracing::info!("Starting network cleanup for container: {}", container_id);
         
-        // In real implementation, this would:
-        // 1. Remove veth interfaces
-        // 2. Update iptables rules
-        // 3. Mark network allocation as cleaned
-        // 4. Remove bridge assignments
+        // Step 1: Remove veth interfaces using the naming pattern from NetworkManager
+        let veth_host_name = format!("veth-{}", &container_id[..8]);
+        let veth_container_name = format!("vethc-{}", &container_id[..8]);
+        let quilt_bridge_veth = format!("quilt{}", &container_id[..8]); // Alternative naming pattern
+        
+        // Try to remove all possible veth interfaces for this container
+        let veth_interfaces = vec![
+            veth_host_name,
+            veth_container_name,
+            quilt_bridge_veth,
+        ];
+        
+        for interface in veth_interfaces {
+            let cleanup_cmd = format!("ip link delete {} 2>/dev/null || true", interface);
+            match tokio::process::Command::new("sh")
+                .arg("-c")
+                .arg(&cleanup_cmd)
+                .output()
+                .await 
+            {
+                Ok(output) => {
+                    if output.status.success() {
+                        tracing::debug!("Successfully removed interface: {}", interface);
+                    } else {
+                        tracing::debug!("Interface {} not found or already removed", interface);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to execute cleanup command for {}: {}", interface, e);
+                }
+            }
+        }
+        
+        // Step 2: Clean up any container-specific iptables rules 
+        // (This is defensive - the current implementation doesn't create per-container rules)
+        let container_ip_pattern = format!("10.42.0."); // IP range pattern
+        let iptables_cleanup_cmds = vec![
+            // Clean up any potential FORWARD rules for this container's IP range
+            format!("iptables -D FORWARD -s {} -j ACCEPT 2>/dev/null || true", container_ip_pattern),
+            format!("iptables -D FORWARD -d {} -j ACCEPT 2>/dev/null || true", container_ip_pattern),
+        ];
+        
+        for cmd in iptables_cleanup_cmds {
+            match tokio::process::Command::new("sh")
+                .arg("-c")
+                .arg(&cmd)
+                .output()
+                .await 
+            {
+                Ok(_) => {
+                    tracing::debug!("Executed iptables cleanup: {}", cmd);
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to execute iptables cleanup: {}: {}", cmd, e);
+                }
+            }
+        }
+        
+        // Step 3: Remove DNS registrations (if DNS server is running)
+        // This is best-effort since DNS server may not be running
+        // NOTE: The NetworkManager.unregister_container_dns() would be called here
+        // if we had a reference to the network manager, but since the cleanup service
+        // is independent, DNS cleanup happens when containers are removed normally
+        tracing::debug!("Network cleanup completed for container: {}", container_id);
         
         Ok(())
     }

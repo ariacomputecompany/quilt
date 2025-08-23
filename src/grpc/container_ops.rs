@@ -13,7 +13,7 @@ use sqlx::Row;
 pub async fn start_container_process(
     sync_engine: &SyncEngine, 
     container_id: &str,
-    network_manager: Arc<tokio::sync::Mutex<icc::network::NetworkManager>>
+    network_manager: Arc<icc::network::NetworkManager>
 ) -> Result<(), String> {
     use crate::daemon::runtime::ContainerRuntime;
     
@@ -275,6 +275,9 @@ pub async fn start_container_process(
                 if let Some(pid) = container.pid {
                     ConsoleLogger::info(&format!("🆔 [STARTUP-PID] Container {} got PID: {}", container_id, pid.as_raw()));
                     
+                    // Emit process started event
+                    crate::emit_process_started!(container_id, pid.as_raw());
+                    
                     sync_engine.set_container_pid(container_id, pid).await
                         .map_err(|e| {
                             ConsoleLogger::error(&format!("❌ [STARTUP-PID] Failed to set PID for {}: {}", container_id, e));
@@ -343,22 +346,28 @@ pub async fn start_container_process(
                             })?;
                         ConsoleLogger::debug(&format!("✅ [STARTUP-NET] Created network ready signal at {}", network_ready_path_in_container));
                         
-                        // Now setup container network using ICC network manager
-                        ConsoleLogger::debug(&format!("🔧 [STARTUP-NET] Acquiring network manager lock for {}", container_id));
-                        let network_setup_result = {
-                            let nm = network_manager.lock().await;
-                            ConsoleLogger::debug(&format!("🔧 [STARTUP-NET] Setting up container network for {} (PID: {})", 
-                                container_id, pid.as_raw()));
-                            nm.setup_container_network(&icc_network_config, pid.as_raw())
-                        };
+                        // Emit network setup started event
+                        crate::emit_network_setup_started!(container_id);
+                        
+                        // Now setup container network using ICC network manager (lock-free)
+                        ConsoleLogger::debug(&format!("🔧 [STARTUP-NET] Setting up container network for {} (PID: {})", 
+                            container_id, pid.as_raw()));
+                        let network_setup_result = network_manager.setup_container_network(&icc_network_config, pid.as_raw());
                         
                         // Check if network setup succeeded
                         network_setup_result.map_err(|e| {
                             ConsoleLogger::error(&format!("❌ [STARTUP-NET] Network setup failed for {}: {}", container_id, e));
+                            
+                            // Emit network setup failed event
+                            crate::emit_network_setup_failed!(container_id, &e);
+                            
                             e
                         })?;
                         
                         ConsoleLogger::success(&format!("✅ [STARTUP-NET] Container network setup succeeded for {}", container_id));
+                        
+                        // Emit network setup completed event
+                        crate::emit_network_setup_completed!(container_id, &network_alloc.ip_address);
                         
                         // Mark network setup complete in sync engine
                         ConsoleLogger::debug(&format!("📝 [STARTUP-NET] Marking network setup complete in sync engine for {}", container_id));
@@ -384,8 +393,7 @@ pub async fn start_container_process(
                         ConsoleLogger::debug(&format!("🌐 [STARTUP-NET] DNS name for {}: {}", container_id, container_name));
                         
                         {
-                            let nm = network_manager.lock().await;
-                            nm.register_container_dns(container_id, &container_name, &network_alloc.ip_address)
+                            network_manager.register_container_dns(container_id, &container_name, &network_alloc.ip_address)
                                 .map_err(|e| {
                                     ConsoleLogger::error(&format!("❌ [STARTUP-NET] DNS registration failed for {}: {}", container_id, e));
                                     e
@@ -421,14 +429,11 @@ pub async fn start_container_process(
             ConsoleLogger::success(&format!("🎉 [STARTUP-SUCCESS] Container {} started successfully in {:?}", 
                 container_id, total_time));
             
-            // Emit container started event
-            crate::sync::events::global_event_buffer().emit(
-                crate::sync::events::EventType::Started,
-                container_id,
-                None,
-            );
+            // Emit container ready event with timing
+            let startup_time_ms = total_time.as_millis() as u64;
+            crate::emit_container_ready!(container_id, startup_time_ms);
             
-            ConsoleLogger::debug(&format!("📡 [STARTUP-SUCCESS] Started event emitted for {}", container_id));
+            ConsoleLogger::debug(&format!("📡 [STARTUP-SUCCESS] Container ready event emitted for {}", container_id));
             
             Ok(())
         }
@@ -436,6 +441,9 @@ pub async fn start_container_process(
             let total_time = start_time.elapsed();
             ConsoleLogger::error(&format!("❌ [STARTUP-ERROR] Container {} startup FAILED after {:?}: {}", 
                 container_id, total_time, e));
+            
+            // Emit container startup failed event
+            crate::emit_container_startup_failed!(container_id, &e, "container_startup");
             
             // Update state to Error and log the failure
             sync_engine.update_container_state(container_id, ContainerState::Error).await.ok();

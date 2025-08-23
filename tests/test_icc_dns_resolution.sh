@@ -194,7 +194,7 @@ fi
 
 echo -e "\n${BLUE}=== Test 2: Create Containers for DNS Testing ===${NC}"
 info "Creating container A..."
-CREATE_A=$(./target/debug/cli create --image-path "$TEST_IMAGE" --enable-network-namespace -- sleep 3600 2>&1)
+CREATE_A=$(./target/debug/cli create --image-path "$TEST_IMAGE" --enable-network-namespace -- /bin/sleep 3600 2>&1)
 CONTAINER_A=$(echo "$CREATE_A" | grep "Container ID:" | tail -1 | awk '{print $NF}')
 
 if [ -z "$CONTAINER_A" ]; then
@@ -208,7 +208,7 @@ success "Created container A: $CONTAINER_A"
 sleep 0.5
 
 info "Creating container B..."
-CREATE_B=$(./target/debug/cli create --image-path "$TEST_IMAGE" --enable-network-namespace -- sleep 3600 2>&1)
+CREATE_B=$(./target/debug/cli create --image-path "$TEST_IMAGE" --enable-network-namespace -- /bin/sleep 3600 2>&1)
 CONTAINER_B=$(echo "$CREATE_B" | grep "Container ID:" | tail -1 | awk '{print $NF}')
 
 if [ -z "$CONTAINER_B" ]; then
@@ -364,7 +364,7 @@ fi
 
 echo -e "\n${BLUE}=== Test 10: Container Lifecycle and DNS ===${NC}"
 info "Testing DNS cleanup on container removal..."
-LIFECYCLE_CONTAINER=$(./target/debug/cli create --image-path "$TEST_IMAGE" --enable-network-namespace -- sleep 60 2>&1 | grep "Container ID:" | tail -1 | awk '{print $NF}')
+LIFECYCLE_CONTAINER=$(./target/debug/cli create --image-path "$TEST_IMAGE" --enable-network-namespace -- /bin/sleep 60 2>&1 | grep "Container ID:" | tail -1 | awk '{print $NF}')
 
 if [ ! -z "$LIFECYCLE_CONTAINER" ]; then
     wait_for_running "$LIFECYCLE_CONTAINER"

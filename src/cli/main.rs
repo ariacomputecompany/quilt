@@ -88,8 +88,8 @@ enum Commands {
         #[clap(long, help = "Enable IPC namespace isolation")]
         enable_ipc_namespace: bool,
         
-        #[clap(long, help = "Enable network namespace isolation")]
-        enable_network_namespace: bool,
+        #[clap(long, help = "Disable network namespace isolation")]
+        no_network: bool,
         
         #[clap(long, help = "Enable all namespace isolation features")]
         enable_all_namespaces: bool,
@@ -274,7 +274,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             enable_mount_namespace,
             enable_uts_namespace,
             enable_ipc_namespace,
-            enable_network_namespace,
+            no_network,
             enable_all_namespaces,
             volumes,
             mounts,
@@ -301,7 +301,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     enable_mount_namespace, 
                     enable_uts_namespace,
                     enable_ipc_namespace,
-                    enable_network_namespace
+                    !no_network  // Fixed: Use no_network flag (default networking enabled)
                 )
             };
             

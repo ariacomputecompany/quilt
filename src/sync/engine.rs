@@ -109,24 +109,131 @@ impl SyncEngine {
     
     // === Container Management ===
     
-    /// Create a new container with coordinated network allocation
+    /// PRODUCTION-GRADE: Atomic container + network creation
+    /// Eliminates database lock contention by using single transaction for both operations
     pub async fn create_container(&self, config: ContainerConfig) -> SyncResult<NetworkConfig> {
         // Store container ID and network namespace flag before moving config
         let container_id = config.id.clone();
         let enable_network = config.enable_network_namespace;
         
-        // 1. Create container record in database FIRST (to satisfy foreign key constraints)
-        self.container_manager.create_container(config).await?;
+        // Import ConsoleLogger
+        use crate::utils::ConsoleLogger;
+        use std::time::{SystemTime, UNIX_EPOCH};
         
-        // 2. Allocate network resources if networking is enabled
+        println!("🔧 [SYNC-CREATE] Creating container {} with networking: {} (atomic)", container_id, enable_network);
+        ConsoleLogger::info(&format!("🔧 [SYNC-CREATE] Creating container {} with networking: {} (atomic)", container_id, enable_network));
+        
+        // ATOMIC TRANSACTION: Container + Network creation in single database operation
+        let mut transaction = self.connection_manager.pool().begin().await?;
+        
+        // Step 1: Insert container record within transaction
+        let environment_json = serde_json::to_string(&config.environment)?;
+        let created_at = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
+        
+        sqlx::query(r#"
+            INSERT INTO containers (
+                id, name, image_path, command, environment, state,
+                memory_limit_mb, cpu_limit_percent,
+                enable_network_namespace, enable_pid_namespace, enable_mount_namespace,
+                enable_uts_namespace, enable_ipc_namespace,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        "#)
+        .bind(&config.id)
+        .bind(&config.name)
+        .bind(&config.image_path)
+        .bind(&config.command)
+        .bind(&environment_json)
+        .bind(crate::sync::containers::ContainerState::Created.to_string())
+        .bind(config.memory_limit_mb)
+        .bind(config.cpu_limit_percent)
+        .bind(config.enable_network_namespace)
+        .bind(config.enable_pid_namespace)
+        .bind(config.enable_mount_namespace)
+        .bind(config.enable_uts_namespace)
+        .bind(config.enable_ipc_namespace)
+        .bind(created_at)
+        .bind(created_at)
+        .execute(&mut *transaction)
+        .await?;
+        
+        ConsoleLogger::debug(&format!("✅ [ATOMIC] Container record inserted for {}", container_id));
+        
+        // Step 2: Network allocation within same transaction (if enabled)
         let network_config = if enable_network {
-            Some(self.network_manager.allocate_network(&container_id).await?)
+            // Find available IP within transaction
+            let allocated_ips: Vec<(String,)> = sqlx::query_as(
+                "SELECT ip_address FROM network_allocations WHERE status != 'cleaned'"
+            ).fetch_all(&mut *transaction).await?;
+            
+            let allocated_set: std::collections::HashSet<String> = allocated_ips
+                .into_iter()
+                .map(|(ip,)| ip)
+                .collect();
+            
+            // Find first available IP in range (10.42.0.2 to 10.42.255.254)
+            let start_ip = std::net::Ipv4Addr::new(10, 42, 0, 2);
+            let end_ip = std::net::Ipv4Addr::new(10, 42, 255, 254);
+            let start_int = u32::from(start_ip);
+            let end_int = u32::from(end_ip);
+            
+            let mut selected_ip = None;
+            for ip_int in start_int..=end_int {
+                let ip = std::net::Ipv4Addr::from(ip_int);
+                let ip_str = ip.to_string();
+                
+                if !allocated_set.contains(&ip_str) {
+                    selected_ip = Some(ip_str);
+                    break;
+                }
+            }
+            
+            let ip = selected_ip.ok_or(SyncError::NoAvailableIp)?;
+            let allocation_time = created_at; // Use same timestamp
+            
+            // Insert network allocation within same transaction
+            sqlx::query(r#"
+                INSERT INTO network_allocations (
+                    container_id, ip_address, allocation_time, setup_completed, status
+                ) VALUES (?, ?, ?, ?, ?)
+            "#)
+            .bind(&container_id)
+            .bind(&ip)
+            .bind(allocation_time)
+            .bind(false)
+            .bind(crate::sync::network::NetworkStatus::Allocated.to_string())
+            .execute(&mut *transaction)
+            .await?;
+            
+            ConsoleLogger::debug(&format!("✅ [ATOMIC] Network allocation inserted for {}: IP={}", container_id, ip));
+            
+            Some(NetworkConfig {
+                container_id: container_id.clone(),
+                ip_address: ip,
+                bridge_interface: None,
+                veth_host: None,
+                veth_container: None,
+                setup_required: true,
+            })
         } else {
-            self.network_manager.mark_network_disabled(&container_id).await?;
             None
         };
         
-        // 3. Return network configuration for setup
+        // Step 3: Commit atomic transaction
+        transaction.commit().await?;
+        ConsoleLogger::info(&format!("🔒 [ATOMIC] Container {} created atomically with network config", container_id));
+        
+        // Step 4: Emit events after successful database commit
+        crate::emit_container_created!(container_id);
+        
+        if let Some(ref net_cfg) = network_config {
+            crate::emit_network_allocated!(container_id, net_cfg.ip_address);
+            ConsoleLogger::info(&format!("✅ [ATOMIC] Network allocated for {}: IP={}", container_id, net_cfg.ip_address));
+        } else {
+            ConsoleLogger::debug(&format!("🚫 [ATOMIC] Network disabled for {}", container_id));
+        }
+        
+        // Return network configuration
         Ok(network_config.unwrap_or(NetworkConfig {
             container_id,
             ip_address: String::new(),

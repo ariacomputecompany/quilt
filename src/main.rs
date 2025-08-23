@@ -46,7 +46,7 @@ use quilt::{
 #[derive(Clone)]
 pub struct QuiltServiceImpl {
     sync_engine: Arc<SyncEngine>,
-    network_manager: Arc<tokio::sync::Mutex<icc::network::NetworkManager>>,
+    network_manager: Arc<icc::network::NetworkManager>,
     start_time: std::time::SystemTime,
 }
 
@@ -85,7 +85,7 @@ impl QuiltServiceImpl {
         
         Ok(Self {
             sync_engine,
-            network_manager: Arc::new(tokio::sync::Mutex::new(network_manager)),
+            network_manager: Arc::new(network_manager),
             start_time: std::time::SystemTime::now(),
         })
     }
@@ -470,8 +470,7 @@ impl QuiltService for QuiltServiceImpl {
             Ok(()) => {
                 // Unregister from DNS
                 {
-                    let nm = self.network_manager.lock().await;
-                    let _ = nm.unregister_container_dns(&container_id);
+                    let _ = self.network_manager.unregister_container_dns(&container_id);
                 }
                 
                 ConsoleLogger::success(&format!("Container {} removed", container_id));

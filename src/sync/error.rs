@@ -28,6 +28,9 @@ pub enum SyncError {
     #[error("No available IP addresses in range")]
     NoAvailableIp,
     
+    #[error("IP allocation conflict - retry needed")]
+    IpAllocationConflict,
+    
     #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
     

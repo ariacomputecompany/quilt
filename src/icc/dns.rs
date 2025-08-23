@@ -174,6 +174,9 @@ impl DnsServer {
                 
                 if let Some(entry) = entries.get(&name) {
                     if let IpAddr::V4(ipv4) = entry.ip_address {
+                        ConsoleLogger::debug(&format!("🔍 [DNS-MATCH] Found entry for {}: {} (ttl: {})", name, ipv4, entry.ttl));
+                        
+                        // CRITICAL FIX: Use proper builder pattern to avoid temporary value issues
                         let record = Record::new()
                             .set_name(query.name().clone())
                             .set_ttl(entry.ttl)
@@ -182,16 +185,28 @@ impl DnsServer {
                             .set_data(Some(RData::A(trust_dns_proto::rr::rdata::A::from(ipv4))))
                             .clone();
                         
-                        response.add_answer(record);
+                        ConsoleLogger::debug(&format!("🔧 [DNS-RECORD] Created A record for {}: name={}, ttl={}, data={:?}", 
+                            name, record.name(), record.ttl(), record.data()));
+                        
+                        ConsoleLogger::debug(&format!("🔧 [DNS-RECORD] Pre-add: response has {} answers", response.answer_count()));
+                        response.add_answer(record.clone());
+                        ConsoleLogger::debug(&format!("🔧 [DNS-RECORD] Post-add: response has {} answers", response.answer_count()));
+                        ConsoleLogger::debug(&format!("✅ [DNS-ADD] Added answer to response. Total answers: {}", response.answer_count()));
                         ConsoleLogger::debug(&format!("DNS: Resolved {} -> {}", name, ipv4));
                     }
                 } else {
                     // Try without domain suffix if it was included
+                    ConsoleLogger::debug(&format!("🔍 [DNS-FALLBACK] No direct match for '{}', trying fallback patterns", name));
                     let short_name = name.trim_end_matches(&format!(".{}", domain_suffix))
                         .trim_end_matches(domain_suffix);
                     
+                    ConsoleLogger::debug(&format!("🔍 [DNS-FALLBACK] Trying short name: '{}'", short_name));
+                    
                     if let Some(entry) = entries.get(short_name) {
                         if let IpAddr::V4(ipv4) = entry.ip_address {
+                            ConsoleLogger::debug(&format!("🔍 [DNS-MATCH-FALLBACK] Found entry for short name {}: {} (ttl: {})", short_name, ipv4, entry.ttl));
+                            
+                            // CRITICAL FIX: Use proper builder pattern to avoid temporary value issues
                             let record = Record::new()
                                 .set_name(query.name().clone())
                                 .set_ttl(entry.ttl)
@@ -200,11 +215,20 @@ impl DnsServer {
                                 .set_data(Some(RData::A(trust_dns_proto::rr::rdata::A::from(ipv4))))
                                 .clone();
                             
-                            response.add_answer(record);
+                            ConsoleLogger::debug(&format!("🔧 [DNS-RECORD-FALLBACK] Created A record for {}: name={}, ttl={}, data={:?}", 
+                                short_name, record.name(), record.ttl(), record.data()));
+                            
+                            ConsoleLogger::debug(&format!("🔧 [DNS-RECORD-FALLBACK] Pre-add: response has {} answers", response.answer_count()));
+                            response.add_answer(record.clone());
+                            ConsoleLogger::debug(&format!("🔧 [DNS-RECORD-FALLBACK] Post-add: response has {} answers", response.answer_count()));
+                            ConsoleLogger::debug(&format!("✅ [DNS-ADD-FALLBACK] Added answer to response. Total answers: {}", response.answer_count()));
                             ConsoleLogger::debug(&format!("DNS: Resolved {} -> {}", short_name, ipv4));
                         }
                     } else {
-                        ConsoleLogger::debug(&format!("DNS: Name not found: {}", name));
+                        ConsoleLogger::debug(&format!("❌ [DNS-NOTFOUND] Name not found: '{}' (short: '{}')", name, short_name));
+                        
+                        // Debug: List all available entries
+                        ConsoleLogger::debug(&format!("🔧 [DNS-DEBUG] Available entries: {:?}", entries.keys().collect::<Vec<_>>()));
                     }
                 }
             }

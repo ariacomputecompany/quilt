@@ -94,32 +94,37 @@ impl NetworkManager {
             });
         }
         
-        let ip = self.find_available_ip().await?;
-        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
+        // FIXED: Atomic IP allocation using database transaction with retry logic
+        // This eliminates the TOCTOU race condition in concurrent container creation
+        let max_retries = 5;
+        let mut retry_count = 0;
         
-        sqlx::query(r#"
-            INSERT INTO network_allocations (
-                container_id, ip_address, allocation_time, setup_completed, status
-            ) VALUES (?, ?, ?, ?, ?)
-        "#)
-        .bind(container_id)
-        .bind(&ip)
-        .bind(now)
-        .bind(false)
-        .bind(NetworkStatus::Allocated.to_string())
-        .execute(&self.pool)
-        .await?;
-        
-        tracing::info!("Allocated IP {} for container {}", ip, container_id);
-        
-        Ok(NetworkConfig {
-            container_id: container_id.to_string(),
-            ip_address: ip,
-            bridge_interface: None,
-            veth_host: None,
-            veth_container: None,
-            setup_required: true,
-        })
+        loop {
+            match self.try_allocate_ip_atomically(container_id).await {
+                Ok(ip) => {
+                    tracing::info!("Allocated IP {} for container {} (attempt {})", ip, container_id, retry_count + 1);
+                    return Ok(NetworkConfig {
+                        container_id: container_id.to_string(),
+                        ip_address: ip,
+                        bridge_interface: None,
+                        veth_host: None,
+                        veth_container: None,
+                        setup_required: true,
+                    });
+                }
+                Err(SyncError::IpAllocationConflict) => {
+                    retry_count += 1;
+                    if retry_count >= max_retries {
+                        tracing::error!("Failed to allocate IP for {} after {} retries", container_id, max_retries);
+                        return Err(SyncError::NoAvailableIp);
+                    }
+                    // Small backoff to reduce contention
+                    tokio::time::sleep(tokio::time::Duration::from_millis(10 * retry_count as u64)).await;
+                    tracing::debug!("IP allocation conflict for {}, retrying (attempt {})", container_id, retry_count + 1);
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
     
     pub async fn mark_network_disabled(&self, container_id: &str) -> SyncResult<()> {
@@ -130,6 +135,10 @@ impl NetworkManager {
     }
     
     pub async fn should_setup_network(&self, container_id: &str) -> SyncResult<bool> {
+        use crate::utils::ConsoleLogger;
+        
+        ConsoleLogger::debug(&format!("🔍 [NETWORK-CHECK] Checking if container {} needs network setup", container_id));
+        
         let count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM network_allocations WHERE container_id = ? AND status = 'allocated'"
         )
@@ -137,7 +146,28 @@ impl NetworkManager {
         .fetch_one(&self.pool)
         .await?;
         
-        Ok(count > 0)
+        ConsoleLogger::info(&format!("🔍 [NETWORK-CHECK] Container {} has {} allocated network entries", container_id, count));
+        
+        // Debug: Also check what entries exist for this container (any status)
+        let all_entries: Vec<(String, String)> = sqlx::query_as(
+            "SELECT status, ip_address FROM network_allocations WHERE container_id = ?"
+        )
+        .bind(container_id)
+        .fetch_all(&self.pool)
+        .await.unwrap_or_default();
+        
+        if all_entries.is_empty() {
+            ConsoleLogger::warning(&format!("🔍 [NETWORK-CHECK] No network allocation entries found for container {}", container_id));
+        } else {
+            for (status, ip) in &all_entries {
+                ConsoleLogger::debug(&format!("🔍 [NETWORK-CHECK] Found allocation for {}: status={}, ip={}", container_id, status, ip));
+            }
+        }
+        
+        let needs_setup = count > 0;
+        ConsoleLogger::info(&format!("🔍 [NETWORK-CHECK] Container {} needs network setup: {}", container_id, needs_setup));
+        
+        Ok(needs_setup)
     }
     
     pub async fn mark_network_setup_complete(&self, container_id: &str, bridge_interface: &str, veth_host: &str, veth_container: &str) -> SyncResult<()> {
@@ -285,7 +315,72 @@ impl NetworkManager {
         self.list_allocations(Some(NetworkStatus::CleanupPending)).await
     }
     
+    /// PRODUCTION-GRADE: Atomically allocate IP using database transaction
+    /// Eliminates TOCTOU race conditions in concurrent container creation
+    async fn try_allocate_ip_atomically(&self, container_id: &str) -> SyncResult<String> {
+        let mut transaction = self.pool.begin().await?;
+        
+        // Find available IP within transaction (consistent snapshot)
+        let allocated_ips: Vec<(String,)> = sqlx::query_as(
+            "SELECT ip_address FROM network_allocations WHERE status != 'cleaned'"
+        ).fetch_all(&mut *transaction).await?;
+        
+        let allocated_set: std::collections::HashSet<String> = allocated_ips
+            .into_iter()
+            .map(|(ip,)| ip)
+            .collect();
+        
+        // Find first available IP in range
+        let start_int = u32::from(self.ip_range_start);
+        let end_int = u32::from(self.ip_range_end);
+        
+        let mut selected_ip = None;
+        for ip_int in start_int..=end_int {
+            let ip = Ipv4Addr::from(ip_int);
+            let ip_str = ip.to_string();
+            
+            if !allocated_set.contains(&ip_str) {
+                selected_ip = Some(ip_str);
+                break;
+            }
+        }
+        
+        let ip = selected_ip.ok_or(SyncError::NoAvailableIp)?;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+        
+        // Attempt to insert within transaction - will fail if another transaction beat us
+        match sqlx::query(r#"
+            INSERT INTO network_allocations (
+                container_id, ip_address, allocation_time, setup_completed, status
+            ) VALUES (?, ?, ?, ?, ?)
+        "#)
+        .bind(container_id)
+        .bind(&ip)
+        .bind(now)
+        .bind(false)
+        .bind(NetworkStatus::Allocated.to_string())
+        .execute(&mut *transaction)
+        .await {
+            Ok(_) => {
+                // Success - commit transaction
+                transaction.commit().await?;
+                Ok(ip)
+            }
+            Err(sqlx::Error::Database(db_err)) if db_err.is_unique_violation() => {
+                // IP already allocated by concurrent transaction - signal retry
+                transaction.rollback().await?;
+                Err(SyncError::IpAllocationConflict)
+            }
+            Err(e) => {
+                // Other error - propagate
+                transaction.rollback().await?;
+                Err(SyncError::Database(e))
+            }
+        }
+    }
+    
     async fn find_available_ip(&self) -> SyncResult<String> {
+        // DEPRECATED: Use try_allocate_ip_atomically instead for race-free allocation
         // Get all allocated IPs
         let allocated_ips: Vec<(String,)> = sqlx::query_as(
             "SELECT ip_address FROM network_allocations WHERE status != 'cleaned'"
