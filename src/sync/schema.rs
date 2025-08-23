@@ -1,5 +1,5 @@
 use sqlx::SqlitePool;
-use crate::sync::error::{SyncError, SyncResult};
+use crate::sync::error::SyncResult;
 
 pub struct SchemaManager {
     pool: SqlitePool,

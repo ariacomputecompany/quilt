@@ -6,14 +6,12 @@ pub enum SyncError {
     #[error("Container not found: {container_id}")]
     NotFound { container_id: String },
     
-    #[error("Network allocation failed: {reason}")]
-    NetworkAllocation { reason: String },
+    // NetworkAllocation variant removed - not used
     
     #[error("State transition invalid: {from} -> {to}")]
     InvalidStateTransition { from: String, to: String },
     
-    #[error("Process monitoring error: {message}")]
-    ProcessMonitoring { message: String },
+    // ProcessMonitoring variant removed - not used
     
     #[error("Cleanup operation failed: {resource_type} at {path}: {message}")]
     CleanupFailed {
@@ -22,14 +20,8 @@ pub enum SyncError {
         message: String,
     },
     
-    #[error("Network IP address already allocated: {ip}")]
-    IpAlreadyAllocated { ip: String },
-    
     #[error("No available IP addresses in range")]
     NoAvailableIp,
-    
-    #[error("IP allocation conflict - retry needed")]
-    IpAllocationConflict,
     
     #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),

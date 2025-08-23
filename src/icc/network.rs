@@ -1,17 +1,17 @@
 // src/icc/network.rs
 // Optimized Inter-Container Communication using Linux Bridge
 
-//#![deny(warnings)] // Temporarily disabled during implementation
+// Warnings handled at crate level
 
-use crate::utils::{CommandExecutor, ConsoleLogger};
-use crate::icc::dns::{DnsServer, DnsEntry};
+use crate::utils::command::CommandExecutor;
+use crate::utils::console::ConsoleLogger;
+use crate::utils::filesystem::FileSystemUtils;
+use crate::icc::dns::DnsServer;
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, Instant};
-use std::collections::HashMap;
+use std::time::Duration;
 use std::sync::atomic::{AtomicU32, Ordering, AtomicBool, AtomicU64};
 use std::net::SocketAddr;
-use scopeguard;
 
 #[derive(Debug, Clone)]
 pub struct NetworkConfig {
@@ -699,7 +699,7 @@ impl NetworkManager {
     }
     
     /// ENHANCED: Test bidirectional connectivity between container and host
-    fn test_bidirectional_connectivity(&self, container_pid: i32, container_ip: &str, gateway_ip: &str) {
+    fn test_bidirectional_connectivity(&self, _container_pid: i32, container_ip: &str, gateway_ip: &str) {
         ConsoleLogger::debug(&format!("🔄 [BIDIR-TEST] Testing bidirectional connectivity: container {} <-> gateway {}", 
             container_ip, gateway_ip));
         
@@ -1736,7 +1736,7 @@ impl NetworkManager {
         }
         
         // Check system network state
-        if let Ok(all_links) = CommandExecutor::execute_shell("ip link show") {
+        if let Ok(_all_links) = CommandExecutor::execute_shell("ip link show") {
             ConsoleLogger::debug(&format!("ℹ️ [BRIDGE-DIAG] All network interfaces available"));
         }
         
@@ -2141,9 +2141,9 @@ impl NetworkManager {
     }
 
     /// SECURITY CRITICAL: Verify DNS changes only affected container, not host
-    fn verify_dns_container_isolation(&self, container_pid: i32, expected_content: &str) -> bool {
+    fn verify_dns_container_isolation(&self, container_pid: i32, _expected_content: &str) -> bool {
         // Check host DNS was not modified
-        if let Ok(host_resolv) = std::fs::read_to_string("/etc/resolv.conf") {
+        if let Ok(host_resolv) = FileSystemUtils::read_file("/etc/resolv.conf") {
             if host_resolv.contains(&self.config.bridge_ip.to_string()) {
                 ConsoleLogger::error("🚨 [SECURITY BREACH] Host /etc/resolv.conf was modified by container DNS operation!");
                 return false;
@@ -2173,15 +2173,15 @@ impl NetworkManager {
 
             // Ensure /etc directory exists
             let etc_path = format!("{}/etc", rootfs_path);
-            if let Err(e) = std::fs::create_dir_all(&etc_path) {
+            if let Err(e) = FileSystemUtils::create_dir_all_with_logging(&etc_path, "container /etc directory") {
                 return Err(format!("Failed to create /etc directory: {}", e));
             }
             
             let resolv_conf_path = format!("{}/etc/resolv.conf", rootfs_path);
             // Remove any existing file/symlink first
-            let _ = std::fs::remove_file(&resolv_conf_path);
+            let _ = FileSystemUtils::remove_path(&resolv_conf_path);
             
-            match std::fs::write(&resolv_conf_path, dns_content) {
+            match FileSystemUtils::write_file(&resolv_conf_path, &dns_content) {
                 Ok(_) => {
                     ConsoleLogger::debug(&format!("✅ DNS configuration written via safe fallback method: {}", resolv_conf_path));
                     Ok(())

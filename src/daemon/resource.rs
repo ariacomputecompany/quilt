@@ -2,10 +2,11 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::path::Path;
 use nix::unistd::Pid;
-use crate::utils::{ConsoleLogger, CommandExecutor};
+use crate::utils::console::ConsoleLogger;
+use crate::utils::command::CommandExecutor;
 use crate::daemon::cgroup::CgroupManager;
 use crate::icc::network::ContainerNetworkConfig;
-use crate::utils::FileSystemUtils;
+use crate::utils::filesystem::FileSystemUtils;
 
 /// Thread-safe comprehensive resource manager for container lifecycle
 pub struct ResourceManager {
@@ -107,7 +108,7 @@ impl ResourceManager {
         // Clean up container side veth if container is still running
         if let Some(pid) = container_pid {
             // SECURITY NOTE: Safe cleanup operation - only deletes interface, with || true fallback
-            let cleanup_container_veth = format!("nsenter -t {} -n ip link delete {} 2>/dev/null || true", pid.as_raw(), network_config.veth_container_name);
+            let cleanup_container_veth = format!("nsenter -t {} -n ip link delete {} 2>/dev/null || true", crate::utils::process::ProcessUtils::pid_to_i32(pid), network_config.veth_container_name);
             if let Err(e) = CommandExecutor::execute_shell(&cleanup_container_veth) {
                 ConsoleLogger::debug(&format!("Container veth cleanup attempt failed (expected if container exited): {}", e));
             }
@@ -116,7 +117,7 @@ impl ResourceManager {
         // Clean up any custom interface names
         let interface_name = format!("qnet{}", &network_config.container_id[..8]);
         if let Some(pid) = container_pid {
-            let cleanup_custom_interface = format!("nsenter -t {} -n ip link delete {} 2>/dev/null || true", pid.as_raw(), interface_name);
+            let cleanup_custom_interface = format!("nsenter -t {} -n ip link delete {} 2>/dev/null || true", crate::utils::process::ProcessUtils::pid_to_i32(pid), interface_name);
             if let Err(e) = CommandExecutor::execute_shell(&cleanup_custom_interface) {
                 ConsoleLogger::debug(&format!("Custom interface cleanup attempt failed (expected if container exited): {}", e));
             }
@@ -300,18 +301,12 @@ impl ResourceManager {
 }
 
 /// Thread-safe singleton resource manager using proper synchronization
-use std::sync::Once;
-static mut RESOURCE_MANAGER: Option<Arc<ResourceManager>> = None;
-static RESOURCE_MANAGER_INIT: Once = Once::new();
+use std::sync::OnceLock;
+static RESOURCE_MANAGER: OnceLock<Arc<ResourceManager>> = OnceLock::new();
 
 impl ResourceManager {
     /// Get the global resource manager instance (thread-safe)
     pub fn global() -> Arc<ResourceManager> {
-        unsafe {
-            RESOURCE_MANAGER_INIT.call_once(|| {
-                RESOURCE_MANAGER = Some(Arc::new(ResourceManager::new()));
-            });
-            RESOURCE_MANAGER.as_ref().unwrap().clone()
-        }
+        RESOURCE_MANAGER.get_or_init(|| Arc::new(ResourceManager::new())).clone()
     }
 } 

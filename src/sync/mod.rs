@@ -11,9 +11,5 @@ pub mod metrics;
 pub mod events;
 
 pub use engine::SyncEngine;
-pub use error::SyncError;
 pub use containers::ContainerState;
-pub use network::NetworkConfig;
-pub use monitor::ProcessMonitorService;
-pub use cleanup::CleanupService;
-pub use volumes::{VolumeManager, Volume, Mount, MountType}; 
+pub use volumes::MountType; 

@@ -1,7 +1,7 @@
 use sqlx::SqlitePool;
 use crate::sync::error::{SyncError, SyncResult};
 use crate::daemon::metrics::{ContainerMetrics, CpuMetrics, MemoryMetrics, NetworkMetrics, DiskMetrics};
-use crate::utils::logger::{Logger, LogLevel};
+use crate::utils::console::ConsoleLogger;
 
 pub struct MetricsStore {
     pool: SqlitePool,
@@ -58,7 +58,7 @@ impl MetricsStore {
         match result {
             Ok(_) => Ok(()),
             Err(e) => {
-                Logger::warn(&format!("Failed to store metrics for container {}: {}", 
+                ConsoleLogger::warning(&format!("Failed to store metrics for container {}: {}", 
                     metrics.container_id, e));
                 Err(SyncError::Database(e))
             }
@@ -80,7 +80,7 @@ impl MetricsStore {
         Ok(row.map(|r| r.into()))
     }
 
-    /// Get metrics history for a container
+    /// Get metrics history for a container with time range
     pub async fn get_metrics_history(
         &self, 
         container_id: &str, 
@@ -123,49 +123,13 @@ impl MetricsStore {
 
         let deleted = result.rows_affected();
         if deleted > 0 {
-            Logger::info(&format!("Cleaned up {} old metric records", deleted));
+            ConsoleLogger::info(&format!("Cleaned up {} old metric records", deleted));
         }
 
         Ok(deleted)
     }
 
-    /// Get aggregated metrics for a time period
-    pub async fn get_aggregated_metrics(
-        &self,
-        container_id: &str,
-        start_time: u64,
-        end_time: u64,
-        interval_seconds: u32,
-    ) -> SyncResult<Vec<AggregatedMetrics>> {
-        // Group metrics by time intervals
-        let interval_ms = interval_seconds as i64 * 1000;
-        
-        let rows = sqlx::query_as::<_, AggregatedMetricsRow>(r#"
-            SELECT 
-                (timestamp / ?1) * ?1 as interval_start,
-                COUNT(*) as sample_count,
-                AVG(cpu_usage_usec) as avg_cpu_usage,
-                MAX(cpu_usage_usec) as max_cpu_usage,
-                AVG(memory_current_bytes) as avg_memory_bytes,
-                MAX(memory_current_bytes) as max_memory_bytes,
-                SUM(network_rx_bytes) as total_rx_bytes,
-                SUM(network_tx_bytes) as total_tx_bytes,
-                SUM(disk_read_bytes) as total_read_bytes,
-                SUM(disk_write_bytes) as total_write_bytes
-            FROM container_metrics
-            WHERE container_id = ?2 AND timestamp >= ?3 AND timestamp <= ?4
-            GROUP BY interval_start
-            ORDER BY interval_start DESC
-        "#)
-        .bind(interval_ms)
-        .bind(container_id)
-        .bind(start_time as i64)
-        .bind(end_time as i64)
-        .fetch_all(&self.pool)
-        .await?;
-
-        Ok(rows.into_iter().map(Into::into).collect())
-    }
+    // Complex aggregated metrics method removed - over-engineered for current needs
 }
 
 // Database row types
@@ -232,47 +196,4 @@ impl From<MetricsRow> for ContainerMetrics {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct AggregatedMetrics {
-    pub interval_start: u64,
-    pub sample_count: u32,
-    pub avg_cpu_usage_usec: u64,
-    pub max_cpu_usage_usec: u64,
-    pub avg_memory_bytes: u64,
-    pub max_memory_bytes: u64,
-    pub total_rx_bytes: u64,
-    pub total_tx_bytes: u64,
-    pub total_read_bytes: u64,
-    pub total_write_bytes: u64,
-}
-
-#[derive(sqlx::FromRow)]
-struct AggregatedMetricsRow {
-    interval_start: i64,
-    sample_count: i64,
-    avg_cpu_usage: Option<f64>,
-    max_cpu_usage: Option<i64>,
-    avg_memory_bytes: Option<f64>,
-    max_memory_bytes: Option<i64>,
-    total_rx_bytes: Option<i64>,
-    total_tx_bytes: Option<i64>,
-    total_read_bytes: Option<i64>,
-    total_write_bytes: Option<i64>,
-}
-
-impl From<AggregatedMetricsRow> for AggregatedMetrics {
-    fn from(row: AggregatedMetricsRow) -> Self {
-        AggregatedMetrics {
-            interval_start: row.interval_start as u64,
-            sample_count: row.sample_count as u32,
-            avg_cpu_usage_usec: row.avg_cpu_usage.unwrap_or(0.0) as u64,
-            max_cpu_usage_usec: row.max_cpu_usage.unwrap_or(0) as u64,
-            avg_memory_bytes: row.avg_memory_bytes.unwrap_or(0.0) as u64,
-            max_memory_bytes: row.max_memory_bytes.unwrap_or(0) as u64,
-            total_rx_bytes: row.total_rx_bytes.unwrap_or(0) as u64,
-            total_tx_bytes: row.total_tx_bytes.unwrap_or(0) as u64,
-            total_read_bytes: row.total_read_bytes.unwrap_or(0) as u64,
-            total_write_bytes: row.total_write_bytes.unwrap_or(0) as u64,
-        }
-    }
-}
+// Over-engineered aggregated metrics structs removed - not needed for core functionality

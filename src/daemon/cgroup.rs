@@ -1,7 +1,8 @@
 use std::fs;
 use std::path::PathBuf;
 use nix::unistd::Pid;
-use crate::utils::{ConsoleLogger, ProcessUtils};
+use crate::utils::console::ConsoleLogger;
+use crate::utils::process::ProcessUtils;
 
 #[derive(Debug, Clone)]
 pub struct CgroupLimits {

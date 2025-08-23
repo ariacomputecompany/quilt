@@ -452,6 +452,98 @@ impl CleanupService {
         
         Ok(())
     }
+
+    /// Get cleanup tasks, optionally filtered by container ID
+    pub async fn get_cleanup_tasks(&self, container_filter: Option<&str>) -> SyncResult<Vec<CleanupTask>> {
+        let query = if let Some(container_id) = container_filter {
+            sqlx::query(r#"
+                SELECT id, container_id, resource_type, resource_path, status, 
+                       created_at, completed_at, error_message
+                FROM cleanup_tasks 
+                WHERE container_id = ?
+                ORDER BY created_at DESC
+            "#)
+            .bind(container_id)
+        } else {
+            sqlx::query(r#"
+                SELECT id, container_id, resource_type, resource_path, status, 
+                       created_at, completed_at, error_message
+                FROM cleanup_tasks 
+                ORDER BY created_at DESC
+            "#)
+        };
+        
+        let rows = query.fetch_all(&self.pool).await?;
+        
+        let mut tasks = Vec::new();
+        for row in rows {
+            let resource_type_str: String = row.get("resource_type");
+            let status_str: String = row.get("status");
+            
+            tasks.push(CleanupTask {
+                id: row.get("id"),
+                container_id: row.get("container_id"),
+                resource_type: ResourceType::from_string(&resource_type_str)?,
+                resource_path: row.get("resource_path"),
+                status: CleanupStatus::from_string(&status_str)?,
+                created_at: row.get("created_at"),
+                completed_at: row.get("completed_at"),
+                error_message: row.get("error_message"),
+            });
+        }
+        
+        Ok(tasks)
+    }
+
+    /// Force cleanup of a container - immediately execute all pending cleanup tasks
+    pub async fn force_cleanup(&self, container_id: &str) -> SyncResult<Vec<String>> {
+        // Get all pending cleanup tasks for this container
+        let pending_tasks = sqlx::query(r#"
+            SELECT id, container_id, resource_type, resource_path, status, 
+                   created_at, completed_at, error_message
+            FROM cleanup_tasks 
+            WHERE container_id = ? AND status IN ('pending', 'failed')
+            ORDER BY created_at ASC
+        "#)
+        .bind(container_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut cleaned_resources = Vec::new();
+        
+        for row in pending_tasks {
+            let resource_type_str: String = row.get("resource_type");
+            let status_str: String = row.get("status");
+            
+            let task = CleanupTask {
+                id: row.get("id"),
+                container_id: row.get("container_id"),
+                resource_type: ResourceType::from_string(&resource_type_str)?,
+                resource_path: row.get("resource_path"),
+                status: CleanupStatus::from_string(&status_str)?,
+                created_at: row.get("created_at"),
+                completed_at: row.get("completed_at"),
+                error_message: row.get("error_message"),
+            };
+
+            // Execute the cleanup task immediately
+            match Self::execute_cleanup_task(&self.pool, task.clone()).await {
+                Ok(()) => {
+                    cleaned_resources.push(format!("{}:{}", task.resource_type.to_string(), task.resource_path));
+                }
+                Err(e) => {
+                    tracing::error!("Force cleanup failed for task {} ({:?}: {}): {}", 
+                                   task.id, task.resource_type, task.resource_path, e);
+                    // Continue with other tasks even if one fails
+                }
+            }
+        }
+
+        tracing::info!("Force cleanup completed for container {}, cleaned {} resources", 
+                      container_id, cleaned_resources.len());
+        
+        Ok(cleaned_resources)
+    }
 }
 
 #[cfg(test)]

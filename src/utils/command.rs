@@ -1,200 +1,123 @@
-use std::process::{Command, Output};
-use std::collections::HashMap;
+use std::process::Command;
+use std::fs;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CommandResult {
+    pub success: bool,
     pub stdout: String,
     pub stderr: String,
-    pub success: bool,
     pub exit_code: Option<i32>,
-}
-
-impl CommandResult {
-    pub fn new(output: Output) -> Self {
-        Self {
-            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-            success: output.status.success(),
-            exit_code: output.status.code(),
-        }
-    }
 }
 
 pub struct CommandExecutor;
 
 impl CommandExecutor {
-    /// Execute a shell command and return structured result
+    /// Execute a shell command and return result
     pub fn execute_shell(command: &str) -> Result<CommandResult, String> {
-        let output = Command::new("/bin/sh")
+        let output = Command::new("sh")
             .arg("-c")
             .arg(command)
             .output()
-            .map_err(|e| format!("Failed to execute command: {}", e))?;
+            .map_err(|e| format!("Failed to execute command '{}': {}", command, e))?;
 
-        Ok(CommandResult::new(output))
+        Ok(CommandResult {
+            success: output.status.success(),
+            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+            exit_code: output.status.code(),
+        })
     }
 
-    /// Check if a command is available in PATH
+    /// Check if a command is available in the system PATH
     pub fn is_command_available(command: &str) -> bool {
-        match Command::new("/bin/sh")
-            .arg("-c")
-            .arg(&format!("command -v {}", command))
+        Command::new("which")
+            .arg(command)
             .output()
-        {
-            Ok(output) => output.status.success(),
-            Err(_) => false,
-        }
+            .map(|output| output.status.success())
+            .unwrap_or(false)
     }
 
     /// Execute a package manager command
-    pub fn execute_package_manager(manager: &str, action: &str, packages: &[&str]) -> Result<CommandResult, String> {
-        let mut cmd = Command::new(manager);
-        
-        match (manager, action) {
-            ("apt", "update") => {
-                cmd.arg("update").arg("-y");
-            }
-            ("apt", "install") => {
-                cmd.arg("install").arg("-y");
-                cmd.args(packages);
-            }
-            ("yum", "install") => {
-                cmd.arg("install").arg("-y");
-                cmd.args(packages);
-            }
-            ("dnf", "install") => {
-                cmd.arg("install").arg("-y");
-                cmd.args(packages);
-            }
-            _ => return Err(format!("Unsupported package manager action: {} {}", manager, action)),
+    pub fn execute_package_manager(
+        package_manager: &str,
+        action: &str,
+        packages: &[&str],
+    ) -> Result<CommandResult, String> {
+        if !Self::is_command_available(package_manager) {
+            return Err(format!("Package manager '{}' not available", package_manager));
         }
 
-        let output = cmd.output()
-            .map_err(|e| format!("Failed to execute {} command: {}", manager, e))?;
+        let mut cmd = Command::new(package_manager);
+        cmd.arg(action);
 
-        Ok(CommandResult::new(output))
+        // Add common flags based on package manager
+        match package_manager {
+            "apt" | "apt-get" => {
+                cmd.arg("-y"); // Assume yes to prompts
+                if action == "install" || action == "upgrade" {
+                    cmd.arg("--no-install-recommends"); // Minimal installation
+                }
+            }
+            "yum" | "dnf" => {
+                cmd.arg("-y"); // Assume yes to prompts
+            }
+            "apk" => {
+                cmd.arg("--no-cache"); // Don't cache packages
+            }
+            _ => {} // Other package managers use defaults
+        }
+
+        // Add packages if provided
+        for package in packages {
+            cmd.arg(package);
+        }
+
+        let output = cmd
+            .output()
+            .map_err(|e| format!("Failed to execute {} {}: {}", package_manager, action, e))?;
+
+        Ok(CommandResult {
+            success: output.status.success(),
+            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+            exit_code: output.status.code(),
+        })
     }
 
-    /// Check if a binary has dependencies in /nix/store (indicating it's Nix-linked)
-    pub fn is_nix_linked_binary(binary_path: &str) -> bool {
-        match Command::new("ldd").arg(binary_path).output() {
-            Ok(output) => {
-                let ldd_output = String::from_utf8_lossy(&output.stdout);
-                ldd_output.contains("/nix/store")
-            }
-            Err(_) => false,
-        }
-    }
-
-    /// Get library dependencies for a binary
-    pub fn get_binary_dependencies(binary_path: &str) -> Vec<String> {
-        match Command::new("ldd").arg(binary_path).output() {
-            Ok(output) => {
-                let ldd_output = String::from_utf8_lossy(&output.stdout);
-                ldd_output
-                    .lines()
-                    .filter_map(|line| {
-                        if let Some(start) = line.find(" => ") {
-                            if let Some(end) = line[start + 4..].find(" (") {
-                                let path = line[start + 4..start + 4 + end].trim();
-                                if !path.is_empty() && path != "(0x" {
-                                    return Some(path.to_string());
-                                }
-                            }
-                        }
-                        None
-                    })
-                    .collect()
-            }
-            Err(_) => Vec::new(),
-        }
-    }
-
-    /// Check if a package manager command would succeed
-    pub fn validate_package_manager_command(manager: &str, packages: &[&str]) -> Result<(), String> {
-        if !Self::is_command_available(manager) {
-            return Err(format!("Package manager '{}' not available", manager));
+    /// Check if a binary is linked to Nix store paths
+    pub fn is_nix_linked_binary(path: &str) -> bool {
+        // Check if the binary itself is in /nix/store
+        if path.starts_with("/nix/store") {
+            return true;
         }
 
-        if packages.is_empty() {
-            return Err("No packages specified".to_string());
-        }
-
-        // For some package managers, we can do dry-run validation
-        match manager {
-            "apt" => {
-                // Check if packages exist in apt cache
-                for package in packages {
-                    match Command::new("apt")
-                        .arg("show")
-                        .arg(package)
-                        .output()
-                    {
-                        Ok(output) => {
-                            if !output.status.success() {
-                                return Err(format!("Package '{}' not found in apt", package));
-                            }
-                        }
-                        Err(_) => return Err(format!("Failed to validate package '{}'", package)),
+        // Check if the binary is a symlink pointing to /nix/store
+        if let Ok(metadata) = fs::symlink_metadata(path) {
+            if metadata.file_type().is_symlink() {
+                if let Ok(target) = fs::read_link(path) {
+                    if target.to_string_lossy().contains("/nix/store") {
+                        return true;
                     }
                 }
             }
-            _ => {
-                // For other package managers, basic validation passed
+        }
+
+        // Check if the binary has Nix store dependencies using ldd
+        if let Ok(output) = Command::new("ldd").arg(path).output() {
+            if output.status.success() {
+                let ldd_output = String::from_utf8_lossy(&output.stdout);
+                return ldd_output.contains("/nix/store");
             }
         }
 
-        Ok(())
-    }
-
-    /// Execute command with environment variables
-    pub fn execute_with_env(command: &str, env_vars: HashMap<String, String>) -> Result<CommandResult, String> {
-        let mut cmd = Command::new("/bin/sh");
-        cmd.arg("-c").arg(command);
-        
-        for (key, value) in env_vars {
-            cmd.env(key, value);
+        // Fallback: check if readelf shows Nix store paths in dynamic section
+        if let Ok(output) = Command::new("readelf").arg("-d").arg(path).output() {
+            if output.status.success() {
+                let readelf_output = String::from_utf8_lossy(&output.stdout);
+                return readelf_output.contains("/nix/store");
+            }
         }
 
-        let output = cmd.output()
-            .map_err(|e| format!("Failed to execute command with environment: {}", e))?;
-
-        Ok(CommandResult::new(output))
+        false
     }
-
-    /// Execute command with timeout (basic implementation)
-    pub fn execute_with_timeout(command: &str, timeout_seconds: u64) -> Result<CommandResult, String> {
-        use std::time::{Duration, Instant};
-
-        let start = Instant::now();
-        
-        // This is a simplified timeout implementation
-        // In production, you'd want to use async/await or more sophisticated timeout handling
-        let output = Command::new("/bin/sh")
-            .arg("-c")
-            .arg(command)
-            .output()
-            .map_err(|e| format!("Failed to execute command: {}", e))?;
-
-        if start.elapsed() > Duration::from_secs(timeout_seconds) {
-            return Err("Command execution timed out".to_string());
-        }
-
-        Ok(CommandResult::new(output))
-    }
-
-    /// Get command output as lines
-    pub fn get_command_lines(command: &str) -> Result<Vec<String>, String> {
-        let result = Self::execute_shell(command)?;
-        
-        if !result.success {
-            return Err(format!("Command failed: {}", result.stderr));
-        }
-
-        Ok(result.stdout
-            .lines()
-            .map(|line| line.trim().to_string())
-            .filter(|line| !line.is_empty())
-            .collect())
-    }
-} 
+}

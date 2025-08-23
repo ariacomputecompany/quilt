@@ -4,6 +4,13 @@ use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use crate::sync::error::{SyncError, SyncResult};
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogEntry {
+    pub timestamp: i64,
+    pub level: String,
+    pub message: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ContainerState {
     Created,
@@ -94,56 +101,6 @@ impl ContainerManager {
         Self { pool }
     }
     
-    pub async fn create_container(&self, config: ContainerConfig) -> SyncResult<()> {
-        // Check if name already exists
-        if let Some(ref name) = config.name {
-            if !name.is_empty() {
-                let existing = sqlx::query("SELECT id FROM containers WHERE name = ?")
-                    .bind(name)
-                    .fetch_optional(&self.pool)
-                    .await?;
-                    
-                if existing.is_some() {
-                    return Err(SyncError::ValidationFailed {
-                        message: format!("Container with name '{}' already exists", name),
-                    });
-                }
-            }
-        }
-        
-        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
-        let environment_json = serde_json::to_string(&config.environment)?;
-        
-        sqlx::query(r#"
-            INSERT INTO containers (
-                id, name, image_path, command, environment, state,
-                memory_limit_mb, cpu_limit_percent,
-                enable_network_namespace, enable_pid_namespace, enable_mount_namespace,
-                enable_uts_namespace, enable_ipc_namespace,
-                created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        "#)
-        .bind(&config.id)
-        .bind(&config.name)
-        .bind(&config.image_path)
-        .bind(&config.command)
-        .bind(&environment_json)
-        .bind(ContainerState::Created.to_string())
-        .bind(config.memory_limit_mb)
-        .bind(config.cpu_limit_percent)
-        .bind(config.enable_network_namespace)
-        .bind(config.enable_pid_namespace)
-        .bind(config.enable_mount_namespace)
-        .bind(config.enable_uts_namespace)
-        .bind(config.enable_ipc_namespace)
-        .bind(now)
-        .bind(now)
-        .execute(&self.pool)
-        .await?;
-        
-        tracing::info!("Created container {} in database", config.id);
-        Ok(())
-    }
     
     pub async fn update_container_state(&self, container_id: &str, new_state: ContainerState) -> SyncResult<()> {
         let current_state = self.get_container_state(container_id).await?;
@@ -374,21 +331,78 @@ impl ContainerManager {
         Ok(())
     }
     
-    pub async fn container_exists(&self, container_id: &str) -> SyncResult<bool> {
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM containers WHERE id = ?")
-            .bind(container_id)
-            .fetch_one(&self.pool)
-            .await?;
+    
+    
+    /// Store a log entry for a container
+    pub async fn store_log(&self, container_id: &str, level: &str, message: &str) -> SyncResult<()> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
         
-        Ok(count > 0)
+        sqlx::query(r#"
+            INSERT INTO container_logs (container_id, timestamp, level, message)
+            VALUES (?, ?, ?, ?)
+        "#)
+        .bind(container_id)
+        .bind(timestamp)
+        .bind(level)
+        .bind(message)
+        .execute(&self.pool)
+        .await?;
+        
+        Ok(())
     }
     
-    pub async fn get_containers_needing_cleanup(&self) -> SyncResult<Vec<String>> {
-        let rows: Vec<(String,)> = sqlx::query_as(
-            "SELECT id FROM containers WHERE state IN ('exited', 'error') AND id NOT IN (SELECT container_id FROM cleanup_tasks WHERE status = 'completed')"
-        ).fetch_all(&self.pool).await?;
+    /// Get logs for a container with optional filtering
+    pub async fn get_container_logs(&self, container_id: &str, limit: Option<u32>) -> SyncResult<Vec<LogEntry>> {
+        let limit_clause = if let Some(l) = limit {
+            format!("LIMIT {}", l)
+        } else {
+            String::new()
+        };
         
-        Ok(rows.into_iter().map(|(id,)| id).collect())
+        let query = format!(r#"
+            SELECT timestamp, level, message
+            FROM container_logs
+            WHERE container_id = ?
+            ORDER BY timestamp DESC
+            {}
+        "#, limit_clause);
+        
+        let rows = sqlx::query(&query)
+            .bind(container_id)
+            .fetch_all(&self.pool)
+            .await?;
+        
+        let mut logs = Vec::new();
+        for row in rows {
+            logs.push(LogEntry {
+                timestamp: row.get("timestamp"),
+                level: row.get("level"),
+                message: row.get("message"),
+            });
+        }
+        
+        Ok(logs)
+    }
+    
+    /// Clean up old logs for a container (keep last N entries)
+    pub async fn cleanup_container_logs(&self, container_id: &str, keep_count: u32) -> SyncResult<u64> {
+        let result = sqlx::query(r#"
+            DELETE FROM container_logs
+            WHERE container_id = ? AND id NOT IN (
+                SELECT id FROM container_logs
+                WHERE container_id = ?
+                ORDER BY timestamp DESC
+                LIMIT ?
+            )
+        "#)
+        .bind(container_id)
+        .bind(container_id)
+        .bind(keep_count as i64)
+        .execute(&self.pool)
+        .await?;
+        
+        Ok(result.rows_affected())
     }
 }
 

@@ -15,40 +15,15 @@ use crate::quilt::{
     ContainerStatus,
 };
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub enum ConnectionType {
     Tcp { port: u16 },
-    Udp { port: u16 },
-    WebSocket { path: String },
-    Database { pool_size: u32, db_type: DatabaseType },
-    MessageQueue { queue_name: String },
-    Http { method: String },
-    Grpc { service: String },
 }
 
-#[derive(Debug, Clone)]
-pub enum DatabaseType {
-    PostgreSql,
-    MySql,
-    Redis,
-    MongoDb,
-}
 
-#[derive(Debug, Clone)]
-pub struct ConnectionInfo {
-    pub from_container: String,
-    pub to_container: String,
-    pub connection_type: ConnectionType,
-    pub established_at: u64,
-    pub status: ConnectionStatus,
-    pub connection_id: String,
-}
-
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub enum ConnectionStatus {
-    Establishing,
     Active,
-    Failed(String),
     Disconnected,
 }
 
@@ -449,7 +424,7 @@ async fn handle_disconnect_command(
     connection_id: Option<String>,
     force: bool,
     all: bool,
-    client: &mut QuiltServiceClient<Channel>
+    _client: &mut QuiltServiceClient<Channel>
 ) -> Result<(), Box<dyn std::error::Error>> {
     if all {
         println!("🔌 Disconnecting all connections for {}", from_container);

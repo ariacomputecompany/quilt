@@ -2,8 +2,12 @@ use crate::daemon::namespace::{NamespaceManager, NamespaceConfig};
 use crate::daemon::cgroup::{CgroupManager, CgroupLimits};
 use crate::daemon::manager::RuntimeManager;
 use crate::daemon::readiness::{ContainerReadinessManager, ReadinessConfig, cleanup_readiness_signal};
-use crate::utils::{ConsoleLogger, FileSystemUtils, CommandExecutor, ProcessUtils, ImageManager, ConcurrentContainerRegistry};
+use crate::utils::console::ConsoleLogger;
+use crate::utils::process::ProcessUtils;
+use crate::utils::filesystem::FileSystemUtils;
+use crate::utils::command::CommandExecutor;
 use crate::icc::network::{ContainerNetworkConfig, NetworkManager};
+use crate::sync::ContainerState;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::process::Command;
@@ -15,21 +19,7 @@ use nix::unistd::{chroot, chdir, Pid, execv};
 use std::os::unix::fs::PermissionsExt;
 use std::ffi::CString;
 use crate::daemon::resource::ResourceManager;
-use std::time::SystemTime;
 
-#[derive(Debug, Clone)]
-pub enum ContainerState {
-    PENDING,
-    RUNNING,
-    EXITED(i32),
-    FAILED(String),
-}
-
-#[derive(Debug, Clone)]
-pub struct LogEntry {
-    pub timestamp: u64,
-    pub message: String,
-}
 
 #[derive(Debug, Clone)]
 pub struct ContainerConfig {
@@ -81,7 +71,7 @@ pub struct Container {
     pub id: String,
     pub config: ContainerConfig,
     pub state: ContainerState,
-    pub logs: Vec<LogEntry>,
+    pub logs: Vec<String>,
     pub pid: Option<Pid>,
     pub rootfs_path: String,
     pub created_at: u64,
@@ -114,7 +104,7 @@ impl Container {
         Container {
             id: id.clone(),
             config,
-            state: ContainerState::PENDING,
+            state: ContainerState::Created,
             logs: Vec::new(),
             pid: None,
             rootfs_path: format!("/tmp/quilt-containers/{}", id),
@@ -125,30 +115,25 @@ impl Container {
     }
 
     pub fn add_log(&mut self, message: String) {
-        let timestamp = ProcessUtils::get_timestamp();
+        let _timestamp = ProcessUtils::get_timestamp();
 
-        self.logs.push(LogEntry {
-            timestamp,
-            message,
-        });
+        self.logs.push(message);
     }
 }
 
 pub struct ContainerRuntime {
-    containers: Arc<ConcurrentContainerRegistry<Container>>,
+    containers: Arc<tokio::sync::Mutex<HashMap<String, Container>>>,
     namespace_manager: NamespaceManager,
     runtime_manager: RuntimeManager,
-    resource_manager: ResourceManager,
     readiness_manager: ContainerReadinessManager,
 }
 
 impl ContainerRuntime {
     pub fn new() -> Self {
         ContainerRuntime {
-            containers: Arc::new(ConcurrentContainerRegistry::new()),
+            containers: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             namespace_manager: NamespaceManager::new(),
             runtime_manager: RuntimeManager::new(),
-            resource_manager: ResourceManager::new(),
             readiness_manager: ContainerReadinessManager::new(ReadinessConfig::default()),
         }
     }
@@ -160,34 +145,44 @@ impl ContainerRuntime {
         let rootfs_path = container.rootfs_path.clone();
 
         // Lock-free container insertion
-        self.containers.insert(id.clone(), container);
+        if let Ok(mut containers) = self.containers.try_lock() {
+            containers.insert(id.clone(), container);
+        } else {
+            return Err(format!("Failed to lock containers for insertion of {}", id));
+        }
 
         // Setup rootfs
         ConsoleLogger::debug(&format!("Setting up rootfs for {} at {}", id, rootfs_path));
         if let Err(e) = self.setup_rootfs(&id) {
             ConsoleLogger::error(&format!("[CREATE] Rootfs setup failed for {}: {}", id, e));
             // Rollback: remove container from map
-            self.containers.remove(&id);
+            if let Ok(mut containers) = self.containers.try_lock() {
+                containers.remove(&id);
+            }
             return Err(e);
         }
         
         // Verify rootfs was actually created and has content
         if !std::path::Path::new(&rootfs_path).exists() {
             ConsoleLogger::error(&format!("Rootfs path {} was not created after setup", rootfs_path));
-            self.containers.remove(&id);
+            if let Ok(mut containers) = self.containers.try_lock() {
+                containers.remove(&id);
+            }
             return Err(format!("Rootfs creation failed for container {}", id));
         }
         
-        // Check if rootfs has any content
-        let entries = std::fs::read_dir(&rootfs_path)
+        // Check if rootfs has any content  
+        let entries = FileSystemUtils::list_dir(&rootfs_path)
             .map_err(|e| format!("Failed to read rootfs directory: {}", e))?;
-        if entries.count() == 0 {
+        if entries.is_empty() {
             ConsoleLogger::error(&format!("Rootfs {} is empty after extraction", rootfs_path));
-            self.containers.remove(&id);
-            return Err(format!("Rootfs extraction failed - directory is empty", ));
+            if let Ok(mut containers) = self.containers.try_lock() {
+                containers.remove(&id);
+            }
+            return Err(format!("Rootfs extraction failed - directory is empty"));
         }
 
-        self.update_container_state(&id, ContainerState::PENDING);
+        self.update_container_state(&id, ContainerState::Starting);
 
         ConsoleLogger::container_created(&id);
         ConsoleLogger::success(&format!("Container {} created with rootfs at {}", id, rootfs_path));
@@ -206,9 +201,13 @@ impl ContainerRuntime {
         container.rootfs_path = rootfs_path.clone();
         
         // Lock-free container insertion
-        self.containers.insert(id.clone(), container);
+        if let Ok(mut containers) = self.containers.try_lock() {
+            containers.insert(id.clone(), container);
+        } else {
+            return Err(format!("Failed to lock containers for insertion of {}", id));
+        }
         
-        self.update_container_state(&id, ContainerState::PENDING);
+        self.update_container_state(&id, ContainerState::Starting);
         
         ConsoleLogger::debug(&format!("Registered existing container {} with rootfs {}", id, rootfs_path));
         Ok(())
@@ -218,9 +217,15 @@ impl ContainerRuntime {
         ConsoleLogger::progress(&format!("[START] Starting container: {}", id));
 
         // Get container configuration (lock-free read)
-        let (config, rootfs_path) = self.containers.with_container(id, |container| {
-            (container.config.clone(), container.rootfs_path.clone())
-        }).ok_or_else(|| format!("Container {} not found", id))?;
+        let (config, rootfs_path) = if let Ok(containers) = self.containers.try_lock() {
+            if let Some(container) = containers.get(id) {
+                (container.config.clone(), container.rootfs_path.clone())
+            } else {
+                return Err(format!("Container {} not found", id));
+            }
+        } else {
+            return Err(format!("Failed to lock containers for {}", id));
+        };
 
         // Register mounts with ResourceManager
         let mount_points = vec![
@@ -261,9 +266,11 @@ impl ContainerRuntime {
         let command_for_logs = format!("{:?}", config.command);
         
         // Add log entry (per-container lock)
-        self.containers.update(id, |container| {
-            container.add_log(format!("Starting container execution with command: {}", command_for_logs));
-        });
+        if let Ok(mut containers) = self.containers.try_lock() {
+            if let Some(container) = containers.get_mut(id) {
+                container.add_log(format!("Starting container execution with command: {}", command_for_logs));
+            }
+        }
         
         // Prepare all data needed by child process (avoid heavy captures)
         // ENHANCED: Inject readiness check into command
@@ -330,9 +337,9 @@ impl ContainerRuntime {
             // NOW wait for network configuration AFTER chroot if networking is enabled
             if network_enabled {
                 // Ensure /tmp exists in container
-                if !std::path::Path::new("/tmp").exists() {
+                if !FileSystemUtils::exists("/tmp") {
                     println!("Creating /tmp directory in container");
-                    if let Err(e) = std::fs::create_dir_all("/tmp") {
+                    if let Err(e) = FileSystemUtils::create_dir_all_with_logging("/tmp", "container /tmp") {
                         eprintln!("Failed to create /tmp in container: {}", e);
                         // Try to continue anyway
                     }
@@ -347,7 +354,7 @@ impl ContainerRuntime {
                     if std::path::Path::new(&network_ready_path).exists() {
                         println!("Network configuration ready, proceeding...");
                         // Clean up the flag file
-                        let _ = std::fs::remove_file(&network_ready_path);
+                        let _ = FileSystemUtils::remove_path(&network_ready_path);
                         break;
                     }
                     
@@ -523,7 +530,7 @@ impl ContainerRuntime {
                 // EVENT-DRIVEN: Just check immediately, no sleep
                 if !ProcessUtils::is_process_running(pid) {
                     ConsoleLogger::error(&format!("Container {} process {} died immediately after starting", id, ProcessUtils::pid_to_i32(pid)));
-                    self.update_container_state(id, ContainerState::FAILED("Process died immediately".to_string()));
+                    self.update_container_state(id, ContainerState::Error);
                     return Err(format!("Container {} process died immediately", id));
                 }
                 
@@ -533,7 +540,7 @@ impl ContainerRuntime {
                         // Double-check process is still alive after readiness check
                         if !ProcessUtils::is_process_running(pid) {
                             ConsoleLogger::error(&format!("Container {} process {} died during readiness check", id, ProcessUtils::pid_to_i32(pid)));
-                            self.update_container_state(id, ContainerState::FAILED("Process died during readiness".to_string()));
+                            self.update_container_state(id, ContainerState::Error);
                             return Err(format!("Container {} process died during readiness check", id));
                         }
                         
@@ -542,11 +549,13 @@ impl ContainerRuntime {
                         
                         ConsoleLogger::debug(&format!("[START] Locking containers map to update state for {}", id));
                         // Update container state using lock-free concurrent operations
-                        self.containers.update(id, |container| {
-                            container.pid = Some(pid);
-                            container.state = ContainerState::RUNNING;
-                            container.add_log(format!("Container started with PID: {} and verified ready (event-driven)", pid));
-                        });
+                        if let Ok(mut containers) = self.containers.try_lock() {
+                            if let Some(container) = containers.get_mut(id) {
+                                container.pid = Some(pid);
+                                container.state = ContainerState::Running;
+                                container.add_log(format!("Container started with PID: {} and verified ready (event-driven)", pid));
+                            }
+                        }
                         ConsoleLogger::debug(&format!("[START] Unlocked containers map for {}", id));
                     }
                     Err(e) => {
@@ -555,7 +564,7 @@ impl ContainerRuntime {
                         let _ = ProcessUtils::terminate_process(pid, 2);
                         // Clean up readiness signal
                         cleanup_readiness_signal(id);
-                        self.update_container_state(id, ContainerState::FAILED(e.clone()));
+                        self.update_container_state(id, ContainerState::Error);
                         return Err(format!("Container {} failed to become ready (event-driven): {}", id, e));
                     }
                 }
@@ -564,7 +573,7 @@ impl ContainerRuntime {
                 let id_clone = id.to_string();
                 let start_time = std::time::SystemTime::now();
                 let containers_ref = self.containers.clone(); // Clone the Arc for the task
-                let resource_manager = ResourceManager::global();
+                let _resource_manager = ResourceManager::global();
                 
                 // ✅ CRITICAL FIX: Use a JoinHandle to manage the task lifecycle
                 let wait_task = tokio::spawn(async move {
@@ -588,15 +597,17 @@ impl ContainerRuntime {
                     };
 
                     // Update container state to EXITED
-                    containers_ref.update(&id_clone, |container| {
-                        if let Some(code) = exit_code {
-                            container.state = ContainerState::EXITED(code);
-                        } else {
-                            container.state = ContainerState::FAILED("Process monitoring failed".to_string());
+                    if let Ok(mut containers) = containers_ref.try_lock() {
+                        if let Some(container) = containers.get_mut(&id_clone) {
+                            if let Some(_code) = exit_code {
+                                container.state = ContainerState::Exited;
+                            } else {
+                                container.state = ContainerState::Error;
+                            }
+                            container.pid = None;
+                            container.add_log("Container process completed".to_string());
                         }
-                        container.pid = None;
-                        container.add_log("Container process completed".to_string());
-                    });
+                    }
 
                     // Don't cleanup resources on exit - container can be restarted
                     ConsoleLogger::debug(&format!("Container {} exited, resources preserved for restart", id_clone));
@@ -608,14 +619,16 @@ impl ContainerRuntime {
                 // For now, we'll let it run to completion since it cleans up after itself
                 
                 // Update container state to store the monitoring task
-                self.containers.update(id, |container| {
-                    container.monitoring_task = Some(wait_task);
-                });
+                if let Ok(mut containers) = self.containers.try_lock() {
+                    if let Some(container) = containers.get_mut(id) {
+                        container.monitoring_task = Some(wait_task);
+                    }
+                }
 
                 Ok(())
             }
             Err(e) => {
-                self.update_container_state(id, ContainerState::FAILED(e.clone()));
+                self.update_container_state(id, ContainerState::Error);
                 Err(format!("Failed to start container {}: {}", id, e))
             }
         }
@@ -623,13 +636,27 @@ impl ContainerRuntime {
 
     fn setup_rootfs(&self, container_id: &str) -> Result<(), String> {
         // Lock-free read of container configuration
-        let image_path = self.containers.with_container(container_id, |container| {
-            container.config.image_path.clone()
-        }).ok_or_else(|| format!("Container {} not found", container_id))?;
+        let image_path = if let Ok(containers) = self.containers.try_lock() {
+            if let Some(container) = containers.get(container_id) {
+                container.config.image_path.clone()
+            } else {
+                return Err(format!("Container {} not found", container_id));
+            }
+        } else {
+            return Err(format!("Failed to lock containers for {}", container_id));
+        };
 
-        // Use ImageManager for efficient copy-on-write setup
-        if FileSystemUtils::is_file(&image_path) {
-            let rootfs_path = ImageManager::setup_container_rootfs(container_id, &image_path)?;
+        // Extract image to simple rootfs directory
+        if std::path::Path::new(&image_path).is_file() {
+            let rootfs_path = format!("/tmp/quilt-containers/{}", container_id);
+            
+            // Create the directory first using FileSystemUtils
+            FileSystemUtils::create_dir_all_with_logging(&rootfs_path, "container rootfs")?;
+            
+            // Extract the image
+            if let Err(e) = self.extract_image(&image_path, &rootfs_path) {
+                return Err(format!("Failed to extract container image: {}", e));
+            }
             
             // Fix broken symlinks and ensure working binaries
             self.fix_container_binaries(&rootfs_path)?;
@@ -825,20 +852,38 @@ impl ContainerRuntime {
         if let Some(shell_binary) = usable_shell {
             // Copy the working shell
             match FileSystemUtils::copy_file(shell_binary, shell_path) {
-                            Ok(_) => {
+                Ok(_) => {
                     FileSystemUtils::make_executable(shell_path)?;
+                    
+                    // Try to copy shell dependencies for better compatibility
+                    let container_root = shell_path.split("/bin").next().unwrap_or("");
+                    if let Err(e) = self.copy_shell_dependencies(shell_binary, container_root) {
+                        ConsoleLogger::warning(&format!("Failed to copy shell dependencies: {}", e));
+                    } else {
+                        ConsoleLogger::debug("Shell dependencies copied successfully");
+                    }
+                    
                     ConsoleLogger::success(&format!("Created shell by copying from {}", shell_binary));
-                                return Ok(());
-                            }
-                            Err(e) => {
+                    return Ok(());
+                }
+                Err(e) => {
                     ConsoleLogger::warning(&format!("Failed to copy shell from {}: {}", shell_binary, e));
                 }
             }
         }
 
-        // Fallback: create a minimal shell binary using C code
+        // Fallback 1: create a minimal shell binary using C code
         ConsoleLogger::progress("Creating minimal C shell binary");
-        self.create_minimal_shell_binary(shell_path)
+        match self.create_minimal_shell_binary(shell_path) {
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                ConsoleLogger::warning(&format!("Failed to create minimal shell binary: {}", e));
+            }
+        }
+        
+        // Fallback 2: create a shell script as last resort
+        ConsoleLogger::progress("Creating shell script as final fallback");
+        self.create_shell_script(shell_path)
     }
 
     /// Copy essential libraries for a shell binary
@@ -1159,7 +1204,7 @@ int main(int argc, char *argv[]) {
         Err("Could not create minimal shell binary".to_string())
     }
 
-    /// Create a shell script implementation
+    /// Create a shell script implementation as final fallback
     fn create_shell_script(&self, shell_path: &str) -> Result<(), String> {
         // Create a simple shell script that uses exec to replace itself
         let shell_script = r#"#!/bin/sh
@@ -1416,22 +1461,36 @@ done
 
     fn update_container_state(&self, container_id: &str, new_state: ContainerState) {
         // Per-container lock for state update
-        self.containers.update(container_id, |container| {
-            container.state = new_state;
-        });
+        if let Ok(mut containers) = self.containers.try_lock() {
+            if let Some(container) = containers.get_mut(container_id) {
+                container.state = new_state;
+            }
+        }
     }
 
     #[allow(dead_code)]
     pub fn get_container_state(&self, container_id: &str) -> Option<ContainerState> {
-        self.containers.with_container(container_id, |container| container.state.clone())
+        if let Ok(containers) = self.containers.try_lock() {
+            containers.get(container_id).map(|c| c.state.clone())
+        } else {
+            None
+        }
     }
 
-    pub fn get_container_logs(&self, container_id: &str) -> Option<Vec<LogEntry>> {
-        self.containers.with_container(container_id, |container| container.logs.clone())
+    pub fn get_container_logs(&self, container_id: &str) -> Option<Vec<String>> {
+        if let Ok(containers) = self.containers.try_lock() {
+            containers.get(container_id).map(|c| c.logs.clone())
+        } else {
+            None
+        }
     }
 
     pub fn get_container_info(&self, container_id: &str) -> Option<Container> {
-        self.containers.get(container_id)
+        if let Ok(containers) = self.containers.try_lock() {
+            containers.get(container_id).cloned()
+        } else {
+            None
+        }
     }
 
     // Internal method for getting container stats
@@ -1439,7 +1498,7 @@ done
 
         let mut stats = HashMap::new();
         
-        if let Some(pid) = container.pid {
+        if let Some(_pid) = container.pid {
             // Get memory usage from cgroups
             let cgroup_manager = CgroupManager::new(container_id.to_string());
             if let Ok(memory_usage) = cgroup_manager.get_memory_usage() {
@@ -1449,10 +1508,11 @@ done
 
         // Get container state
         match &container.state {
-            ContainerState::PENDING => stats.insert("state".to_string(), "pending".to_string()),
-            ContainerState::RUNNING => stats.insert("state".to_string(), "running".to_string()),
-            ContainerState::EXITED(code) => stats.insert("state".to_string(), format!("exited({})", code)),
-            ContainerState::FAILED(msg) => stats.insert("state".to_string(), format!("failed: {}", msg)),
+            ContainerState::Created => stats.insert("state".to_string(), "created".to_string()),
+            ContainerState::Starting => stats.insert("state".to_string(), "starting".to_string()),
+            ContainerState::Running => stats.insert("state".to_string(), "running".to_string()),
+            ContainerState::Exited => stats.insert("state".to_string(), "exited".to_string()),
+            ContainerState::Error => stats.insert("state".to_string(), "error".to_string()),
         };
 
         // Get PID if available
@@ -1464,13 +1524,23 @@ done
     }
 
     pub fn get_container_stats(&self, container_id: &str) -> Result<HashMap<String, String>, String> {
-        self.containers.with_container(container_id, |container| {
-            self.get_container_stats_for_container(container, container_id)
-        }).unwrap_or_else(|| Err(format!("Container {} not found", container_id)))
+        if let Ok(containers) = self.containers.try_lock() {
+            if let Some(container) = containers.get(container_id) {
+                self.get_container_stats_for_container(container, container_id)
+            } else {
+                Err(format!("Container {} not found", container_id))
+            }
+        } else {
+            Err(format!("Failed to lock containers for {}", container_id))
+        }
     }
 
     pub fn get_container_info_and_stats(&self, container_id: &str) -> (Option<Container>, Result<HashMap<String, String>, String>) {
-        let container_info = self.containers.get(container_id);
+        let container_info = if let Ok(containers) = self.containers.try_lock() {
+            containers.get(container_id).cloned()
+        } else {
+            None
+        };
         let container_stats = self.get_container_stats(container_id);
         (container_info, container_stats)
     }
@@ -1479,9 +1549,15 @@ done
         ConsoleLogger::progress(&format!("Stopping container: {}", container_id));
 
         // Get container PID and monitoring task
-        let (pid, monitoring_task) = self.containers.with_container(container_id, |container| {
-            (container.pid, container.monitoring_task.as_ref().map(|t| t.abort_handle()))
-        }).ok_or_else(|| format!("Container {} not found", container_id))?;
+        let (pid, monitoring_task) = if let Ok(containers) = self.containers.try_lock() {
+            if let Some(container) = containers.get(container_id) {
+                (container.pid, container.monitoring_task.as_ref().map(|t| t.abort_handle()))
+            } else {
+                return Err(format!("Container {} not found", container_id));
+            }
+        } else {
+            return Err(format!("Failed to lock containers for {}", container_id));
+        };
 
         let pid = pid.ok_or_else(|| format!("Container {} is not running", container_id))?;
 
@@ -1494,12 +1570,14 @@ done
         match ProcessUtils::terminate_process(pid, 10) {
             Ok(()) => {
                 // Update container state
-                self.containers.update(container_id, |container| {
-                    container.state = ContainerState::EXITED(0);
-                    container.pid = None;
-                    container.monitoring_task = None; // Clear the task handle
-                    container.add_log("Container stopped by user request".to_string());
-                });
+                if let Ok(mut containers) = self.containers.try_lock() {
+                    if let Some(container) = containers.get_mut(container_id) {
+                        container.state = ContainerState::Exited;
+                        container.pid = None;
+                        container.monitoring_task = None; // Clear the task handle
+                        container.add_log("Container stopped by user request".to_string());
+                    }
+                }
                 
                 // Don't cleanup resources on stop - container can be restarted
                 ConsoleLogger::debug(&format!("Container {} stopped, resources preserved for restart", container_id));
@@ -1517,8 +1595,15 @@ done
         ConsoleLogger::progress(&format!("Removing container: {}", container_id));
 
         // Get container PID before stopping if it's running
-        let container_pid = self.containers.with_container(container_id, |container| container.pid)
-            .flatten(); // This converts Option<Option<Pid>> to Option<Pid>
+        let container_pid = if let Ok(containers) = self.containers.try_lock() {
+            if let Some(container) = containers.get(container_id) {
+                container.pid
+            } else {
+                return Err(format!("Container {} not found", container_id));
+            }
+        } else {
+            return Err(format!("Failed to lock containers for {}", container_id));
+        };
 
         // Stop the container first if it's running
         if let Err(e) = self.stop_container(container_id) {
@@ -1526,8 +1611,15 @@ done
         }
 
         // Remove container from registry
-        self.containers.remove(container_id)
-            .ok_or_else(|| format!("Container {} not found", container_id))?;
+        let removed = if let Ok(mut containers) = self.containers.try_lock() {
+            containers.remove(container_id).is_some()
+        } else {
+            return Err(format!("Failed to lock containers for removal of {}", container_id));
+        };
+        
+        if !removed {
+            return Err(format!("Container {} not found", container_id));
+        }
 
         // Clean up readiness signal files
         cleanup_readiness_signal(container_id);
@@ -1542,9 +1634,10 @@ done
             }
         }
 
-        // Clean up image layers and overlay mounts
-        if let Err(e) = ImageManager::cleanup_container_image(container_id) {
-            ConsoleLogger::warning(&format!("Image cleanup failed: {}", e));
+        // Clean up rootfs directory using FileSystemUtils
+        let rootfs_path = format!("/tmp/quilt-containers/{}", container_id);
+        if let Err(e) = FileSystemUtils::remove_path(&rootfs_path) {
+            ConsoleLogger::warning(&format!("Failed to remove rootfs directory: {}", e));
         }
 
         ConsoleLogger::container_removed(container_id);
@@ -1553,33 +1646,54 @@ done
 
     #[allow(dead_code)]
     pub fn list_containers(&self) -> Vec<String> {
-        self.containers.keys()
+        if let Ok(containers) = self.containers.try_lock() {
+            containers.keys().cloned().collect()
+        } else {
+            Vec::new()
+        }
     }
 
     /// Set the network configuration for a container
     pub fn set_container_network(&self, container_id: &str, network_config: ContainerNetworkConfig) -> Result<(), String> {
-        self.containers.update(container_id, |container| {
-            container.network_config = Some(network_config);
-        }).ok_or_else(|| format!("Container {} not found", container_id))
+        if let Ok(mut containers) = self.containers.try_lock() {
+            if let Some(container) = containers.get_mut(container_id) {
+                container.network_config = Some(network_config);
+                Ok(())
+            } else {
+                Err(format!("Container {} not found", container_id))
+            }
+        } else {
+            Err(format!("Failed to lock containers for {}", container_id))
+        }
     }
 
     /// Get the network configuration for a container
     pub fn get_container_network(&self, container_id: &str) -> Option<ContainerNetworkConfig> {
-        self.containers.with_container(container_id, |container| container.network_config.clone())?
+        if let Ok(containers) = self.containers.try_lock() {
+            containers.get(container_id).and_then(|c| c.network_config.clone())
+        } else {
+            None
+        }
     }
 
     /// Configure network for a running container
     pub fn setup_container_network_post_start(&self, container_id: &str, network_manager: &NetworkManager) -> Result<(), String> {
-        let (network_config, pid) = self.containers.with_container(container_id, |container| {
-            let network_config = container.network_config
-                .as_ref()
-                .ok_or_else(|| format!("No network config for container {}", container_id))?;
-            
-            let pid = container.pid
-                .ok_or_else(|| format!("Container {} is not running", container_id))?;
-            
-            Result::<(ContainerNetworkConfig, nix::unistd::Pid), String>::Ok((network_config.clone(), pid))
-        }).ok_or_else(|| format!("Container {} not found", container_id))??;
+        let (network_config, pid) = if let Ok(containers) = self.containers.try_lock() {
+            if let Some(container) = containers.get(container_id) {
+                let network_config = container.network_config
+                    .as_ref()
+                    .ok_or_else(|| format!("No network config for container {}", container_id))?;
+                
+                let pid = container.pid
+                    .ok_or_else(|| format!("Container {} is not running", container_id))?;
+                
+                (network_config.clone(), pid)
+            } else {
+                return Err(format!("Container {} not found", container_id));
+            }
+        } else {
+            return Err(format!("Failed to lock containers for {}", container_id));
+        };
 
         // Setup the container's network interface using the network manager
         network_manager.setup_container_network(&network_config, pid.as_raw())?;
@@ -1599,25 +1713,31 @@ done
         ConsoleLogger::debug(&format!("🔍 [EXEC] Working dir: {:?}, Env vars: {}, Capture output: {}", 
                                      working_directory, environment.len(), capture_output));
 
-        let pid = self.containers.with_container(container_id, |container| {
-            // Check if container is running
-            match container.state {
-                ContainerState::RUNNING => {
-                    ConsoleLogger::debug(&format!("✅ [EXEC] Container {} is running", container_id));
-                    container.pid.ok_or_else(|| format!("Container {} has no PID", container_id))
-                },
-                ref state => {
-                    let state_msg = match state {
-                        ContainerState::PENDING => "PENDING",
-                        ContainerState::EXITED(code) => &format!("EXITED({})", code),
-                        ContainerState::FAILED(msg) => &format!("FAILED({})", msg),
-                        _ => "UNKNOWN",
-                    };
-                    ConsoleLogger::debug(&format!("❌ [EXEC] Container {} is not running, state: {}", container_id, state_msg));
-                    Err(format!("Container {} is not running", container_id))
+        let pid = if let Ok(containers) = self.containers.try_lock() {
+            if let Some(container) = containers.get(container_id) {
+                match container.state {
+                    ContainerState::Running => {
+                        ConsoleLogger::debug(&format!("✅ [EXEC] Container {} is running", container_id));
+                        container.pid.ok_or_else(|| format!("Container {} has no PID", container_id))
+                    },
+                    ref state => {
+                        let state_msg = match state {
+                            ContainerState::Created => "CREATED",
+                            ContainerState::Starting => "STARTING", 
+                            ContainerState::Running => "RUNNING",
+                            ContainerState::Exited => "EXITED",
+                            ContainerState::Error => "ERROR",
+                        };
+                        ConsoleLogger::debug(&format!("❌ [EXEC] Container {} is not running, state: {}", container_id, state_msg));
+                        Err(format!("Container {} is not running", container_id))
+                    }
                 }
+            } else {
+                Err(format!("Container {} not found", container_id))
             }
-        }).ok_or_else(|| format!("Container {} not found", container_id))??;
+        } else {
+            Err(format!("Failed to lock containers for {}", container_id))
+        }?;
         ConsoleLogger::debug(&format!("🔓 [EXEC] Released containers lock, got PID: {}", ProcessUtils::pid_to_i32(pid)));
 
         // Prepare the command to execute

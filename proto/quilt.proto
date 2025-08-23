@@ -34,6 +34,22 @@ service QuiltService {
     rpc GetMetrics (GetMetricsRequest) returns (GetMetricsResponse);
     rpc GetSystemInfo (GetSystemInfoRequest) returns (GetSystemInfoResponse);
     rpc StreamEvents (StreamEventsRequest) returns (stream ContainerEvent);
+    
+    // Container monitoring
+    rpc ListActiveMonitors (ListActiveMonitorsRequest) returns (ListActiveMonitorsResponse);
+    rpc GetMonitorStatus (GetMonitorStatusRequest) returns (GetMonitorStatusResponse);
+    rpc ListMonitoringProcesses (ListMonitoringProcessesRequest) returns (ListMonitoringProcessesResponse);
+    
+    // Network operations
+    rpc ListNetworkAllocations (ListNetworkAllocationsRequest) returns (ListNetworkAllocationsResponse);
+    rpc GetContainerNetwork (GetContainerNetworkRequest) returns (GetContainerNetworkResponse);
+    rpc SetContainerNetwork (SetContainerNetworkRequest) returns (SetContainerNetworkResponse);
+    rpc SetupContainerNetworkPostStart (SetupContainerNetworkPostStartRequest) returns (SetupContainerNetworkPostStartResponse);
+    
+    // Cleanup operations  
+    rpc GetCleanupStatus (GetCleanupStatusRequest) returns (GetCleanupStatusResponse);
+    rpc ListCleanupTasks (ListCleanupTasksRequest) returns (ListCleanupTasksResponse);
+    rpc ForceCleanup (ForceCleanupRequest) returns (ForceCleanupResponse);
 }
 
 // Container status enumeration
@@ -346,4 +362,148 @@ message ContainerEvent {
     string container_id = 2;                      // Container ID
     uint64 timestamp = 3;                         // Event timestamp
     map<string, string> attributes = 4;           // Event-specific attributes
+}
+
+// Container monitoring messages
+message ListActiveMonitorsRequest {
+    // Empty - list all active monitors
+}
+
+message ListActiveMonitorsResponse {
+    repeated ProcessMonitor monitors = 1;
+    bool success = 2;
+    string error_message = 3;
+}
+
+message GetMonitorStatusRequest {
+    string container_id = 1;
+}
+
+message GetMonitorStatusResponse {
+    ProcessMonitor monitor = 1;
+    bool success = 2;
+    string error_message = 3;
+}
+
+message ListMonitoringProcessesRequest {
+    // Empty - list all monitoring processes
+}
+
+message ListMonitoringProcessesResponse {
+    repeated ProcessMonitor processes = 1;
+    bool success = 2;
+    string error_message = 3;
+}
+
+message ProcessMonitor {
+    string container_id = 1;
+    int64 pid = 2;
+    string status = 3;
+    uint64 started_at = 4;
+    uint64 last_check = 5;
+    int32 check_count = 6;
+    string error_message = 7;
+}
+
+// Cleanup operation messages
+message GetCleanupStatusRequest {
+    string container_id = 1;  // Empty for all containers
+}
+
+message GetCleanupStatusResponse {
+    repeated CleanupTask tasks = 1;
+    bool success = 2;
+    string error_message = 3;
+}
+
+message ListCleanupTasksRequest {
+    // Empty - list all cleanup tasks
+}
+
+message ListCleanupTasksResponse {
+    repeated CleanupTask tasks = 1;
+    bool success = 2;
+    string error_message = 3;
+}
+
+message ForceCleanupRequest {
+    string container_id = 1;
+}
+
+message ForceCleanupResponse {
+    bool success = 1;
+    string error_message = 2;
+    repeated string cleaned_resources = 3;
+}
+
+message CleanupTask {
+    int64 task_id = 1;
+    string container_id = 2;
+    string resource_type = 3;
+    string resource_path = 4;
+    string status = 5;
+    uint64 created_at = 6;
+    uint64 completed_at = 7;
+    string error_message = 8;
+}
+
+// Network allocation messages
+message ListNetworkAllocationsRequest {
+}
+
+message ListNetworkAllocationsResponse {
+    repeated NetworkAllocation allocations = 1;
+}
+
+message NetworkAllocation {
+    string container_id = 1;
+    string ip_address = 2;
+    string bridge_interface = 3;
+    string veth_host = 4;
+    string veth_container = 5;
+    bool setup_completed = 6;
+    int64 allocation_time = 7;
+    string status = 8;
+}
+
+// Container Network Configuration
+message ContainerNetworkConfig {
+    string ip_address = 1;
+    string bridge_interface = 2;
+    string veth_host = 3;
+    string veth_container = 4;
+    bool setup_completed = 5;
+    string status = 6;
+}
+
+// Get Container Network Request/Response
+message GetContainerNetworkRequest {
+    string container_id = 1;
+}
+
+message GetContainerNetworkResponse {
+    bool success = 1;
+    string error_message = 2;
+    ContainerNetworkConfig network_config = 3;
+}
+
+// Set Container Network Request/Response
+message SetContainerNetworkRequest {
+    string container_id = 1;
+    ContainerNetworkConfig network_config = 2;
+}
+
+message SetContainerNetworkResponse {
+    bool success = 1;
+    string error_message = 2;
+}
+
+// Setup Container Network Post Start Request/Response
+message SetupContainerNetworkPostStartRequest {
+    string container_id = 1;
+}
+
+message SetupContainerNetworkPostStartResponse {
+    bool success = 1;
+    string error_message = 2;
 } 

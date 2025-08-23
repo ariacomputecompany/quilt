@@ -3,8 +3,9 @@ use nix::unistd::Pid;
 use nix::mount::{mount, MsFlags};
 use nix::sys::wait::{waitpid, WaitStatus, WaitPidFlag};
 use std::path::Path;
-use crate::utils::{ConsoleLogger, ProcessUtils};
-use crate::utils::CommandExecutor;
+use crate::utils::console::ConsoleLogger;
+use crate::utils::process::ProcessUtils;
+use crate::utils::command::CommandExecutor;
 use crate::icc::network::ContainerNetworkConfig;
 
 #[derive(Debug, Clone)]
@@ -264,7 +265,7 @@ impl NamespaceManager {
             };
             
             // Ensure target directory exists
-            if let Err(e) = std::fs::create_dir_all(&target_path) {
+            if let Err(e) = crate::utils::filesystem::FileSystemUtils::create_dir_all_with_logging(&target_path, "mount target") {
                 ConsoleLogger::warning(&format!("Failed to create mount target {}: {}", target_path, e));
                 continue;
             }

@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use tokio::fs;
 use crate::sync::error::{SyncError, SyncResult};
-use crate::utils::{ConsoleLogger, FileSystemUtils};
+use crate::utils::console::ConsoleLogger;
 use serde::{Serialize, Deserialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -341,6 +341,7 @@ impl VolumeManager {
         self.base_path.join(volume_name)
     }
     
+    /// Clean up orphaned volumes that are no longer referenced by any containers
     pub async fn cleanup_orphaned_volumes(&self) -> SyncResult<u32> {
         // Find volumes marked for cleanup or not in use
         let orphaned = sqlx::query_scalar::<_, String>(
@@ -359,6 +360,7 @@ impl VolumeManager {
         
         Ok(cleaned)
     }
+    
 }
 
 #[cfg(test)]

@@ -1,8 +1,6 @@
 use std::fs;
 use std::path::Path;
-use std::collections::HashMap;
 use serde::{Serialize, Deserialize};
-use crate::utils::logger::{Logger, LogLevel};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContainerMetrics {

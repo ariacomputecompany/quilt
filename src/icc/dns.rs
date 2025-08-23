@@ -1,18 +1,15 @@
 // src/icc/dns.rs
 // DNS server for container name resolution
 
-//#![deny(warnings)] // Temporarily disabled during implementation
+// Warnings handled at crate level
 
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
 use tokio::net::UdpSocket;
-use tokio::time::timeout;
-use trust_dns_proto::op::{Message, MessageType, OpCode, ResponseCode, Query};
-use trust_dns_proto::rr::{DNSClass, Name, RData, Record, RecordData, RecordType};
-use trust_dns_proto::serialize::binary::{BinDecodable, BinEncodable};
-use crate::utils::ConsoleLogger;
+use trust_dns_proto::op::{Message, MessageType, OpCode, ResponseCode};
+use trust_dns_proto::rr::{DNSClass, RData, Record, RecordType};
+use crate::utils::console::ConsoleLogger;
 
 #[derive(Debug, Clone)]
 pub struct DnsEntry {

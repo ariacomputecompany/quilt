@@ -1,7 +1,7 @@
 // src/daemon/readiness.rs
 // Production-ready event-driven container readiness system
 
-use crate::utils::ConsoleLogger;
+use crate::utils::console::ConsoleLogger;
 use nix::unistd::Pid;
 use std::collections::HashSet;
 use std::path::Path;
@@ -47,19 +47,11 @@ impl ContainerReadinessManager {
 
         // EVENT-DRIVEN: Check if process is actually running
         // No sleep, just immediate verification
-        use nix::sys::signal;
-        match signal::kill(pid, None) {
-            Ok(()) => {
-                // Process exists and we can signal it
-                ConsoleLogger::debug(&format!("✅ Process {} is alive and responsive", pid));
-            }
-            Err(nix::errno::Errno::ESRCH) => {
-                return Err(format!("Process {} does not exist", pid));
-            }
-            Err(e) => {
-                return Err(format!("Cannot verify process {}: {}", pid, e));
-            }
+        if !crate::utils::process::ProcessUtils::is_process_running(pid) {
+            return Err(format!("Process {} does not exist", crate::utils::process::ProcessUtils::pid_to_i32(pid)));
         }
+        
+        ConsoleLogger::debug(&format!("✅ Process {} is alive and responsive", crate::utils::process::ProcessUtils::pid_to_i32(pid)));
 
         let total_time = overall_start.elapsed().unwrap_or_default();
         ConsoleLogger::success(&format!("✅ Container {} ready in {:?} (event-driven)", container_id, total_time));
@@ -200,21 +192,13 @@ echo "✅ Ready signal sent to {ready_signal_path}"
 
         // Ensure the directory exists
         let script_dir = format!("{}/usr/local/bin", rootfs_path);
-        std::fs::create_dir_all(&script_dir)
-            .map_err(|e| format!("Failed to create script directory {}: {}", script_dir, e))?;
+        crate::utils::filesystem::FileSystemUtils::create_dir_all_with_logging(&script_dir, "readiness script directory")?;
 
         // Write the script
-        std::fs::write(&script_path, script_content)
-            .map_err(|e| format!("Failed to write readiness script to {}: {}", script_path, e))?;
+        crate::utils::filesystem::FileSystemUtils::write_file(&script_path, &script_content)?;
 
         // Make executable
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&script_path)
-            .map_err(|e| format!("Failed to get script permissions: {}", e))?
-            .permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&script_path, perms)
-            .map_err(|e| format!("Failed to set script permissions: {}", e))?;
+        crate::utils::filesystem::FileSystemUtils::set_permissions(&script_path, 0o755)?;
 
         ConsoleLogger::debug(&format!("✅ Readiness script created at {}", script_path));
         Ok(())
@@ -332,8 +316,8 @@ echo "✅ Ready signal sent to {ready_signal_path}"
 /// Helper to clean up readiness signal files
 pub fn cleanup_readiness_signal(container_id: &str) {
     let ready_signal_path = format!("/tmp/quilt_ready_{}", container_id);
-    if Path::new(&ready_signal_path).exists() {
-        if let Err(e) = std::fs::remove_file(&ready_signal_path) {
+    if crate::utils::filesystem::FileSystemUtils::exists(&ready_signal_path) {
+        if let Err(e) = crate::utils::filesystem::FileSystemUtils::remove_path(&ready_signal_path) {
             ConsoleLogger::warning(&format!("Failed to cleanup readiness signal {}: {}", ready_signal_path, e));
         } else {
             ConsoleLogger::debug(&format!("🧹 Cleaned up readiness signal: {}", ready_signal_path));

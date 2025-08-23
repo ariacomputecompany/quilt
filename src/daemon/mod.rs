@@ -10,7 +10,7 @@ pub mod metrics;
 pub mod events;
 
 // Re-export commonly used types
-pub use runtime::{ContainerRuntime, ContainerConfig, ContainerState, MountConfig, MountType};
+pub use runtime::{ContainerConfig, MountConfig, MountType};
 pub use cgroup::CgroupLimits;
 pub use namespace::NamespaceConfig;
 // pub use resource::ResourceManager; // Accessed directly where needed 

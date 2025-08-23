@@ -59,26 +59,15 @@ pub struct NetworkAllocation {
 
 pub struct NetworkManager {
     pool: SqlitePool,
-    ip_range_start: Ipv4Addr,
-    ip_range_end: Ipv4Addr,
 }
 
 impl NetworkManager {
     pub fn new(pool: SqlitePool) -> Self {
         Self {
             pool,
-            ip_range_start: Ipv4Addr::new(10, 42, 0, 10),
-            ip_range_end: Ipv4Addr::new(10, 42, 0, 250),
         }
     }
     
-    pub fn with_ip_range(pool: SqlitePool, start: Ipv4Addr, end: Ipv4Addr) -> Self {
-        Self {
-            pool,
-            ip_range_start: start,
-            ip_range_end: end,
-        }
-    }
     
     pub async fn allocate_network(&self, container_id: &str) -> SyncResult<NetworkConfig> {
         // Check if already allocated
@@ -112,7 +101,7 @@ impl NetworkManager {
                         setup_required: true,
                     });
                 }
-                Err(SyncError::IpAllocationConflict) => {
+                Err(SyncError::NoAvailableIp) => {
                     retry_count += 1;
                     if retry_count >= max_retries {
                         tracing::error!("Failed to allocate IP for {} after {} retries", container_id, max_retries);
@@ -127,15 +116,9 @@ impl NetworkManager {
         }
     }
     
-    pub async fn mark_network_disabled(&self, container_id: &str) -> SyncResult<()> {
-        // For containers with networking disabled, we don't allocate IPs
-        // This is tracked by the absence of entries in network_allocations table
-        tracing::debug!("Container {} marked with networking disabled", container_id);
-        Ok(())
-    }
     
     pub async fn should_setup_network(&self, container_id: &str) -> SyncResult<bool> {
-        use crate::utils::ConsoleLogger;
+        use crate::utils::console::ConsoleLogger;
         
         ConsoleLogger::debug(&format!("🔍 [NETWORK-CHECK] Checking if container {} needs network setup", container_id));
         
@@ -260,21 +243,6 @@ impl NetworkManager {
         Ok(())
     }
     
-    pub async fn delete_network_allocation(&self, container_id: &str) -> SyncResult<()> {
-        let result = sqlx::query("DELETE FROM network_allocations WHERE container_id = ?")
-            .bind(container_id)
-            .execute(&self.pool)
-            .await?;
-        
-        if result.rows_affected() == 0 {
-            return Err(SyncError::NotFound {
-                container_id: container_id.to_string(),
-            });
-        }
-        
-        tracing::info!("Deleted network allocation for container {}", container_id);
-        Ok(())
-    }
     
     pub async fn list_allocations(&self, status_filter: Option<NetworkStatus>) -> SyncResult<Vec<NetworkAllocation>> {
         let mut query = "
@@ -330,9 +298,11 @@ impl NetworkManager {
             .map(|(ip,)| ip)
             .collect();
         
-        // Find first available IP in range
-        let start_int = u32::from(self.ip_range_start);
-        let end_int = u32::from(self.ip_range_end);
+        // Find first available IP in range (10.42.0.2 to 10.42.255.254)
+        let start_ip = Ipv4Addr::new(10, 42, 0, 2);
+        let end_ip = Ipv4Addr::new(10, 42, 255, 254);
+        let start_int = u32::from(start_ip);
+        let end_int = u32::from(end_ip);
         
         let mut selected_ip = None;
         for ip_int in start_int..=end_int {
@@ -369,7 +339,7 @@ impl NetworkManager {
             Err(sqlx::Error::Database(db_err)) if db_err.is_unique_violation() => {
                 // IP already allocated by concurrent transaction - signal retry
                 transaction.rollback().await?;
-                Err(SyncError::IpAllocationConflict)
+                Err(SyncError::NoAvailableIp)
             }
             Err(e) => {
                 // Other error - propagate
@@ -379,58 +349,7 @@ impl NetworkManager {
         }
     }
     
-    async fn find_available_ip(&self) -> SyncResult<String> {
-        // DEPRECATED: Use try_allocate_ip_atomically instead for race-free allocation
-        // Get all allocated IPs
-        let allocated_ips: Vec<(String,)> = sqlx::query_as(
-            "SELECT ip_address FROM network_allocations WHERE status != 'cleaned'"
-        ).fetch_all(&self.pool).await?;
-        
-        let allocated_set: std::collections::HashSet<String> = allocated_ips
-            .into_iter()
-            .map(|(ip,)| ip)
-            .collect();
-        
-        // Find first available IP in range
-        let start_int = u32::from(self.ip_range_start);
-        let end_int = u32::from(self.ip_range_end);
-        
-        for ip_int in start_int..=end_int {
-            let ip = Ipv4Addr::from(ip_int);
-            let ip_str = ip.to_string();
-            
-            if !allocated_set.contains(&ip_str) {
-                return Ok(ip_str);
-            }
-        }
-        
-        Err(SyncError::NoAvailableIp)
-    }
     
-    pub async fn set_network_state(&self, key: &str, value: &str) -> SyncResult<()> {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
-        
-        sqlx::query(r#"
-            INSERT OR REPLACE INTO network_state (key, value, updated_at)
-            VALUES (?, ?, ?)
-        "#)
-        .bind(key)
-        .bind(value)
-        .bind(now)
-        .execute(&self.pool)
-        .await?;
-        
-        Ok(())
-    }
-    
-    pub async fn get_network_state(&self, key: &str) -> SyncResult<Option<String>> {
-        let value: Option<String> = sqlx::query_scalar("SELECT value FROM network_state WHERE key = ?")
-            .bind(key)
-            .fetch_optional(&self.pool)
-            .await?;
-        
-        Ok(value)
-    }
 }
 
 #[cfg(test)]

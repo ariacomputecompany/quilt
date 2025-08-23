@@ -1,11 +1,11 @@
 use crate::daemon::{ContainerConfig, CgroupLimits, NamespaceConfig};
 use crate::utils::console::ConsoleLogger;
+use crate::utils::filesystem::FileSystemUtils;
 use crate::sync::{SyncEngine, ContainerState, MountType};
 use crate::icc;
 
 use std::sync::Arc;
 use std::collections::HashMap;
-use std::path::Path;
 use sqlx::Row;
 
 /// Background container process startup
@@ -19,6 +19,9 @@ pub async fn start_container_process(
     
     let start_time = std::time::Instant::now();
     ConsoleLogger::info(&format!("🚀 [STARTUP] Starting container process for {} at {:?}", container_id, std::time::SystemTime::now()));
+    
+    // Store startup log
+    let _ = sync_engine.store_container_log(container_id, "info", "Container startup initiated").await;
     
     // Step 1: Configuration retrieval
     let config_start = std::time::Instant::now();
@@ -151,7 +154,7 @@ pub async fn start_container_process(
     
     // Check if this is a restart (container already has rootfs)
     let needs_creation = if let Some(ref rootfs) = rootfs_path {
-        let exists = Path::new(rootfs).exists();
+        let exists = FileSystemUtils::exists(rootfs);
         ConsoleLogger::debug(&format!("🔍 [STARTUP-CREATE] Checking rootfs path {} for {}: exists={}", rootfs, container_id, exists));
         !exists
     } else {
@@ -231,9 +234,9 @@ pub async fn start_container_process(
     // Ensure /tmp exists in container rootfs
     let container_tmp_dir = format!("{}/tmp", actual_rootfs_path);
     ConsoleLogger::debug(&format!("📁 [STARTUP-NETWORK] Ensuring /tmp directory exists: {}", container_tmp_dir));
-    if !std::path::Path::new(&container_tmp_dir).exists() {
+    if !FileSystemUtils::exists(&container_tmp_dir) {
         ConsoleLogger::debug(&format!("📁 [STARTUP-NETWORK] Creating /tmp directory for {}", container_id));
-        std::fs::create_dir_all(&container_tmp_dir)
+        FileSystemUtils::create_dir_all_with_logging(&container_tmp_dir, "container /tmp directory")
             .map_err(|e| {
                 ConsoleLogger::error(&format!("❌ [STARTUP-NETWORK] Failed to create /tmp directory for {}: {}", container_id, e));
                 format!("Failed to create /tmp in container rootfs: {}", e)
@@ -245,7 +248,7 @@ pub async fn start_container_process(
     if !needs_network_setup {
         // No network setup needed, create signal file immediately so container doesn't wait
         ConsoleLogger::debug(&format!("📝 [STARTUP-NETWORK] Creating immediate network ready signal for {} (no network needed)", container_id));
-        std::fs::write(&network_ready_path, "ready")
+        FileSystemUtils::write_file(&network_ready_path, "ready")
             .map_err(|e| {
                 ConsoleLogger::error(&format!("❌ [STARTUP-NETWORK] Failed to create network ready signal for {}: {}", container_id, e));
                 format!("Failed to create network ready signal: {}", e)
@@ -265,6 +268,9 @@ pub async fn start_container_process(
         Ok(()) => {
             ConsoleLogger::success(&format!("✅ [STARTUP-START] Container process started successfully for {} in {:?}", 
                 container_id, start_process_time.elapsed()));
+            
+            // Store success log
+            let _ = sync_engine.store_container_log(container_id, "info", "Container process started successfully").await;
             
             // Step 9: PID handling and monitoring setup
             let pid_start = std::time::Instant::now();
@@ -323,11 +329,19 @@ pub async fn start_container_process(
                                     ConsoleLogger::success(&format!("🎉 [BACKGROUND-NET] Background network setup completed for {} with IP {} in {:?}", 
                                         bg_container_id, network_alloc.ip_address, network_start.elapsed()));
                                     
+                                    // Store network success log
+                                    let _ = bg_sync_engine.store_container_log(&bg_container_id, "info", 
+                                        &format!("Network setup completed with IP {}", network_alloc.ip_address)).await;
+                                    
                                     // Emit network setup completed event
                                     crate::emit_network_setup_completed!(bg_container_id, &network_alloc.ip_address);
                                 }
                                 Err(e) => {
                                     ConsoleLogger::error(&format!("❌ [BACKGROUND-NET] Background network setup failed for {}: {}", bg_container_id, e));
+                                    
+                                    // Store network error log
+                                    let _ = bg_sync_engine.store_container_log(&bg_container_id, "error", 
+                                        &format!("Network setup failed: {}", e)).await;
                                     
                                     // Emit network setup failed event
                                     crate::emit_network_setup_failed!(bg_container_id, &e);
@@ -363,6 +377,10 @@ pub async fn start_container_process(
             ConsoleLogger::success(&format!("🎉 [STARTUP-SUCCESS] Container {} started successfully in {:?}", 
                 container_id, total_time));
             
+            // Store final success log
+            let _ = sync_engine.store_container_log(container_id, "info", 
+                &format!("Container startup completed successfully in {:.2}s", total_time.as_secs_f64())).await;
+            
             // Emit container ready event with timing
             let startup_time_ms = total_time.as_millis() as u64;
             crate::emit_container_ready!(container_id, startup_time_ms);
@@ -375,6 +393,10 @@ pub async fn start_container_process(
             let total_time = start_time.elapsed();
             ConsoleLogger::error(&format!("❌ [STARTUP-ERROR] Container {} startup FAILED after {:?}: {}", 
                 container_id, total_time, e));
+            
+            // Store error log
+            let _ = sync_engine.store_container_log(container_id, "error", 
+                &format!("Container startup failed: {}", e)).await;
             
             // Emit container startup failed event
             crate::emit_container_startup_failed!(container_id, &e, "container_startup");
@@ -445,7 +467,7 @@ async fn setup_container_network_async(
     ConsoleLogger::debug(&format!("📝 [ASYNC-NET] Creating network ready signal for {} at {}", 
         container_id, network_ready_path_in_container));
         
-    std::fs::write(&network_ready_path_in_container, "ready")
+    FileSystemUtils::write_file(&network_ready_path_in_container, "ready")
         .map_err(|e| {
             ConsoleLogger::error(&format!("❌ [ASYNC-NET] Failed to create network ready signal for {}: {}", container_id, e));
             format!("Failed to create network ready signal: {}", e)

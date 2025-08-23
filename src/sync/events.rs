@@ -116,11 +116,7 @@ impl EventRingBuffer {
         self.push(event);
     }
 
-    /// Get all events (newest first)
-    pub fn get_all(&self) -> Vec<ContainerEvent> {
-        let buffer = self.buffer.read();
-        buffer.iter().rev().cloned().collect()
-    }
+    // get_all() method removed - not used in core functionality
 
     /// Get events filtered by criteria
     pub fn get_filtered(
@@ -162,23 +158,7 @@ impl EventRingBuffer {
             .collect()
     }
 
-    /// Clear all events
-    pub fn clear(&self) {
-        let mut buffer = self.buffer.write();
-        buffer.clear();
-    }
-
-    /// Get the current size of the buffer
-    pub fn len(&self) -> usize {
-        let buffer = self.buffer.read();
-        buffer.len()
-    }
-
-    /// Check if buffer is empty
-    pub fn is_empty(&self) -> bool {
-        let buffer = self.buffer.read();
-        buffer.is_empty()
-    }
+    // Utility methods clear(), len(), is_empty() removed - not used in core functionality
 }
 
 /// Global event buffer instance

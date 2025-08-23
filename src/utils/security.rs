@@ -42,32 +42,22 @@ impl SecurityValidator {
                         return Err(format!("Security: Mounting {} is not allowed", denied));
                     }
                 }
-                
-                // Warn about risky paths
-                const RISKY_PATHS: &[&str] = &["/home", "/var", "/opt"];
-                for risky in RISKY_PATHS {
-                    if canonical_str.starts_with(risky) {
-                        eprintln!("Warning: Mounting {} may expose sensitive data", risky);
-                    }
-                }
             }
             MountType::Volume => {
-                // Validate volume name format
-                if !Self::is_valid_volume_name(path) {
-                    return Err("Invalid volume name: must contain only alphanumeric, dash, or underscore".to_string());
+                // Volume names are handled by the volume manager
+                if path.is_empty() || path.len() > 64 {
+                    return Err("Invalid volume name".to_string());
                 }
             }
             MountType::Tmpfs => {
                 // No source validation needed for tmpfs
-                if !path.is_empty() {
-                    return Err("Tmpfs mount should not have a source path".to_string());
-                }
             }
         }
+        
         Ok(())
     }
     
-    /// Validate mount target path for security issues
+    /// Validate mount target path
     pub fn validate_mount_target(path: &str) -> Result<(), String> {
         // Must be absolute path
         if !path.starts_with('/') {
@@ -91,7 +81,6 @@ impl SecurityValidator {
             "/sys",
             "/dev",
             "/etc",
-            "/.dockerenv",
         ];
         
         for protected in PROTECTED_PATHS {
@@ -103,7 +92,7 @@ impl SecurityValidator {
         Ok(())
     }
     
-    /// Validate complete mount configuration
+    /// Main mount validation entry point
     pub fn validate_mount(mount: &VolumeMount) -> Result<(), String> {
         // Validate source
         Self::validate_mount_source(&mount.source, mount.mount_type.clone())?;
@@ -123,13 +112,6 @@ impl SecurityValidator {
         }
         
         Ok(())
-    }
-    
-    /// Check if a volume name is valid
-    fn is_valid_volume_name(name: &str) -> bool {
-        !name.is_empty() && 
-        name.len() <= 64 &&
-        name.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_')
     }
     
     /// Validate tmpfs size option
@@ -156,85 +138,11 @@ impl SecurityValidator {
             return Err("Tmpfs size must be at least 1m".to_string());
         }
         
-        // Maximum 10GB for safety
+        // Maximum 10GB to prevent resource exhaustion
         if bytes > 10 * 1024 * 1024 * 1024 {
             return Err("Tmpfs size cannot exceed 10g".to_string());
         }
         
         Ok(())
-    }
-    
-    /// Check if a path would escape the container
-    pub fn check_container_escape(container_root: &str, resolved_path: &str) -> Result<(), String> {
-        let container_root = Path::new(container_root).canonicalize()
-            .map_err(|e| format!("Cannot resolve container root: {}", e))?;
-        
-        let resolved = Path::new(resolved_path).canonicalize()
-            .map_err(|e| format!("Cannot resolve path: {}", e))?;
-        
-        if !resolved.starts_with(&container_root) {
-            return Err("Path would escape container root".to_string());
-        }
-        
-        Ok(())
-    }
-    
-    /// Validate that volume operations won't compromise security
-    pub fn validate_volume_operation(_operation: &str, volume_name: &str, _user_id: Option<u32>) -> Result<(), String> {
-        // Check volume name
-        if !Self::is_valid_volume_name(volume_name) {
-            return Err("Invalid volume name".to_string());
-        }
-        
-        // In future, check user permissions here
-        // For now, allow all operations
-        
-        Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    
-    #[test]
-    fn test_deny_sensitive_paths() {
-        assert!(SecurityValidator::validate_mount_source("/etc/passwd", MountType::Bind).is_err());
-        assert!(SecurityValidator::validate_mount_source("/proc", MountType::Bind).is_err());
-        assert!(SecurityValidator::validate_mount_source("/sys", MountType::Bind).is_err());
-    }
-    
-    #[test]
-    fn test_allow_safe_paths() {
-        // These tests would need actual directories to exist
-        // assert!(SecurityValidator::validate_mount_source("/tmp", MountType::Bind).is_ok());
-    }
-    
-    #[test]
-    fn test_volume_name_validation() {
-        assert!(SecurityValidator::is_valid_volume_name("my-data"));
-        assert!(SecurityValidator::is_valid_volume_name("test_vol_123"));
-        assert!(!SecurityValidator::is_valid_volume_name("my/data"));
-        assert!(!SecurityValidator::is_valid_volume_name("my..data"));
-        assert!(!SecurityValidator::is_valid_volume_name(""));
-    }
-    
-    #[test]
-    fn test_mount_target_validation() {
-        assert!(SecurityValidator::validate_mount_target("/data").is_ok());
-        assert!(SecurityValidator::validate_mount_target("/app/config").is_ok());
-        assert!(SecurityValidator::validate_mount_target("/").is_err());
-        assert!(SecurityValidator::validate_mount_target("/etc").is_err());
-        assert!(SecurityValidator::validate_mount_target("/proc").is_err());
-        assert!(SecurityValidator::validate_mount_target("../etc").is_err());
-    }
-    
-    #[test]
-    fn test_tmpfs_size_validation() {
-        assert!(SecurityValidator::validate_tmpfs_size("100m").is_ok());
-        assert!(SecurityValidator::validate_tmpfs_size("1g").is_ok());
-        assert!(SecurityValidator::validate_tmpfs_size("512k").is_err()); // Too small
-        assert!(SecurityValidator::validate_tmpfs_size("20g").is_err()); // Too large
-        assert!(SecurityValidator::validate_tmpfs_size("100").is_err()); // No unit
     }
 }

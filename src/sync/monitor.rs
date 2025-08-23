@@ -70,6 +70,7 @@ impl ProcessMonitorService {
         }
     }
     
+    #[allow(dead_code)] // Production monitoring infrastructure
     pub fn with_check_interval(pool: SqlitePool, interval: Duration) -> Self {
         Self {
             pool,

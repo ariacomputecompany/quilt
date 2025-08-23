@@ -1,5 +1,7 @@
 use std::env;
-use crate::utils::{ConsoleLogger, CommandExecutor, FileSystemUtils};
+use crate::utils::console::ConsoleLogger;
+use crate::utils::command::CommandExecutor;
+use crate::utils::filesystem::FileSystemUtils;
 
 pub struct SystemRuntime;
 

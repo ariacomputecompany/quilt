@@ -10,6 +10,12 @@ keywords = ["container", "runtime", "namespaces", "cgroups", "linux"]
 categories = ["development-tools", "virtualization"]
 readme = "README.md"
 
+# Lint configuration - deny all warnings
+[lints.rust]
+warnings = "deny"
+dead_code = "deny"
+unused_imports = "deny"
+
 # Binary targets
 [[bin]]
 name = "quilt"

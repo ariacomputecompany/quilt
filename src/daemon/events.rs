@@ -1,7 +1,7 @@
 // src/daemon/events.rs
 // Event-driven container startup coordination system
 
-use crate::utils::ConsoleLogger;
+use crate::utils::console::ConsoleLogger;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};

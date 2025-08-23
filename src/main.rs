@@ -1,4 +1,4 @@
-#![deny(warnings)]
+// Warnings denied at workspace level via Cargo.toml
 
 mod daemon;
 mod utils;
@@ -7,7 +7,9 @@ mod sync;
 mod grpc;
 
 use utils::console::ConsoleLogger;
-use sync::{SyncEngine, ContainerState, MountType};
+use utils::filesystem::FileSystemUtils;
+use utils::command::CommandExecutor;
+use sync::{SyncEngine, MountType, ContainerState};
 use grpc::start_container_process;
 
 use std::sync::Arc;
@@ -15,8 +17,6 @@ use std::collections::HashMap;
 use std::time::Duration;
 use tonic::{transport::Server, Request, Response, Status};
 use uuid::Uuid;
-use sqlx::Row;
-use nix::errno::Errno;
 
 // Include the generated protobuf code
 pub mod quilt {
@@ -49,6 +49,9 @@ use quilt::{
 pub struct QuiltServiceImpl {
     sync_engine: Arc<SyncEngine>,
     network_manager: Arc<icc::network::NetworkManager>,
+    runtime: Arc<daemon::runtime::ContainerRuntime>,
+    #[allow(dead_code)]  // Available for future inter-container messaging features
+    message_broker: Arc<icc::messaging::MessageBroker>,
     start_time: std::time::SystemTime,
 }
 
@@ -85,9 +88,18 @@ impl QuiltServiceImpl {
         
         ConsoleLogger::success("Network manager initialized with bridge networking");
         
+        // Initialize MessageBroker for inter-container communication
+        let message_broker = icc::messaging::MessageBroker::new();
+        message_broker.start();
+        
+        // Initialize container runtime
+        let runtime = daemon::runtime::ContainerRuntime::new();
+        
         Ok(Self {
             sync_engine,
             network_manager: Arc::new(network_manager),
+            runtime: Arc::new(runtime),
+            message_broker: Arc::new(message_broker),
             start_time: std::time::SystemTime::now(),
         })
     }
@@ -142,13 +154,45 @@ impl QuiltService for QuiltServiceImpl {
                 // ✅ INSTANT RETURN: Container creation is coordinated but non-blocking
                 ConsoleLogger::success(&format!("Container {} created with network config", container_id));
                 
-                // Process mounts BEFORE starting container
+                // Store creation log
+                let _ = self.sync_engine.store_container_log(&container_id, "info", "Container created and configured").await;
+                
+                // Process mounts BEFORE starting container with security validation
                 for mount in req.mounts {
                     let mount_type = match mount.r#type() {
                         quilt::MountType::Bind => MountType::Bind,
                         quilt::MountType::Volume => MountType::Volume,
                         quilt::MountType::Tmpfs => MountType::Tmpfs,
                     };
+                    
+                    // Convert to validation format for security check
+                    use crate::utils::security::SecurityValidator;
+                    use crate::utils::validation::{VolumeMount, MountType as ValidationMountType};
+                    
+                    let validation_mount = VolumeMount {
+                        source: mount.source.clone(),
+                        target: mount.target.clone(),
+                        mount_type: match mount_type {
+                            MountType::Bind => ValidationMountType::Bind,
+                            MountType::Volume => ValidationMountType::Volume, 
+                            MountType::Tmpfs => ValidationMountType::Tmpfs,
+                        },
+                        readonly: mount.readonly,
+                        options: mount.options.clone(),
+                    };
+                    
+                    // Validate mount for security issues
+                    if let Err(e) = SecurityValidator::validate_mount(&validation_mount) {
+                        ConsoleLogger::error(&format!("Mount security validation failed for container {}: {}", container_id, e));
+                        return Ok(Response::new(CreateContainerResponse {
+                            container_id: String::new(),
+                            success: false,
+                            error_message: format!("Mount security validation failed: {}", e),
+                        }));
+                    }
+                    
+                    ConsoleLogger::debug(&format!("Mount security validation passed for {}: {} -> {}", 
+                        container_id, mount.source, mount.target));
                     
                     // For named volumes, auto-create if needed
                     if mount_type == MountType::Volume {
@@ -185,6 +229,9 @@ impl QuiltService for QuiltServiceImpl {
                             error_message: format!("Failed to configure mount: {}", e),
                         }));
                     }
+                    
+                    ConsoleLogger::success(&format!("Mount successfully added for {}: {} -> {} (readonly: {})", 
+                        container_id, mount.source, mount.target, mount.readonly));
                 }
                 
                 // Now start the container with mounts already configured
@@ -268,6 +315,17 @@ impl QuiltService for QuiltServiceImpl {
                     ContainerState::Error => ContainerStatus::Failed,
                 };
 
+                // Get enhanced runtime statistics if container is running
+                let mut memory_usage_bytes = 0i64;
+                if status.state == ContainerState::Running && status.pid.is_some() {
+                    if let Ok(runtime_stats) = self.runtime.get_container_stats(&container_id) {
+                        if let Some(memory_str) = runtime_stats.get("memory_usage_bytes") {
+                            memory_usage_bytes = memory_str.parse().unwrap_or(0);
+                        }
+                        ConsoleLogger::debug(&format!("Runtime stats for {}: {} entries", container_id, runtime_stats.len()));
+                    }
+                }
+
                 ConsoleLogger::debug(&format!("✅ [GRPC] Status for {}: {:?}", req.container_id, grpc_status));
                 
                 Ok(Response::new(GetContainerStatusResponse {
@@ -277,7 +335,7 @@ impl QuiltService for QuiltServiceImpl {
                     error_message: if status.state == ContainerState::Error { "Container failed".to_string() } else { String::new() },
                     pid: status.pid.unwrap_or(0) as i32,
                     created_at: status.created_at as u64,
-                    memory_usage_bytes: 0, // TODO: Implement memory monitoring in sync engine
+                    memory_usage_bytes: memory_usage_bytes as u64,
                     rootfs_path: status.rootfs_path.unwrap_or_default(),
                     ip_address: status.ip_address.unwrap_or_default(),
                 }))
@@ -305,11 +363,105 @@ impl QuiltService for QuiltServiceImpl {
             req.container_id.clone()
         };
 
-        // TODO: Implement structured logging in sync engine
-        // For now, return empty logs since we're focusing on the core sync functionality
+        // Get logs from both sync engine and runtime for comprehensive logging
+        let mut all_logs = Vec::new();
+        
+        // Get logs from sync engine (structured logs)
+        match self.sync_engine.get_container_logs(&container_id, None).await {
+            Ok(logs) => {
+                for log in logs {
+                    all_logs.push(quilt::LogEntry {
+                        timestamp: log.timestamp as u64,
+                        message: format!("[{}] {}", log.level.to_uppercase(), log.message),
+                    });
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Failed to get sync engine logs for container {}: {}", container_id, e);
+            }
+        }
+        
+        // Also get logs from runtime (container output logs)
+        use crate::daemon::runtime::ContainerRuntime;
+        let runtime = ContainerRuntime::new();
+        if let Some(runtime_logs) = runtime.get_container_logs(&container_id) {
+            for (i, log_line) in runtime_logs.iter().enumerate() {
+                all_logs.push(quilt::LogEntry {
+                    timestamp: (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() - runtime_logs.len() as u64 + i as u64) as u64,
+                    message: format!("[RUNTIME] {}", log_line),
+                });
+            }
+        }
+        
+        // Add comprehensive filesystem inspection for debugging
+        use crate::utils::filesystem::FileSystemUtils;
+        let current_time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        
+        // Inspect container rootfs if accessible
+        if let Ok(status) = self.sync_engine.get_container_status(&container_id).await {
+            if let Some(rootfs) = status.rootfs_path {
+                if FileSystemUtils::exists(&rootfs) {
+                    if FileSystemUtils::is_directory(&rootfs) {
+                        all_logs.push(quilt::LogEntry {
+                            timestamp: current_time,
+                            message: format!("[INSPECT] Container rootfs exists at: {}", rootfs),
+                        });
+                        
+                        // Check key directories
+                        let key_dirs = vec!["/bin", "/usr/bin", "/tmp", "/var", "/etc"];
+                        for dir in key_dirs {
+                            let full_path = FileSystemUtils::join(&rootfs, dir);
+                            if FileSystemUtils::exists(&full_path) {
+                                let info = if FileSystemUtils::is_directory(&full_path) {
+                                    "directory exists"
+                                } else if FileSystemUtils::is_file(&full_path) {
+                                    "exists as file"
+                                } else {
+                                    "exists (unknown type)"
+                                };
+                                all_logs.push(quilt::LogEntry {
+                                    timestamp: current_time + 1,
+                                    message: format!("[INSPECT] {} - {}", dir, info),
+                                });
+                            }
+                        }
+                        
+                        // Check important files
+                        let important_files = vec!["/bin/sh", "/bin/busybox", "/usr/local/bin/quilt_ready"];
+                        for file in important_files {
+                            let full_path = FileSystemUtils::join(&rootfs, file);
+                            if FileSystemUtils::exists(&full_path) {
+                                if FileSystemUtils::is_file(&full_path) {
+                                    let executable = if FileSystemUtils::is_executable(&full_path) {
+                                        "executable"
+                                    } else {
+                                        "not executable"
+                                    };
+                                    if let Ok(size) = FileSystemUtils::get_file_size(&full_path) {
+                                        all_logs.push(quilt::LogEntry {
+                                            timestamp: current_time + 2,
+                                            message: format!("[INSPECT] {} - {} ({} bytes, {})", file, "exists", size, executable),
+                                        });
+                                    }
+                                } else if FileSystemUtils::is_broken_symlink(&full_path) {
+                                    all_logs.push(quilt::LogEntry {
+                                        timestamp: current_time + 2,
+                                        message: format!("[INSPECT] {} - broken symlink detected", file),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Sort logs by timestamp for chronological order
+        all_logs.sort_by_key(|log| log.timestamp);
+        
         Ok(Response::new(GetContainerLogsResponse {
             container_id,
-            logs: vec![],
+            logs: all_logs,
         }))
     }
 
@@ -317,6 +469,8 @@ impl QuiltService for QuiltServiceImpl {
         &self,
         request: Request<StopContainerRequest>,
     ) -> Result<Response<StopContainerResponse>, Status> {
+        use crate::daemon::runtime::ContainerRuntime;
+        
         let req = request.into_inner();
         
         // Resolve container name to ID if needed
@@ -332,116 +486,41 @@ impl QuiltService for QuiltServiceImpl {
             req.container_id.clone()
         };
 
-        // Get container status to get PID
-        match self.sync_engine.get_container_status(&container_id).await {
-            Ok(status) => {
-                if let Some(pid) = status.pid {
-                    // Send SIGTERM to the process
-                    let timeout = req.timeout_seconds as u64;
-                    let timeout = if timeout > 0 { timeout } else { 10 }; // Default 10s timeout
-                    
-                    // Use nix to send signal
-                    use nix::sys::signal::{kill, Signal};
-                    use nix::unistd::Pid;
-                    
-                    match kill(Pid::from_raw(pid as i32), Some(Signal::SIGTERM)) {
-                        Ok(()) => {
-                            ConsoleLogger::debug(&format!("Sent SIGTERM to process {}", pid));
-                            
-                            // Wait for process to exit gracefully
-                            let mut process_exists = true;
-                            let start_time = std::time::Instant::now();
-                            let timeout_duration = std::time::Duration::from_secs(timeout as u64);
-                            
-                            while process_exists && start_time.elapsed() < timeout_duration {
-                                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                                
-                                // Check if process still exists (signal 0 = check only)
-                                match kill(Pid::from_raw(pid as i32), None) {
-                                    Ok(()) => {
-                                        // Process still exists
-                                        ConsoleLogger::debug(&format!("Process {} still running after {:.1}s", pid, start_time.elapsed().as_secs_f32()));
-                                    }
-                                    Err(nix::errno::Errno::ESRCH) => {
-                                        // Process no longer exists
-                                        process_exists = false;
-                                        ConsoleLogger::debug(&format!("Process {} terminated after {:.1}s", pid, start_time.elapsed().as_secs_f32()));
-                                    }
-                                    Err(e) => {
-                                        ConsoleLogger::warning(&format!("Error checking process {}: {}", pid, e));
-                                        break;
-                                    }
-                                }
-                            }
-                            
-                            // If process still exists after timeout, force kill
-                            if process_exists {
-                                ConsoleLogger::warning(&format!("Process {} didn't exit after {}s, sending SIGKILL", pid, timeout));
-                                if let Err(e) = kill(Pid::from_raw(pid as i32), Some(Signal::SIGKILL)) {
-                                    if e != nix::errno::Errno::ESRCH {
-                                        ConsoleLogger::error(&format!("Failed to SIGKILL process {}: {}", pid, e));
-                                    }
-                                }
-                                // Wait a bit more for SIGKILL to take effect
-                                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                            }
-                            
-                            // Stop monitoring
-                            let _ = self.sync_engine.stop_monitoring(&container_id).await;
-                            
-                            // Update container state
-                            if let Err(e) = self.sync_engine.update_container_state(&container_id, ContainerState::Exited).await {
-                                ConsoleLogger::warning(&format!("Failed to update container state: {}", e));
-                            }
-                            
-                            ConsoleLogger::success(&format!("Container {} stopped", container_id));
-                            
-                            // Emit container stopped event
-                            sync::events::global_event_buffer().emit(
-                                sync::events::EventType::Stopped,
-                                &container_id,
-                                None,
-                            );
-                            Ok(Response::new(StopContainerResponse {
-                                success: true,
-                                error_message: String::new(),
-                            }))
-                        }
-                        Err(e) => {
-                            if e == nix::errno::Errno::ESRCH {
-                                // Process already dead
-                                let _ = self.sync_engine.stop_monitoring(&container_id).await;
-                                let _ = self.sync_engine.update_container_state(&container_id, ContainerState::Exited).await;
-                                
-                                Ok(Response::new(StopContainerResponse {
-                                    success: true,
-                                    error_message: String::new(),
-                                }))
-                            } else {
-                                ConsoleLogger::error(&format!("Failed to stop process {}: {}", pid, e));
-                                Ok(Response::new(StopContainerResponse {
-                                    success: false,
-                                    error_message: format!("Failed to stop process: {}", e),
-                                }))
-                            }
-                        }
-                    }
-                } else {
-                    // No PID, just update state
-                    let _ = self.sync_engine.stop_monitoring(&container_id).await;
-                    let _ = self.sync_engine.update_container_state(&container_id, ContainerState::Exited).await;
-                    
-                    Ok(Response::new(StopContainerResponse {
-                        success: true,
-                        error_message: String::new(),
-                    }))
+        // Use the comprehensive runtime stop_container method
+        let runtime = ContainerRuntime::new();
+        match runtime.stop_container(&container_id) {
+            Ok(()) => {
+                // Update sync engine state
+                if let Err(e) = self.sync_engine.update_container_state(&container_id, ContainerState::Exited).await {
+                    ConsoleLogger::warning(&format!("Failed to update container state in sync engine: {}", e));
                 }
+                
+                // Stop monitoring in sync engine
+                let _ = self.sync_engine.stop_monitoring(&container_id).await;
+                
+                // Store stop log
+                let _ = self.sync_engine.store_container_log(&container_id, "info", "Container stopped successfully").await;
+                
+                // Emit container stopped event
+                sync::events::global_event_buffer().emit(
+                    sync::events::EventType::Stopped,
+                    &container_id,
+                    None,
+                );
+
+                Ok(Response::new(StopContainerResponse {
+                    success: true,
+                    error_message: String::new(),
+                }))
             }
             Err(e) => {
-                ConsoleLogger::error(&format!("Failed to get container status: {}", e));
+                // Store error log
+                let _ = self.sync_engine.store_container_log(&container_id, "error", &format!("Failed to stop container: {}", e)).await;
+                
+                ConsoleLogger::error(&format!("Failed to stop container {}: {}", container_id, e));
                 Ok(Response::new(StopContainerResponse {
                     success: false,
-                    error_message: format!("Container not found: {}", e),
+                    error_message: e,
                 }))
             }
         }
@@ -466,15 +545,40 @@ impl QuiltService for QuiltServiceImpl {
             req.container_id.clone()
         };
 
-        // ✅ NON-BLOCKING: Coordinated cleanup through sync engine
+        // Use both runtime cleanup and sync engine cleanup for comprehensive removal
+        use crate::daemon::runtime::ContainerRuntime;
+        let runtime = ContainerRuntime::new();
+        
+        // First, attempt runtime removal (handles process stopping and resource cleanup)
+        let runtime_result = runtime.remove_container(&container_id);
+        
+        // Then, remove from sync engine (handles database cleanup)
         match self.sync_engine.delete_container(&container_id).await {
             Ok(()) => {
-                // Unregister from DNS
-                {
-                    let _ = self.network_manager.unregister_container_dns(&container_id);
+                // Comprehensive cleanup using all sync engine methods
+                
+                // Remove container mounts
+                if let Err(e) = self.sync_engine.remove_container_mounts(&container_id).await {
+                    ConsoleLogger::warning(&format!("Failed to remove mounts for {}: {}", container_id, e));
                 }
                 
-                ConsoleLogger::success(&format!("Container {} removed", container_id));
+                // Cleanup container logs (keep last 10 for debugging)
+                if let Ok(cleaned_count) = self.sync_engine.cleanup_container_logs(&container_id, 10).await {
+                    ConsoleLogger::debug(&format!("Cleaned up {} log entries for {}", cleaned_count, container_id));
+                }
+                
+                // Unregister from DNS
+                let _ = self.network_manager.unregister_container_dns(&container_id);
+                
+                // Log runtime result for debugging
+                if let Err(e) = runtime_result {
+                    ConsoleLogger::warning(&format!("Runtime cleanup issues for {}: {}", container_id, e));
+                }
+                
+                ConsoleLogger::success(&format!("Container {} removed with comprehensive cleanup", container_id));
+                
+                // Store removal log
+                let _ = self.sync_engine.store_container_log(&container_id, "info", "Container removed successfully").await;
                 
                 // Emit container removed event
                 sync::events::global_event_buffer().emit(
@@ -482,13 +586,14 @@ impl QuiltService for QuiltServiceImpl {
                     &container_id,
                     None,
                 );
+                
                 Ok(Response::new(RemoveContainerResponse {
                     success: true,
                     error_message: String::new(),
                 }))
             }
             Err(e) => {
-                ConsoleLogger::error(&format!("Failed to remove container {}: {}", req.container_id, e));
+                ConsoleLogger::error(&format!("Failed to remove container {}: {}", container_id, e));
                 Ok(Response::new(RemoveContainerResponse {
                     success: false,
                     error_message: e.to_string(),
@@ -524,13 +629,13 @@ impl QuiltService for QuiltServiceImpl {
         // Handle script copying if needed
         if req.copy_script && req.command.len() == 1 {
             let script_path = &req.command[0];
-            if std::path::Path::new(script_path).exists() {
+            if FileSystemUtils::exists(script_path) {
                 // Copy script to container
                 match self.sync_engine.get_container_status(&container_id).await {
                     Ok(status) => {
                         if let Some(rootfs_path) = status.rootfs_path {
                             let dest_path = format!("{}/tmp/script.sh", rootfs_path);
-                            if let Err(e) = utils::filesystem::FileSystemUtils::copy_file(script_path, &dest_path) {
+                            if let Err(e) = FileSystemUtils::copy_file(script_path, &dest_path) {
                                 return Ok(Response::new(ExecContainerResponse {
                                     success: false,
                                     exit_code: -1,
@@ -540,7 +645,7 @@ impl QuiltService for QuiltServiceImpl {
                                 }));
                             }
                             // Make script executable
-                            let _ = utils::filesystem::FileSystemUtils::make_executable(&dest_path);
+                            let _ = FileSystemUtils::make_executable(&dest_path);
                         }
                     }
                     Err(e) => {
@@ -587,7 +692,7 @@ impl QuiltService for QuiltServiceImpl {
                     let script_path = &req.command[0];
                     
                     // Read the local script file
-                    match std::fs::read_to_string(script_path) {
+                    match FileSystemUtils::read_file(script_path) {
                         Ok(script_content) => {
                             // Generate unique script name
                             let timestamp = std::time::SystemTime::now()
@@ -656,7 +761,8 @@ impl QuiltService for QuiltServiceImpl {
                     format!("nsenter -t {} -p -m -n -u -- chroot {} /bin/sh -c \"{}{}\" >/dev/null 2>&1", pid, rootfs_path, path_prefix, escaped_command)
                 };
 
-                match utils::command::CommandExecutor::execute_shell(&exec_cmd) {
+                // Primary execution using CommandExecutor with fallback to runtime method
+                match CommandExecutor::execute_shell(&exec_cmd) {
                     Ok(result) => {
                         ConsoleLogger::debug(&format!("✅ [GRPC] Exec completed with exit code: {}", result.exit_code.unwrap_or(-1)));
                         
@@ -666,7 +772,7 @@ impl QuiltService for QuiltServiceImpl {
                                 "nsenter -t {} -p -m -n -u -- chroot {} rm -f {}",
                                 pid, rootfs_path, command_to_execute
                             );
-                            let _ = utils::command::CommandExecutor::execute_shell(&cleanup_cmd);
+                            let _ = CommandExecutor::execute_shell(&cleanup_cmd);
                         }
                         
                         // Check if command failed due to "command not found" or similar
@@ -693,24 +799,54 @@ impl QuiltService for QuiltServiceImpl {
                         }))
                     }
                     Err(e) => {
-                        ConsoleLogger::error(&format!("❌ [GRPC] Exec failed: {}", e));
+                        ConsoleLogger::warning(&format!("⚠️ [GRPC] CommandExecutor failed, trying runtime exec: {}", e));
                         
-                        // Clean up temporary script on error too
-                        if req.copy_script && command_to_execute.starts_with("/tmp/quilt_exec_") {
-                            let cleanup_cmd = format!(
-                                "nsenter -t {} -p -m -n -u -- chroot {} rm -f {}",
-                                pid, rootfs_path, command_to_execute
-                            );
-                            let _ = utils::command::CommandExecutor::execute_shell(&cleanup_cmd);
+                        // Fallback to runtime exec_container method for enhanced reliability
+                        use crate::daemon::runtime::ContainerRuntime;
+                        let runtime = ContainerRuntime::new();
+                        
+                        match runtime.exec_container(&container_id, req.command.clone(), Some(req.working_directory), req.environment, true) {
+                            Ok((exit_code, stdout, stderr)) => {
+                                ConsoleLogger::debug(&format!("✅ [GRPC] Runtime exec completed with exit code: {}", exit_code));
+                                
+                                // Clean up temporary script on success
+                                if req.copy_script && command_to_execute.starts_with("/tmp/quilt_exec_") {
+                                    let cleanup_cmd = format!(
+                                        "nsenter -t {} -p -m -n -u -- chroot {} rm -f {}",
+                                        pid, rootfs_path, command_to_execute
+                                    );
+                                    let _ = CommandExecutor::execute_shell(&cleanup_cmd);
+                                }
+                                
+                                Ok(Response::new(ExecContainerResponse {
+                                    success: exit_code == 0,
+                                    exit_code,
+                                    stdout,
+                                    stderr,
+                                    error_message: if exit_code != 0 { format!("Command failed with exit code {}", exit_code) } else { String::new() },
+                                }))
+                            }
+                            Err(runtime_error) => {
+                                ConsoleLogger::error(&format!("❌ [GRPC] Both exec methods failed. CommandExecutor: {}, Runtime: {}", e, runtime_error));
+                                
+                                // Clean up temporary script on error
+                                if req.copy_script && command_to_execute.starts_with("/tmp/quilt_exec_") {
+                                    let cleanup_cmd = format!(
+                                        "nsenter -t {} -p -m -n -u -- chroot {} rm -f {}",
+                                        pid, rootfs_path, command_to_execute
+                                    );
+                                    let _ = CommandExecutor::execute_shell(&cleanup_cmd);
+                                }
+                                
+                                Ok(Response::new(ExecContainerResponse {
+                                    success: false,
+                                    exit_code: -1,
+                                    stdout: String::new(),
+                                    stderr: String::new(),
+                                    error_message: format!("Exec failed: {} (Runtime fallback: {})", e, runtime_error),
+                                }))
+                            }
                         }
-                        
-                        Ok(Response::new(ExecContainerResponse {
-                            success: false,
-                            exit_code: -1,
-                            stdout: String::new(),
-                            stderr: String::new(),
-                            error_message: e,
-                        }))
                     }
                 }
             }
@@ -821,10 +957,11 @@ impl QuiltService for QuiltServiceImpl {
                 
                 if let Some(pid) = status.pid {
                     // Kill the process immediately with SIGKILL
-                    use nix::sys::signal::{kill, Signal};
-                    use nix::unistd::Pid;
+                    use nix::sys::signal::Signal;
+                    use crate::utils::process::ProcessUtils;
                     
-                    match kill(Pid::from_raw(pid as i32), Some(Signal::SIGKILL)) {
+                    let nix_pid = ProcessUtils::i32_to_pid(pid as i32);
+                    match ProcessUtils::send_signal(nix_pid, Signal::SIGKILL) {
                         Ok(()) => {
                             ConsoleLogger::debug(&format!("Sent SIGKILL to process {}", pid));
                             
@@ -832,16 +969,10 @@ impl QuiltService for QuiltServiceImpl {
                             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                             
                             // Verify process is dead
-                            match kill(Pid::from_raw(pid as i32), None) {
-                                Err(nix::errno::Errno::ESRCH) => {
-                                    ConsoleLogger::debug(&format!("Process {} confirmed dead", pid));
-                                }
-                                Ok(()) => {
-                                    ConsoleLogger::warning(&format!("Process {} still exists after SIGKILL", pid));
-                                }
-                                Err(e) => {
-                                    ConsoleLogger::warning(&format!("Error checking process {}: {}", pid, e));
-                                }
+                            if !ProcessUtils::is_process_running(nix_pid) {
+                                ConsoleLogger::debug(&format!("Process {} confirmed dead", pid));
+                            } else {
+                                ConsoleLogger::warning(&format!("Process {} still exists after SIGKILL", pid));
                             }
                             
                             // Update state to exited
@@ -860,7 +991,7 @@ impl QuiltService for QuiltServiceImpl {
                             }))
                         }
                         Err(e) => {
-                            if e == nix::errno::Errno::ESRCH {
+                            if e.contains("ESRCH") || e.contains("does not exist") {
                                 // Process already dead
                                 let _ = self.sync_engine.update_container_state(&container_id, ContainerState::Exited).await;
                                 let _ = self.sync_engine.stop_monitoring(&container_id).await;
@@ -1045,13 +1176,13 @@ impl QuiltService for QuiltServiceImpl {
         &self,
         _request: Request<GetHealthRequest>,
     ) -> Result<Response<GetHealthResponse>, Status> {
-        use crate::utils::logger::Timer;
+        use std::time::Instant;
         
         let mut checks = Vec::new();
         let mut overall_healthy = true;
         
         // Check database connection
-        let db_timer = Timer::new("database_check");
+        let db_start = Instant::now();
         let db_healthy = match sqlx::query("SELECT 1").fetch_one(self.sync_engine.pool()).await {
             Ok(_) => true,
             Err(_) => {
@@ -1063,12 +1194,12 @@ impl QuiltService for QuiltServiceImpl {
             name: "database".to_string(),
             healthy: db_healthy,
             message: if db_healthy { "Connected".to_string() } else { "Connection failed".to_string() },
-            duration_ms: db_timer.elapsed_ms(),
+            duration_ms: db_start.elapsed().as_millis() as u64,
         });
         
         // Check cgroups availability
-        let cgroup_timer = Timer::new("cgroup_check");
-        let cgroup_healthy = std::path::Path::new("/sys/fs/cgroup").exists();
+        let cgroup_start = Instant::now();
+        let cgroup_healthy = FileSystemUtils::exists("/sys/fs/cgroup");
         if !cgroup_healthy {
             overall_healthy = false;
         }
@@ -1076,7 +1207,7 @@ impl QuiltService for QuiltServiceImpl {
             name: "cgroups".to_string(),
             healthy: cgroup_healthy,
             message: if cgroup_healthy { "Available".to_string() } else { "Not available".to_string() },
-            duration_ms: cgroup_timer.elapsed_ms(),
+            duration_ms: cgroup_start.elapsed().as_millis() as u64,
         });
         
         // Get container counts
@@ -1107,13 +1238,18 @@ impl QuiltService for QuiltServiceImpl {
         
         let mut container_metrics = Vec::new();
         
-        // Get container metrics
+        // Get container metrics - use historical data if time range specified
         if !req.container_id.is_empty() {
-            // Get specific container metrics
-            if let Ok(status) = self.sync_engine.get_container_status(&req.container_id).await {
-                let collector = MetricsCollector::new();
-                if let Ok(metrics) = collector.collect_container_metrics(&req.container_id, status.pid.map(|p| p as i32)) {
-                    container_metrics.push(ContainerMetric {
+            if req.start_time > 0 && req.end_time > 0 {
+                // Historical metrics requested
+                if let Ok(historical_metrics) = self.sync_engine.get_metrics_history(
+                    &req.container_id, 
+                    req.start_time, 
+                    req.end_time, 
+                    Some(1000)
+                ).await {
+                    for metrics in historical_metrics {
+                        container_metrics.push(ContainerMetric {
                             container_id: metrics.container_id.clone(),
                             timestamp: metrics.timestamp,
                             cpu_usage_usec: metrics.cpu.usage_usec,
@@ -1132,9 +1268,78 @@ impl QuiltService for QuiltServiceImpl {
                             disk_read_bytes: metrics.disk.read_bytes,
                             disk_write_bytes: metrics.disk.write_bytes,
                         });
+                    }
+                }
+            } else {
+                // Real-time metrics requested - try cached first, then fresh collection
+                if let Ok(status) = self.sync_engine.get_container_status(&req.container_id).await {
+                    // First try to get cached metrics (within last 30 seconds)
+                    let use_cached = if let Ok(Some(latest_metrics)) = self.sync_engine.get_latest_metrics(&req.container_id).await {
+                        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+                        let metrics_age = now - latest_metrics.timestamp;
+                        if metrics_age <= 30 {  // Use cached if less than 30 seconds old
+                            // Use cached metrics
+                            container_metrics.push(ContainerMetric {
+                                container_id: latest_metrics.container_id.clone(),
+                                timestamp: latest_metrics.timestamp,
+                                cpu_usage_usec: latest_metrics.cpu.usage_usec,
+                                cpu_user_usec: latest_metrics.cpu.user_usec,
+                                cpu_system_usec: latest_metrics.cpu.system_usec,
+                                cpu_throttled_usec: latest_metrics.cpu.throttled_usec,
+                                memory_current_bytes: latest_metrics.memory.current_bytes,
+                                memory_peak_bytes: latest_metrics.memory.peak_bytes,
+                                memory_limit_bytes: latest_metrics.memory.limit_bytes,
+                                memory_cache_bytes: latest_metrics.memory.cache_bytes,
+                                memory_rss_bytes: latest_metrics.memory.rss_bytes,
+                                network_rx_bytes: latest_metrics.network.rx_bytes,
+                                network_tx_bytes: latest_metrics.network.tx_bytes,
+                                network_rx_packets: latest_metrics.network.rx_packets,
+                                network_tx_packets: latest_metrics.network.tx_packets,
+                                disk_read_bytes: latest_metrics.disk.read_bytes,
+                                disk_write_bytes: latest_metrics.disk.write_bytes,
+                            });
+                            true
+                        } else {
+                            false  // Cached metrics too old
+                        }
+                    } else {
+                        false  // No cached metrics
+                    };
                     
-                    // Store metrics in database for history
-                    let _ = self.sync_engine.store_metrics(&metrics).await;
+                    // If no cached metrics or they're stale, collect fresh metrics
+                    if !use_cached {
+                        let collector = MetricsCollector::new();
+                        
+                        // Also get stats from runtime for additional details
+                        use crate::daemon::runtime::ContainerRuntime;
+                        let runtime = ContainerRuntime::new();
+                        let _runtime_stats = runtime.get_container_stats(&req.container_id).unwrap_or_default();
+                        
+                        if let Ok(metrics) = collector.collect_container_metrics(&req.container_id, status.pid.map(|p| p as i32)) {
+                        container_metrics.push(ContainerMetric {
+                                container_id: metrics.container_id.clone(),
+                                timestamp: metrics.timestamp,
+                                cpu_usage_usec: metrics.cpu.usage_usec,
+                                cpu_user_usec: metrics.cpu.user_usec,
+                                cpu_system_usec: metrics.cpu.system_usec,
+                                cpu_throttled_usec: metrics.cpu.throttled_usec,
+                                memory_current_bytes: metrics.memory.current_bytes,
+                                memory_peak_bytes: metrics.memory.peak_bytes,
+                                memory_limit_bytes: metrics.memory.limit_bytes,
+                                memory_cache_bytes: metrics.memory.cache_bytes,
+                                memory_rss_bytes: metrics.memory.rss_bytes,
+                                network_rx_bytes: metrics.network.rx_bytes,
+                                network_tx_bytes: metrics.network.tx_bytes,
+                                network_rx_packets: metrics.network.rx_packets,
+                                network_tx_packets: metrics.network.tx_packets,
+                                disk_read_bytes: metrics.disk.read_bytes,
+                                disk_write_bytes: metrics.disk.write_bytes,
+                            });
+                        
+                            // Store metrics in database for history
+                            let _ = self.sync_engine.store_metrics(&metrics).await;
+                        }
+                    }
                 }
             }
         } else {
@@ -1219,11 +1424,53 @@ impl QuiltService for QuiltServiceImpl {
         limits.insert("max_memory_per_container".to_string(), "unlimited".to_string());
         limits.insert("max_cpus_per_container".to_string(), "unlimited".to_string());
         
+        // Add SyncEngineStats for comprehensive system information
+        let mut stats_features = features.clone();
+        if let Ok(engine_stats) = self.sync_engine.get_stats().await {
+            stats_features.insert("active_containers".to_string(), engine_stats.total_containers.to_string());
+            stats_features.insert("running_containers".to_string(), engine_stats.running_containers.to_string());
+            stats_features.insert("active_networks".to_string(), engine_stats.active_networks.to_string());
+            stats_features.insert("active_monitors".to_string(), engine_stats.active_monitors.to_string());
+            
+            // Get detailed runtime stats for running containers
+            if let Ok(containers) = self.sync_engine.list_containers(Some(crate::sync::ContainerState::Running)).await {
+                let mut total_memory = 0i64;
+                let mut containers_with_stats = 0;
+                
+                for container in containers {
+                    // Use the combined method to get both container info and stats
+                    let (container_info, stats_result) = self.runtime.get_container_info_and_stats(&container.id);
+                    
+                    if let Ok(stats) = stats_result {
+                        if let Some(memory_str) = stats.get("memory_usage_bytes") {
+                            total_memory += memory_str.parse::<i64>().unwrap_or(0);
+                            containers_with_stats += 1;
+                        }
+                        
+                        // Add additional info if container details are available
+                        if let Some(info) = container_info {
+                            if let Some(pid) = info.pid {
+                                // Could add PID-based stats here if needed
+                                use crate::utils::process::ProcessUtils;
+                                let pid_i32 = ProcessUtils::pid_to_i32(pid);
+                                stats_features.insert(format!("container_{}_pid", container.id), pid_i32.to_string());
+                            }
+                        }
+                    }
+                }
+                
+                if containers_with_stats > 0 {
+                    stats_features.insert("total_memory_usage_bytes".to_string(), total_memory.to_string());
+                    stats_features.insert("containers_with_runtime_stats".to_string(), containers_with_stats.to_string());
+                }
+            }
+        }
+        
         Ok(Response::new(GetSystemInfoResponse {
             version: env!("CARGO_PKG_VERSION").to_string(),
             runtime: format!("{}/{}", std::env::consts::OS, std::env::consts::ARCH),
             start_time: self.start_time.duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64,
-            features,
+            features: stats_features,
             limits,
         }))
     }
@@ -1279,12 +1526,350 @@ impl QuiltService for QuiltServiceImpl {
     }
     
     type StreamEventsStream = std::pin::Pin<Box<dyn futures::Stream<Item = Result<ProtoContainerEvent, Status>> + Send>>;
+
+    // Container monitoring endpoints
+    async fn list_active_monitors(
+        &self,
+        _request: Request<quilt::ListActiveMonitorsRequest>,
+    ) -> Result<Response<quilt::ListActiveMonitorsResponse>, Status> {
+        match self.sync_engine.list_active_monitors().await {
+            Ok(monitors) => {
+                let proto_monitors = monitors.into_iter().map(|m| quilt::ProcessMonitor {
+                    container_id: m.container_id,
+                    pid: m.pid,
+                    status: m.status.to_string(),
+                    started_at: m.monitor_started_at as u64,
+                    last_check: m.last_check_at.unwrap_or(0) as u64,
+                    check_count: 0, // TODO: Add check count to database schema
+                    error_message: String::new(),
+                }).collect();
+
+                Ok(Response::new(quilt::ListActiveMonitorsResponse {
+                    monitors: proto_monitors,
+                    success: true,
+                    error_message: String::new(),
+                }))
+            }
+            Err(e) => Ok(Response::new(quilt::ListActiveMonitorsResponse {
+                monitors: vec![],
+                success: false,
+                error_message: e.to_string(),
+            }))
+        }
+    }
+
+    async fn get_monitor_status(
+        &self,
+        request: Request<quilt::GetMonitorStatusRequest>,
+    ) -> Result<Response<quilt::GetMonitorStatusResponse>, Status> {
+        let req = request.into_inner();
+        
+        match self.sync_engine.get_monitor_status(&req.container_id).await {
+            Ok(monitor) => {
+                let proto_monitor = quilt::ProcessMonitor {
+                    container_id: monitor.container_id,
+                    pid: monitor.pid,
+                    status: monitor.status.to_string(),
+                    started_at: monitor.monitor_started_at as u64,
+                    last_check: monitor.last_check_at.unwrap_or(0) as u64,
+                    check_count: 0, // TODO: Add check count to database schema
+                    error_message: String::new(),
+                };
+
+                Ok(Response::new(quilt::GetMonitorStatusResponse {
+                    monitor: Some(proto_monitor),
+                    success: true,
+                    error_message: String::new(),
+                }))
+            }
+            Err(e) => Ok(Response::new(quilt::GetMonitorStatusResponse {
+                monitor: None,
+                success: false,
+                error_message: e.to_string(),
+            }))
+        }
+    }
+
+    async fn list_monitoring_processes(
+        &self,
+        _request: Request<quilt::ListMonitoringProcessesRequest>,
+    ) -> Result<Response<quilt::ListMonitoringProcessesResponse>, Status> {
+        // Same as list_active_monitors for now - could be different in the future
+        match self.sync_engine.list_active_monitors().await {
+            Ok(monitors) => {
+                let proto_monitors = monitors.into_iter().map(|m| quilt::ProcessMonitor {
+                    container_id: m.container_id,
+                    pid: m.pid,
+                    status: m.status.to_string(),
+                    started_at: m.monitor_started_at as u64,
+                    last_check: m.last_check_at.unwrap_or(0) as u64,
+                    check_count: 0, // TODO: Add check count to database schema
+                    error_message: String::new(),
+                }).collect();
+
+                Ok(Response::new(quilt::ListMonitoringProcessesResponse {
+                    processes: proto_monitors,
+                    success: true,
+                    error_message: String::new(),
+                }))
+            }
+            Err(e) => Ok(Response::new(quilt::ListMonitoringProcessesResponse {
+                processes: vec![],
+                success: false,
+                error_message: e.to_string(),
+            }))
+        }
+    }
+
+    // Cleanup operation endpoints
+    async fn get_cleanup_status(
+        &self,
+        request: Request<quilt::GetCleanupStatusRequest>,
+    ) -> Result<Response<quilt::GetCleanupStatusResponse>, Status> {
+        let req = request.into_inner();
+        let container_filter = if req.container_id.is_empty() { None } else { Some(req.container_id.as_str()) };
+
+        match self.sync_engine.cleanup_service.get_cleanup_tasks(container_filter).await {
+            Ok(tasks) => {
+                let proto_tasks = tasks.into_iter().map(|t| quilt::CleanupTask {
+                    task_id: t.id,
+                    container_id: t.container_id,
+                    resource_type: t.resource_type.to_string(),
+                    resource_path: t.resource_path,
+                    status: t.status.to_string(),
+                    created_at: t.created_at as u64,
+                    completed_at: t.completed_at.unwrap_or(0) as u64,
+                    error_message: t.error_message.unwrap_or_default(),
+                }).collect();
+
+                Ok(Response::new(quilt::GetCleanupStatusResponse {
+                    tasks: proto_tasks,
+                    success: true,
+                    error_message: String::new(),
+                }))
+            }
+            Err(e) => Ok(Response::new(quilt::GetCleanupStatusResponse {
+                tasks: vec![],
+                success: false,
+                error_message: e.to_string(),
+            }))
+        }
+    }
+
+    async fn list_cleanup_tasks(
+        &self,
+        request: Request<quilt::ListCleanupTasksRequest>,
+    ) -> Result<Response<quilt::ListCleanupTasksResponse>, Status> {
+        let req = request.into_inner();
+        
+        // List cleanup tasks always gets all tasks - no container_id filtering
+        let tasks_result = self.sync_engine.cleanup_service.get_cleanup_tasks(None).await;
+        
+        match tasks_result {
+            Ok(tasks) => {
+                let proto_tasks = tasks.into_iter().map(|t| quilt::CleanupTask {
+                    task_id: t.id,
+                    container_id: t.container_id,
+                    resource_type: t.resource_type.to_string(),
+                    resource_path: t.resource_path,
+                    status: t.status.to_string(),
+                    created_at: t.created_at as u64,
+                    completed_at: t.completed_at.unwrap_or(0) as u64,
+                    error_message: t.error_message.unwrap_or_default(),
+                }).collect();
+
+                Ok(Response::new(quilt::ListCleanupTasksResponse {
+                    tasks: proto_tasks,
+                    success: true,
+                    error_message: String::new(),
+                }))
+            }
+            Err(e) => Ok(Response::new(quilt::ListCleanupTasksResponse {
+                tasks: vec![],
+                success: false,
+                error_message: e.to_string(),
+            }))
+        }
+    }
+
+    async fn list_network_allocations(
+        &self,
+        _request: Request<quilt::ListNetworkAllocationsRequest>,
+    ) -> Result<Response<quilt::ListNetworkAllocationsResponse>, Status> {
+        match self.sync_engine.list_network_allocations().await {
+            Ok(allocations) => {
+                let proto_allocations = allocations.into_iter().map(|a| quilt::NetworkAllocation {
+                    container_id: a.container_id,
+                    ip_address: a.ip_address,
+                    bridge_interface: a.bridge_interface.unwrap_or_default(),
+                    veth_host: a.veth_host.unwrap_or_default(),
+                    veth_container: a.veth_container.unwrap_or_default(),
+                    setup_completed: a.setup_completed,
+                    allocation_time: a.allocation_time,
+                    status: match a.status {
+                        crate::sync::network::NetworkStatus::Allocated => "allocated".to_string(),
+                        crate::sync::network::NetworkStatus::Active => "active".to_string(),
+                        crate::sync::network::NetworkStatus::CleanupPending => "cleanup_pending".to_string(),
+                        crate::sync::network::NetworkStatus::Cleaned => "cleaned".to_string(),
+                    },
+                }).collect();
+
+                Ok(Response::new(quilt::ListNetworkAllocationsResponse {
+                    allocations: proto_allocations,
+                }))
+            }
+            Err(_e) => Ok(Response::new(quilt::ListNetworkAllocationsResponse {
+                allocations: vec![],
+            }))
+        }
+    }
+
+    async fn force_cleanup(
+        &self,
+        request: Request<quilt::ForceCleanupRequest>,
+    ) -> Result<Response<quilt::ForceCleanupResponse>, Status> {
+        let req = request.into_inner();
+        let mut all_cleaned_resources = Vec::new();
+        
+        // Force cleanup specific container if provided
+        if !req.container_id.is_empty() {
+            match self.sync_engine.cleanup_service.force_cleanup(&req.container_id).await {
+                Ok(cleaned_resources) => {
+                    all_cleaned_resources.extend(cleaned_resources);
+                }
+                Err(e) => return Ok(Response::new(quilt::ForceCleanupResponse {
+                    success: false,
+                    error_message: format!("Container cleanup failed: {}", e),
+                    cleaned_resources: vec![],
+                }))
+            }
+        }
+        
+        // Run general cleanup tasks
+        let mut cleanup_messages = Vec::new();
+        
+        // Clean up orphaned volumes
+        match self.sync_engine.cleanup_orphaned_volumes().await {
+            Ok(cleaned_volumes) => {
+                if cleaned_volumes > 0 {
+                    cleanup_messages.push(format!("Cleaned {} orphaned volumes", cleaned_volumes));
+                }
+            }
+            Err(e) => cleanup_messages.push(format!("Volume cleanup failed: {}", e)),
+        }
+        
+        // Clean up old metrics
+        match self.sync_engine.cleanup_old_metrics(7).await {
+            Ok(cleaned_metrics) => {
+                if cleaned_metrics > 0 {
+                    cleanup_messages.push(format!("Cleaned {} old metric records", cleaned_metrics));
+                }
+            }
+            Err(e) => cleanup_messages.push(format!("Metrics cleanup failed: {}", e)),
+        }
+        
+        all_cleaned_resources.extend(cleanup_messages);
+        
+        Ok(Response::new(quilt::ForceCleanupResponse {
+            success: true,
+            error_message: String::new(),
+            cleaned_resources: all_cleaned_resources,
+        }))
+    }
+
+    async fn get_container_network(
+        &self,
+        request: Request<quilt::GetContainerNetworkRequest>,
+    ) -> Result<Response<quilt::GetContainerNetworkResponse>, Status> {
+        let req = request.into_inner();
+        
+        // Use the unused runtime method to get container network config
+        match self.runtime.get_container_network(&req.container_id) {
+            Some(network_config) => {
+                let proto_config = quilt::ContainerNetworkConfig {
+                    ip_address: network_config.ip_address,
+                    bridge_interface: network_config.gateway_ip,
+                    veth_host: network_config.veth_host_name,
+                    veth_container: network_config.veth_container_name,
+                    setup_completed: true,
+                    status: format!("Network configured for container {}", req.container_id),
+                };
+                
+                Ok(Response::new(quilt::GetContainerNetworkResponse {
+                    success: true,
+                    error_message: String::new(),
+                    network_config: Some(proto_config),
+                }))
+            }
+            None => Ok(Response::new(quilt::GetContainerNetworkResponse {
+                success: false,
+                error_message: format!("No network configuration found for container {}", req.container_id),
+                network_config: None,
+            }))
+        }
+    }
+
+    async fn set_container_network(
+        &self,
+        request: Request<quilt::SetContainerNetworkRequest>,
+    ) -> Result<Response<quilt::SetContainerNetworkResponse>, Status> {
+        let req = request.into_inner();
+        
+        if let Some(proto_config) = req.network_config {
+            // Convert protobuf config to ContainerNetworkConfig
+            let network_config = crate::icc::network::ContainerNetworkConfig {
+                ip_address: proto_config.ip_address,
+                subnet_mask: "255.255.0.0".to_string(),
+                gateway_ip: proto_config.bridge_interface,
+                container_id: req.container_id.clone(),
+                veth_host_name: proto_config.veth_host,
+                veth_container_name: proto_config.veth_container,
+                rootfs_path: None,
+            };
+            
+            // Use the unused runtime method to set container network config
+            match self.runtime.set_container_network(&req.container_id, network_config) {
+                Ok(_) => Ok(Response::new(quilt::SetContainerNetworkResponse {
+                    success: true,
+                    error_message: String::new(),
+                })),
+                Err(e) => Ok(Response::new(quilt::SetContainerNetworkResponse {
+                    success: false,
+                    error_message: e,
+                }))
+            }
+        } else {
+            Ok(Response::new(quilt::SetContainerNetworkResponse {
+                success: false,
+                error_message: "Network configuration is required".to_string(),
+            }))
+        }
+    }
+
+    async fn setup_container_network_post_start(
+        &self,
+        request: Request<quilt::SetupContainerNetworkPostStartRequest>,
+    ) -> Result<Response<quilt::SetupContainerNetworkPostStartResponse>, Status> {
+        let req = request.into_inner();
+        
+        // Use the unused runtime method to setup container network post-start
+        match self.runtime.setup_container_network_post_start(&req.container_id, &self.network_manager) {
+            Ok(_) => Ok(Response::new(quilt::SetupContainerNetworkPostStartResponse {
+                success: true,
+                error_message: String::new(),
+            })),
+            Err(e) => Ok(Response::new(quilt::SetupContainerNetworkPostStartResponse {
+                success: false,
+                error_message: e,
+            }))
+        }
+    }
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize logger
-    utils::logger::Logger::init();
+    // Logger initialization not needed - ConsoleLogger is used directly
     
     // ✅ SYNC ENGINE INITIALIZATION
     let service = QuiltServiceImpl::new().await

@@ -5,7 +5,4 @@ pub mod network;
 pub mod dns;
 pub mod messaging;
 
-// Re-export key components for easier access
-pub use network::{NetworkManager, NetworkConfig, ContainerNetworkConfig};
-pub use dns::DnsServer;
-pub use messaging::MessageBroker; 
+// Re-export key components for easier access (none currently used) 

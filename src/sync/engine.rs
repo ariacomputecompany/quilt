@@ -9,7 +9,7 @@ use crate::sync::{
     monitor::ProcessMonitorService,
     cleanup::CleanupService,
     volumes::{VolumeManager, Volume, Mount, MountType},
-    error::{SyncError, SyncResult},
+    error::SyncResult,
 };
 
 /// Main sync engine that coordinates all stateful resources
@@ -18,8 +18,8 @@ pub struct SyncEngine {
     container_manager: Arc<ContainerManager>,
     network_manager: Arc<NetworkManager>,
     volume_manager: Arc<VolumeManager>,
-    monitor_service: Arc<ProcessMonitorService>,
-    cleanup_service: Arc<CleanupService>,
+    pub monitor_service: Arc<ProcessMonitorService>,
+    pub cleanup_service: Arc<CleanupService>,
     
     // Background services control
     background_tasks: Arc<RwLock<Vec<tokio::task::JoinHandle<()>>>>,
@@ -99,6 +99,71 @@ impl SyncEngine {
         });
         tasks.push(monitor_cleanup_task);
         
+        // Start volume cleanup task (runs every 30 minutes)
+        let volume_manager = self.volume_manager.clone();
+        let volume_cleanup_task = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(1800)); // 30 minutes
+            loop {
+                interval.tick().await;
+                if let Err(e) = volume_manager.cleanup_orphaned_volumes().await {
+                    tracing::warn!("Failed to cleanup orphaned volumes: {}", e);
+                }
+            }
+        });
+        tasks.push(volume_cleanup_task);
+        
+        // Start network cleanup task (runs every 15 minutes)
+        let network_manager = self.network_manager.clone();
+        let network_cleanup_task = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(900)); // 15 minutes
+            loop {
+                interval.tick().await;
+                // Get networks needing cleanup and process them
+                if let Ok(networks_to_cleanup) = network_manager.get_networks_needing_cleanup().await {
+                    for network_alloc in networks_to_cleanup {
+                        tracing::info!("Cleaning up network for container {}", network_alloc.container_id);
+                        // Mark as cleaned after successful cleanup
+                        if let Err(e) = network_manager.mark_network_cleaned(&network_alloc.container_id).await {
+                            tracing::warn!("Failed to mark network cleaned for {}: {}", network_alloc.container_id, e);
+                        }
+                    }
+                }
+            }
+        });
+        tasks.push(network_cleanup_task);
+        
+        // Start metrics cleanup task (runs daily)
+        let pool = self.connection_manager.pool().clone();
+        let metrics_cleanup_task = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(86400)); // 24 hours
+            loop {
+                interval.tick().await;
+                let metrics_store = crate::sync::metrics::MetricsStore::new(pool.clone());
+                if let Err(e) = metrics_store.cleanup_old_metrics(7).await { // Keep 7 days
+                    tracing::warn!("Failed to cleanup old metrics: {}", e);
+                }
+            }
+        });
+        tasks.push(metrics_cleanup_task);
+        
+        // Start log cleanup task (runs every 6 hours)
+        let container_manager = self.container_manager.clone();
+        let log_cleanup_task = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(21600)); // 6 hours
+            loop {
+                interval.tick().await;
+                // Get all containers and cleanup logs (keep last 1000 entries per container)
+                if let Ok(containers) = container_manager.list_containers(None).await {
+                    for container in containers {
+                        if let Err(e) = container_manager.cleanup_container_logs(&container.id, 1000).await {
+                            tracing::warn!("Failed to cleanup logs for container {}: {}", container.id, e);
+                        }
+                    }
+                }
+            }
+        });
+        tasks.push(log_cleanup_task);
+        
         tracing::info!("Started {} background services", tasks.len());
         Ok(())
     }
@@ -131,7 +196,7 @@ impl SyncEngine {
         let enable_network = config.enable_network_namespace;
         
         // Import ConsoleLogger
-        use crate::utils::ConsoleLogger;
+        use crate::utils::console::ConsoleLogger;
         use std::time::{SystemTime, UNIX_EPOCH};
         
         println!("🔧 [SYNC-CREATE] Creating container {} with networking: {} (atomic)", container_id, enable_network);
@@ -173,69 +238,31 @@ impl SyncEngine {
         
         ConsoleLogger::debug(&format!("✅ [ATOMIC] Container record inserted for {}", container_id));
         
-        // Step 2: Network allocation within same transaction (if enabled)
+        // Step 2: Commit container creation first
+        transaction.commit().await?;
+        ConsoleLogger::debug(&format!("✅ [ATOMIC] Container record committed for {}", container_id));
+        
+        // Step 3: Network allocation using proper NetworkManager (separate transaction, if enabled)
         let network_config = if enable_network {
-            // Find available IP within transaction
-            let allocated_ips: Vec<(String,)> = sqlx::query_as(
-                "SELECT ip_address FROM network_allocations WHERE status != 'cleaned'"
-            ).fetch_all(&mut *transaction).await?;
-            
-            let allocated_set: std::collections::HashSet<String> = allocated_ips
-                .into_iter()
-                .map(|(ip,)| ip)
-                .collect();
-            
-            // Find first available IP in range (10.42.0.2 to 10.42.255.254)
-            let start_ip = std::net::Ipv4Addr::new(10, 42, 0, 2);
-            let end_ip = std::net::Ipv4Addr::new(10, 42, 255, 254);
-            let start_int = u32::from(start_ip);
-            let end_int = u32::from(end_ip);
-            
-            let mut selected_ip = None;
-            for ip_int in start_int..=end_int {
-                let ip = std::net::Ipv4Addr::from(ip_int);
-                let ip_str = ip.to_string();
-                
-                if !allocated_set.contains(&ip_str) {
-                    selected_ip = Some(ip_str);
-                    break;
+            match self.network_manager.allocate_network(&container_id).await {
+                Ok(config) => {
+                    ConsoleLogger::debug(&format!("✅ [NETWORK] IP allocated via NetworkManager for {}: {}", container_id, config.ip_address));
+                    Some(config)
+                },
+                Err(e) => {
+                    // Network allocation failed - clean up the container
+                    ConsoleLogger::error(&format!("❌ [NETWORK] Failed to allocate IP for {}: {}", container_id, e));
+                    if let Err(cleanup_err) = self.container_manager.delete_container(&container_id).await {
+                        ConsoleLogger::error(&format!("❌ [CLEANUP] Failed to cleanup container {} after network failure: {}", container_id, cleanup_err));
+                    }
+                    return Err(e);
                 }
             }
-            
-            let ip = selected_ip.ok_or(SyncError::NoAvailableIp)?;
-            let allocation_time = created_at; // Use same timestamp
-            
-            // Insert network allocation within same transaction
-            sqlx::query(r#"
-                INSERT INTO network_allocations (
-                    container_id, ip_address, allocation_time, setup_completed, status
-                ) VALUES (?, ?, ?, ?, ?)
-            "#)
-            .bind(&container_id)
-            .bind(&ip)
-            .bind(allocation_time)
-            .bind(false)
-            .bind(crate::sync::network::NetworkStatus::Allocated.to_string())
-            .execute(&mut *transaction)
-            .await?;
-            
-            ConsoleLogger::debug(&format!("✅ [ATOMIC] Network allocation inserted for {}: IP={}", container_id, ip));
-            
-            Some(NetworkConfig {
-                container_id: container_id.clone(),
-                ip_address: ip,
-                bridge_interface: None,
-                veth_host: None,
-                veth_container: None,
-                setup_required: true,
-            })
         } else {
             None
         };
         
-        // Step 3: Commit atomic transaction
-        transaction.commit().await?;
-        ConsoleLogger::info(&format!("🔒 [ATOMIC] Container {} created atomically with network config", container_id));
+        ConsoleLogger::info(&format!("🔒 [COMPLETE] Container {} created with network config", container_id));
         
         // Step 4: Emit events after successful database commit
         crate::emit_container_created!(container_id);
@@ -396,10 +423,6 @@ impl SyncEngine {
     
     // === Utility Methods ===
     
-    /// Check if container exists
-    pub async fn container_exists(&self, container_id: &str) -> SyncResult<bool> {
-        self.container_manager.container_exists(container_id).await
-    }
     
     /// Get container ID by name
     pub async fn get_container_by_name(&self, name: &str) -> SyncResult<String> {
@@ -426,6 +449,33 @@ impl SyncEngine {
         use crate::sync::metrics::MetricsStore;
         let store = MetricsStore::new(self.connection_manager.pool().clone());
         store.store_metrics(metrics).await
+    }
+    
+    /// Get latest metrics for a container
+    pub async fn get_latest_metrics(&self, container_id: &str) -> SyncResult<Option<crate::daemon::metrics::ContainerMetrics>> {
+        use crate::sync::metrics::MetricsStore;
+        let store = MetricsStore::new(self.connection_manager.pool().clone());
+        store.get_latest_metrics(container_id).await
+    }
+    
+    /// Get metrics history for a container within time range
+    pub async fn get_metrics_history(
+        &self, 
+        container_id: &str, 
+        start_time: u64, 
+        end_time: u64,
+        limit: Option<u32>
+    ) -> SyncResult<Vec<crate::daemon::metrics::ContainerMetrics>> {
+        use crate::sync::metrics::MetricsStore;
+        let store = MetricsStore::new(self.connection_manager.pool().clone());
+        store.get_metrics_history(container_id, start_time, end_time, limit).await
+    }
+    
+    /// Clean up old metrics
+    pub async fn cleanup_old_metrics(&self, retention_days: u32) -> SyncResult<u64> {
+        use crate::sync::metrics::MetricsStore;
+        let store = MetricsStore::new(self.connection_manager.pool().clone());
+        store.cleanup_old_metrics(retention_days).await
     }
     
     
@@ -476,6 +526,11 @@ impl SyncEngine {
         self.volume_manager.remove_volume(name, force).await
     }
     
+    /// Clean up orphaned volumes
+    pub async fn cleanup_orphaned_volumes(&self) -> SyncResult<u32> {
+        self.volume_manager.cleanup_orphaned_volumes().await
+    }
+    
     /// Add mount to container
     pub async fn add_container_mount(
         &self,
@@ -502,6 +557,23 @@ impl SyncEngine {
     /// Get volume path for mounting
     pub fn get_volume_path(&self, volume_name: &str) -> std::path::PathBuf {
         self.volume_manager.get_volume_path(volume_name)
+    }
+    
+    // === Container Logging ===
+    
+    /// Store a log entry for a container
+    pub async fn store_container_log(&self, container_id: &str, level: &str, message: &str) -> SyncResult<()> {
+        self.container_manager.store_log(container_id, level, message).await
+    }
+    
+    /// Get logs for a container
+    pub async fn get_container_logs(&self, container_id: &str, limit: Option<u32>) -> SyncResult<Vec<crate::sync::containers::LogEntry>> {
+        self.container_manager.get_container_logs(container_id, limit).await
+    }
+    
+    /// Clean up old logs for a container
+    pub async fn cleanup_container_logs(&self, container_id: &str, keep_count: u32) -> SyncResult<u64> {
+        self.container_manager.cleanup_container_logs(container_id, keep_count).await
     }
 }
 

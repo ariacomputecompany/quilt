@@ -1,7 +1,6 @@
 pub mod container_ops;
 pub mod volume_ops;
-pub mod monitoring_ops;
-pub mod helpers;
+// monitoring_ops and helpers removed - were empty placeholder files
 
 #[cfg(test)]
 pub mod tests;

@@ -1,7 +1,8 @@
 use std::process::Command;
 use std::collections::HashMap;
 use crate::daemon::system::SystemRuntime;
-use crate::utils::{ConsoleLogger, CommandExecutor};
+use crate::utils::console::ConsoleLogger;
+use crate::utils::command::CommandExecutor;
 
 #[derive(Debug, Clone)]
 pub enum Runtime {
