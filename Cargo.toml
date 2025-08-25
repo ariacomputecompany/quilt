@@ -2,9 +2,9 @@
 name = "quilt"
 version = "0.1.0"
 edition = "2021"
-authors = ["Quilt Team"]
+authors = ["Aria Compute Company"]
 description = "Production container runtime with SQLite-based sync engine"
-repository = "https://github.com/your-org/quilt"
+repository = "https://github.com/ariacomputecompany/quilt"
 license = "MIT OR Apache-2.0"
 keywords = ["container", "runtime", "namespaces", "cgroups", "linux"]
 categories = ["development-tools", "virtualization"]
