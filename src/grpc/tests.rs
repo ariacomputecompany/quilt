@@ -194,7 +194,10 @@ mod tests {
     
     #[tokio::test]
     async fn test_get_container_by_name_not_found() {
-        let sync_engine = Arc::new(SyncEngine::new(":memory:").await.unwrap());
+        // Use new_for_testing with custom IP range for this test
+        let start_ip = std::net::Ipv4Addr::new(10, 0, 0, 2);
+        let end_ip = std::net::Ipv4Addr::new(10, 0, 0, 3);
+        let sync_engine = Arc::new(SyncEngine::new_for_testing(":memory:", start_ip, end_ip).await.unwrap());
         let service = QuiltServiceImpl { sync_engine };
         
         let request = tonic::Request::new(GetContainerByNameRequest {

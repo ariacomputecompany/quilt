@@ -88,6 +88,16 @@ cargo check
 ```bash
 # Development script with various utilities
 ./dev.sh [command]
+
+# Available dev.sh commands:
+./dev.sh build                    # Build both binaries
+./dev.sh server                   # Start server in foreground
+./dev.sh server-bg                # Start server in background
+./dev.sh cli [args]               # Run CLI with arguments
+./dev.sh test                     # Run comprehensive tests
+./dev.sh generate [type]          # Generate rootfs (minimal, dev, python, nodejs, rust)
+./dev.sh clean                    # Stop server and cleanup
+./dev.sh status                   # Show development status
 ```
 
 ## High-Level Architecture
@@ -251,3 +261,10 @@ The sync engine uses SQLite with tables for:
 - Shell command execution in containers uses double quotes to allow redirects and pipes
 - Volume security validation blocks path traversal and sensitive system paths
 - Mounts are setup before chroot to ensure visibility in container
+
+## Build Configuration
+
+- **Linting**: Project uses `deny` warnings - all warnings must be fixed
+- **Build profiles**: Optimized release profile with LTO and symbol stripping
+- **Dependencies**: Uses Tokio for async runtime, SQLx for database, Tonic for gRPC
+- **Binary targets**: `quilt` (server) and `cli` (client) defined in Cargo.toml

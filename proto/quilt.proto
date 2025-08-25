@@ -46,10 +46,16 @@ service QuiltService {
     rpc SetContainerNetwork (SetContainerNetworkRequest) returns (SetContainerNetworkResponse);
     rpc SetupContainerNetworkPostStart (SetupContainerNetworkPostStartRequest) returns (SetupContainerNetworkPostStartResponse);
     
+    // DNS operations
+    rpc ListDnsEntries (ListDnsEntriesRequest) returns (ListDnsEntriesResponse);
+    
     // Cleanup operations  
     rpc GetCleanupStatus (GetCleanupStatusRequest) returns (GetCleanupStatusResponse);
     rpc ListCleanupTasks (ListCleanupTasksRequest) returns (ListCleanupTasksResponse);
+    rpc GetCleanupTaskStatus (GetCleanupTaskStatusRequest) returns (GetCleanupTaskStatusResponse);
+    rpc ListContainerCleanupTasks (ListContainerCleanupTasksRequest) returns (ListContainerCleanupTasksResponse);
     rpc ForceCleanup (ForceCleanupRequest) returns (ForceCleanupResponse);
+    rpc ComprehensiveNetworkCleanup (ComprehensiveNetworkCleanupRequest) returns (ComprehensiveNetworkCleanupResponse);
 }
 
 // Container status enumeration
@@ -133,9 +139,11 @@ message GetContainerStatusResponse {
     string error_message = 4;                      // Error message (if failed)
     int32 pid = 5;                                // Process ID (if running)
     uint64 created_at = 6;                        // Creation timestamp
-    uint64 memory_usage_bytes = 7;                // Current memory usage
-    string rootfs_path = 8;                       // Container rootfs path
-    string ip_address = 9;                        // Container IP address (ICC networking)
+    uint64 started_at = 7;                        // Container start timestamp (0 if never started)
+    uint64 exited_at = 8;                         // Container exit timestamp (0 if still running)
+    uint64 memory_usage_bytes = 9;                // Current memory usage
+    string rootfs_path = 10;                      // Container rootfs path
+    string ip_address = 11;                       // Container IP address (ICC networking)
 }
 
 message LogEntry {
@@ -447,6 +455,28 @@ message CleanupTask {
     string error_message = 8;
 }
 
+// Get specific cleanup task status
+message GetCleanupTaskStatusRequest {
+    int64 task_id = 1;
+}
+
+message GetCleanupTaskStatusResponse {
+    bool success = 1;
+    string error_message = 2;
+    CleanupTask task = 3;
+}
+
+// List cleanup tasks for specific container
+message ListContainerCleanupTasksRequest {
+    string container_id = 1;
+}
+
+message ListContainerCleanupTasksResponse {
+    repeated CleanupTask tasks = 1;
+    bool success = 2;
+    string error_message = 3;
+}
+
 // Network allocation messages
 message ListNetworkAllocationsRequest {
 }
@@ -506,4 +536,32 @@ message SetupContainerNetworkPostStartRequest {
 message SetupContainerNetworkPostStartResponse {
     bool success = 1;
     string error_message = 2;
+}
+
+// DNS operation messages
+message ListDnsEntriesRequest {
+    // Empty - list all DNS entries
+}
+
+message ListDnsEntriesResponse {
+    repeated DnsEntry entries = 1;
+    bool success = 2;
+    string error_message = 3;
+}
+
+message DnsEntry {
+    string container_id = 1;
+    string container_name = 2;
+    string ip_address = 3;
+}
+
+// Comprehensive network cleanup admin operation
+message ComprehensiveNetworkCleanupRequest {
+    // Empty - cleanup all network resources
+}
+
+message ComprehensiveNetworkCleanupResponse {
+    repeated string cleaned_resources = 1;
+    bool success = 2;
+    string error_message = 3;
 } 

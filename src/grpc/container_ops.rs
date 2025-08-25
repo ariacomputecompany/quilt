@@ -99,6 +99,27 @@ pub async fn start_container_process(
     ConsoleLogger::debug(&format!("⏱️ [STARTUP-MOUNTS] Mount conversion completed for {} in {:?}", 
         container_id, mount_start.elapsed()));
     
+    // Step 2.5: Mount Security Validation
+    let validation_start = std::time::Instant::now();
+    ConsoleLogger::debug(&format!("🔒 [STARTUP-SECURITY] Validating mount security for {} ({} mounts)", container_id, daemon_mounts.len()));
+    
+    // Get resource manager and validate mount security
+    use crate::daemon::resource::ResourceManager;
+    let resource_manager = ResourceManager::new();
+    
+    // Validate mount security before proceeding
+    if let Err(e) = resource_manager.validate_mount_security(container_id, &daemon_mounts) {
+        ConsoleLogger::error(&format!("❌ [STARTUP-SECURITY] Mount security validation failed for {}: {}", container_id, e));
+        let _ = sync_engine.store_container_log(container_id, "error", &format!("Mount security validation failed: {}", e)).await;
+        return Err(format!("Mount security validation failed: {}", e));
+    }
+    
+    // Register mount configurations for tracking
+    resource_manager.register_mount_configs(container_id, daemon_mounts.clone());
+    
+    ConsoleLogger::success(&format!("✅ [STARTUP-SECURITY] Mount security validated for {} in {:?}", 
+        container_id, validation_start.elapsed()));
+    
     // Step 3: Legacy config conversion
     let legacy_start = std::time::Instant::now();
     ConsoleLogger::debug(&format!("🔄 [STARTUP-LEGACY] Converting to legacy format for {}", container_id));
@@ -282,7 +303,6 @@ pub async fn start_container_process(
                     ConsoleLogger::info(&format!("🆔 [STARTUP-PID] Container {} got PID: {}", container_id, pid.as_raw()));
                     
                     // Emit process started event
-                    crate::emit_process_started!(container_id, pid.as_raw());
                     
                     sync_engine.set_container_pid(container_id, pid).await
                         .map_err(|e| {
@@ -306,7 +326,6 @@ pub async fn start_container_process(
                         let bg_actual_rootfs_path = actual_rootfs_path.clone();
                         
                         // Emit network setup started event
-                        crate::emit_network_setup_started!(container_id);
                         
                         // Launch network setup in background task - PARALLEL EXECUTION
                         ConsoleLogger::debug(&format!("🚀 [STARTUP-NET] Spawning background network setup task for {}", container_id));
@@ -334,7 +353,6 @@ pub async fn start_container_process(
                                         &format!("Network setup completed with IP {}", network_alloc.ip_address)).await;
                                     
                                     // Emit network setup completed event
-                                    crate::emit_network_setup_completed!(bg_container_id, &network_alloc.ip_address);
                                 }
                                 Err(e) => {
                                     ConsoleLogger::error(&format!("❌ [BACKGROUND-NET] Background network setup failed for {}: {}", bg_container_id, e));
@@ -344,7 +362,6 @@ pub async fn start_container_process(
                                         &format!("Network setup failed: {}", e)).await;
                                     
                                     // Emit network setup failed event
-                                    crate::emit_network_setup_failed!(bg_container_id, &e);
                                 }
                             }
                         });
@@ -382,8 +399,7 @@ pub async fn start_container_process(
                 &format!("Container startup completed successfully in {:.2}s", total_time.as_secs_f64())).await;
             
             // Emit container ready event with timing
-            let startup_time_ms = total_time.as_millis() as u64;
-            crate::emit_container_ready!(container_id, startup_time_ms);
+            let _startup_time_ms = total_time.as_millis() as u64;
             
             ConsoleLogger::debug(&format!("📡 [STARTUP-SUCCESS] Container ready event emitted for {}", container_id));
             
@@ -399,7 +415,6 @@ pub async fn start_container_process(
                 &format!("Container startup failed: {}", e)).await;
             
             // Emit container startup failed event
-            crate::emit_container_startup_failed!(container_id, &e, "container_startup");
             
             // Update state to Error and log the failure
             sync_engine.update_container_state(container_id, ContainerState::Error).await.ok();

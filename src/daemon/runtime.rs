@@ -7,6 +7,7 @@ use crate::utils::process::ProcessUtils;
 use crate::utils::filesystem::FileSystemUtils;
 use crate::utils::command::CommandExecutor;
 use crate::icc::network::{ContainerNetworkConfig, NetworkManager};
+use crate::icc::network::security::NetworkSecurity;
 use crate::sync::ContainerState;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -245,6 +246,11 @@ impl ContainerRuntime {
         // Create cgroups
         let mut cgroup_manager = CgroupManager::new(id.to_string());
         if let Some(limits) = &config.resource_limits {
+            // SECURITY: Check resource limits before applying
+            let security = NetworkSecurity::new("192.168.100.1".to_string()); // Bridge IP placeholder
+            if let Err(e) = security.check_resource_limits(id) {
+                ConsoleLogger::warning(&format!("Resource limit security check failed: {}", e));
+            }
             if let Err(e) = cgroup_manager.create_cgroups(limits) {
                 ConsoleLogger::warning(&format!("Failed to create cgroups: {}", e));
             }
@@ -460,6 +466,18 @@ impl ContainerRuntime {
                 (command_clone[0].clone(), command_clone[1..].to_vec())
             };
 
+            // SECURITY: Validate command before execution
+            let security = NetworkSecurity::new("192.168.100.1".to_string()); // Bridge IP placeholder
+            if let Err(e) = security.validate_safe_command(&final_program) {
+                eprintln!("🚨 [SECURITY] Command validation failed: {}", e);
+                return 1;
+            }
+            
+            // SECURITY: Sanitize all arguments
+            let sanitized_args: Vec<String> = final_args.iter()
+                .map(|arg| security.sanitize_shell_argument(arg))
+                .collect();
+
             // Convert to CString for exec (do this once, outside any fork)
             let program_cstring = match CString::new(final_program.clone()) {
                 Ok(cs) => cs,
@@ -471,7 +489,7 @@ impl ContainerRuntime {
                     
             // Prepare all arguments as CStrings with proper lifetime management
             let mut all_args = vec![final_program];
-            all_args.extend(final_args);
+            all_args.extend(sanitized_args);
             
             let args_cstrings: Vec<CString> = match all_args.iter()
                 .map(|s| CString::new(s.clone()))
@@ -1444,6 +1462,10 @@ done
     }
 
     fn extract_image(&self, image_path: &str, rootfs_path: &str) -> Result<(), String> {
+        // SECURITY: Validate rootfs path to prevent directory traversal attacks
+        let security = NetworkSecurity::new("192.168.100.1".to_string()); // Bridge IP placeholder
+        security.validate_rootfs_path(rootfs_path)?;
+        
         // Open and decompress the tar file
         let tar_file = std::fs::File::open(image_path)
             .map_err(|e| format!("Failed to open image file: {}", e))?;

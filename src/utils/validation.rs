@@ -82,6 +82,7 @@ impl InputValidator {
     
     /// Parse advanced mount specification (--mount flag format)
     /// Format: type=bind,source=/host/path,target=/container/path,readonly
+    #[allow(dead_code)]
     pub fn parse_mount(s: &str) -> Result<VolumeMount, String> {
         let mut mount = VolumeMount {
             source: String::new(),

@@ -6,7 +6,6 @@ use std::path::Path;
 use crate::utils::console::ConsoleLogger;
 use crate::utils::process::ProcessUtils;
 use crate::utils::command::CommandExecutor;
-use crate::icc::network::ContainerNetworkConfig;
 
 #[derive(Debug, Clone)]
 pub struct NamespaceConfig {
@@ -366,35 +365,6 @@ impl NamespaceManager {
         Ok(())
     }
 
-    /// Setup the network for a container with a veth pair
-    pub fn setup_container_network(&self, config: &ContainerNetworkConfig) -> Result<(), String> {
-        ConsoleLogger::debug(&format!("Configuring container network for {}", config.container_id));
-        
-        // Move veth peer into container's network namespace
-        CommandExecutor::execute_shell(&format!("ip link set {} netns {}", 
-            config.veth_container_name,
-            ProcessUtils::pid_to_i32(nix::unistd::getpid())
-        ))?;
-        
-        // Rename veth peer to eth0 inside container
-        CommandExecutor::execute_shell(&format!("ip link set dev {} name eth0", config.veth_container_name))?;
-        
-        // Assign IP address to eth0
-        CommandExecutor::execute_shell(&format!("ip addr add {} dev eth0", config.ip_address))?;
-        
-        // Bring up eth0
-        CommandExecutor::execute_shell("ip link set eth0 up")?;
-        
-        // Bring up loopback interface
-        CommandExecutor::execute_shell("ip link set lo up")?;
-        
-        // Set default route
-        CommandExecutor::execute_shell("ip route add default via 10.42.0.1")?;
-
-        ConsoleLogger::success("Container network configured successfully");
-        Ok(())
-    }
-
     /// Setup basic loopback networking in the network namespace
     pub fn setup_network_namespace(&self) -> Result<(), String> {
         ConsoleLogger::debug("Setting up basic loopback networking");
@@ -477,32 +447,6 @@ impl NamespaceManager {
         }
     }
     
-    /// Wait for a process to complete and return its exit code (blocking version for sync code)
-    pub fn wait_for_process(&self, pid: Pid) -> Result<i32, String> {
-        ConsoleLogger::debug(&format!("Waiting for process {} to complete", ProcessUtils::pid_to_i32(pid)));
-
-        match waitpid(pid, None) {
-            Ok(WaitStatus::Exited(_, exit_code)) => {
-                ConsoleLogger::success(&format!("Process {} exited with code: {}", ProcessUtils::pid_to_i32(pid), exit_code));
-                Ok(exit_code)
-            }
-            Ok(WaitStatus::Signaled(_, signal, _)) => {
-                let msg = format!("Process {} was terminated by signal: {:?}", ProcessUtils::pid_to_i32(pid), signal);
-                ConsoleLogger::warning(&msg);
-                Err(msg)
-            }
-            Ok(status) => {
-                let msg = format!("Process {} ended with unexpected status: {:?}", ProcessUtils::pid_to_i32(pid), status);
-                ConsoleLogger::warning(&msg);
-                Err(msg)
-            }
-            Err(e) => {
-                let msg = format!("Failed to wait for process {}: {}", ProcessUtils::pid_to_i32(pid), e);
-                ConsoleLogger::error(&msg);
-                Err(msg)
-            }
-        }
-    }
 }
 
 #[cfg(test)]

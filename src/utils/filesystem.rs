@@ -152,16 +152,6 @@ impl FileSystemUtils {
         path.as_ref().exists()
     }
 
-    /// Get the canonical (absolute) path
-    pub fn canonicalize<P: AsRef<Path>>(path: P) -> Result<PathBuf, String> {
-        path.as_ref().canonicalize().map_err(|e| {
-            format!(
-                "Failed to canonicalize path '{}': {}",
-                path.as_ref().display(),
-                e
-            )
-        })
-    }
 
     /// Create a file with specific content
     pub fn write_file<P: AsRef<Path>>(path: P, content: &str) -> Result<(), String> {
@@ -220,20 +210,6 @@ impl FileSystemUtils {
         }
     }
 
-    /// Create a symlink
-    pub fn create_symlink<P: AsRef<Path>, Q: AsRef<Path>>(
-        target: P,
-        link: Q,
-    ) -> Result<(), String> {
-        std::os::unix::fs::symlink(target.as_ref(), link.as_ref()).map_err(|e| {
-            format!(
-                "Failed to create symlink '{}' -> '{}': {}",
-                link.as_ref().display(),
-                target.as_ref().display(),
-                e
-            )
-        })
-    }
 
     /// List directory contents
     pub fn list_dir<P: AsRef<Path>>(path: P) -> Result<Vec<PathBuf>, String> {
@@ -260,10 +236,6 @@ impl FileSystemUtils {
         Ok(paths)
     }
 
-    /// Get parent directory
-    pub fn get_parent<P: AsRef<Path>>(path: P) -> Option<PathBuf> {
-        path.as_ref().parent().map(|p| p.to_path_buf())
-    }
 
     /// Join path components
     pub fn join<P: AsRef<Path>, Q: AsRef<Path>>(base: P, component: Q) -> PathBuf {

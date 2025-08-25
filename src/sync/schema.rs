@@ -240,19 +240,6 @@ impl SchemaManager {
         Ok(())
     }
     
-    pub async fn get_schema_version(&self) -> SyncResult<i64> {
-        let result = sqlx::query_scalar::<_, i64>("PRAGMA user_version")
-            .fetch_one(&self.pool)
-            .await?;
-        Ok(result)
-    }
-    
-    pub async fn set_schema_version(&self, version: i64) -> SyncResult<()> {
-        sqlx::query(&format!("PRAGMA user_version = {}", version))
-            .execute(&self.pool)
-            .await?;
-        Ok(())
-    }
 }
 
 #[cfg(test)]

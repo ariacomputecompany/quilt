@@ -9,8 +9,10 @@ mod grpc;
 use utils::console::ConsoleLogger;
 use utils::filesystem::FileSystemUtils;
 use utils::command::CommandExecutor;
+use utils::validation::InputValidator;
 use sync::{SyncEngine, MountType, ContainerState};
 use grpc::start_container_process;
+use icc::network::security::NetworkSecurity;
 
 use std::sync::Arc;
 use std::collections::HashMap;
@@ -57,21 +59,19 @@ pub struct QuiltServiceImpl {
 
 impl QuiltServiceImpl {
     pub async fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        // Initialize sync engine with database
-        let sync_engine = Arc::new(SyncEngine::new("quilt.db").await?);
-        
-        // Start background services for monitoring and cleanup
-        sync_engine.start_background_services().await?;
-        
-        ConsoleLogger::success("Sync engine initialized with background services");
-        
-        // Initialize ICC network manager
+        // Initialize ICC network manager first
         let mut network_manager = icc::network::NetworkManager::new("quilt0", "10.42.0.0/16")
             .map_err(|e| format!("Failed to create network manager: {}", e))?;
         
         // CRITICAL: Ensure bridge is ready before any other network operations
         network_manager.ensure_bridge_ready()
             .map_err(|e| format!("Failed to setup network bridge: {}", e))?;
+            
+        // SECURITY: Verify bridge isolation after setup
+        let security = NetworkSecurity::new("192.168.100.1".to_string());
+        if let Err(e) = security.verify_bridge_isolation("quilt0") {
+            ConsoleLogger::warning(&format!("Bridge isolation verification failed: {}", e));
+        }
         
         ConsoleLogger::success("Bridge network initialized - containers can now communicate");
         
@@ -88,6 +88,19 @@ impl QuiltServiceImpl {
         
         ConsoleLogger::success("Network manager initialized with bridge networking");
         
+        // Initialize sync engine with ICC network manager integration
+        let network_manager_arc = Arc::new(network_manager);
+        let sync_engine = Arc::new(SyncEngine::new_with_network_config(
+            "quilt.db", 
+            Some("10.42.0.0/16".to_string()),
+            Some(network_manager_arc.clone())
+        ).await?);
+        
+        // Start background services for monitoring and cleanup with ICC integration
+        sync_engine.start_background_services().await?;
+        
+        ConsoleLogger::success("✅ Sync engine initialized with ICC network manager integration - enhanced cleanup enabled");
+        
         // Initialize MessageBroker for inter-container communication
         let message_broker = icc::messaging::MessageBroker::new();
         message_broker.start();
@@ -97,7 +110,7 @@ impl QuiltServiceImpl {
         
         Ok(Self {
             sync_engine,
-            network_manager: Arc::new(network_manager),
+            network_manager: network_manager_arc,
             runtime: Arc::new(runtime),
             message_broker: Arc::new(message_broker),
             start_time: std::time::SystemTime::now(),
@@ -138,7 +151,30 @@ impl QuiltService for QuiltServiceImpl {
             } else { 
                 req.command.join(" ")
             },
-            environment: req.environment,
+            environment: {
+                // Validate environment variables using InputValidator
+                let mut validated_env = HashMap::new();
+                for (key, value) in req.environment {
+                    // Use InputValidator to parse and validate KEY=VALUE format if needed
+                    if key.contains('=') {
+                        // If someone passed KEY=VALUE as a single key, parse it properly
+                        match InputValidator::parse_key_val(&key) {
+                            Ok((parsed_key, parsed_value)) => {
+                                ConsoleLogger::debug(&format!("Parsed environment variable: {}={}", parsed_key, parsed_value));
+                                validated_env.insert(parsed_key, parsed_value);
+                            }
+                            Err(e) => {
+                                ConsoleLogger::warning(&format!("Invalid environment variable format '{}': {}", key, e));
+                                validated_env.insert(key, value);
+                            }
+                        }
+                    } else {
+                        // Normal key-value pair
+                        validated_env.insert(key, value);
+                    }
+                }
+                validated_env
+            },
             memory_limit_mb: if req.memory_limit_mb > 0 { Some(req.memory_limit_mb as i64) } else { None },
             cpu_limit_percent: if req.cpu_limit_percent > 0.0 { Some(req.cpu_limit_percent as f64) } else { None },
             enable_network_namespace: req.enable_network_namespace,
@@ -164,6 +200,25 @@ impl QuiltService for QuiltServiceImpl {
                         quilt::MountType::Volume => MountType::Volume,
                         quilt::MountType::Tmpfs => MountType::Tmpfs,
                     };
+                    
+                    // Use InputValidator to validate mount configuration format
+                    let mount_string = format!("{}:{}", mount.source, mount.target);
+                    match InputValidator::parse_volume(&mount_string) {
+                        Ok(parsed_mount) => {
+                            ConsoleLogger::debug(&format!("Mount validation passed for {}: {} -> {} (readonly: {})", 
+                                container_id, parsed_mount.source, parsed_mount.target, parsed_mount.readonly));
+                            
+                            // Ensure readonly flags match
+                            if parsed_mount.readonly != mount.readonly {
+                                ConsoleLogger::debug(&format!("Mount readonly flag updated from {} to {} for {}", 
+                                    mount.readonly, parsed_mount.readonly, container_id));
+                            }
+                        }
+                        Err(e) => {
+                            ConsoleLogger::warning(&format!("Mount parsing validation failed for {}: {}", container_id, e));
+                            // Continue with original mount config - parsing is advisory
+                        }
+                    }
                     
                     // Convert to validation format for security check
                     use crate::utils::security::SecurityValidator;
@@ -335,6 +390,8 @@ impl QuiltService for QuiltServiceImpl {
                     error_message: if status.state == ContainerState::Error { "Container failed".to_string() } else { String::new() },
                     pid: status.pid.unwrap_or(0) as i32,
                     created_at: status.created_at as u64,
+                    started_at: status.started_at.unwrap_or(0) as u64,
+                    exited_at: status.exited_at.unwrap_or(0) as u64,
                     memory_usage_bytes: memory_usage_bytes as u64,
                     rootfs_path: status.rootfs_path.unwrap_or_default(),
                     ip_address: status.ip_address.unwrap_or_default(),
@@ -366,13 +423,15 @@ impl QuiltService for QuiltServiceImpl {
         // Get logs from both sync engine and runtime for comprehensive logging
         let mut all_logs = Vec::new();
         
-        // Get logs from sync engine (structured logs)
+        // Get logs from sync engine (structured logs) - using enhanced formatting
         match self.sync_engine.get_container_logs(&container_id, None).await {
             Ok(logs) => {
                 for log in logs {
+                    // Use the LogEntry's timestamp_formatted method for enhanced display
+                    let formatted_timestamp = log.timestamp_formatted();
                     all_logs.push(quilt::LogEntry {
                         timestamp: log.timestamp as u64,
-                        message: format!("[{}] {}", log.level.to_uppercase(), log.message),
+                        message: format!("[{}] [{}] {}", log.level.to_uppercase(), formatted_timestamp, log.message),
                     });
                 }
             }
@@ -569,6 +628,18 @@ impl QuiltService for QuiltServiceImpl {
                 
                 // Unregister from DNS
                 let _ = self.network_manager.unregister_container_dns(&container_id);
+                
+                // Enhanced resource cleanup with correlation
+                use crate::daemon::resource::ResourceManager;
+                let resource_manager = ResourceManager::new();
+                let container_pid = runtime.get_container_info(&container_id)
+                    .and_then(|info| info.pid);
+                
+                if let Err(e) = resource_manager.cleanup_container_with_correlation(&container_id, container_pid) {
+                    ConsoleLogger::warning(&format!("Resource correlation cleanup issues for {}: {}", container_id, e));
+                } else {
+                    ConsoleLogger::debug(&format!("✅ Resource correlation cleanup completed for {}", container_id));
+                }
                 
                 // Log runtime result for debugging
                 if let Err(e) = runtime_result {
@@ -1660,7 +1731,7 @@ impl QuiltService for QuiltServiceImpl {
         &self,
         request: Request<quilt::ListCleanupTasksRequest>,
     ) -> Result<Response<quilt::ListCleanupTasksResponse>, Status> {
-        let req = request.into_inner();
+        let _req = request.into_inner();
         
         // List cleanup tasks always gets all tasks - no container_id filtering
         let tasks_result = self.sync_engine.cleanup_service.get_cleanup_tasks(None).await;
@@ -1685,6 +1756,72 @@ impl QuiltService for QuiltServiceImpl {
                 }))
             }
             Err(e) => Ok(Response::new(quilt::ListCleanupTasksResponse {
+                tasks: vec![],
+                success: false,
+                error_message: e.to_string(),
+            }))
+        }
+    }
+
+    async fn get_cleanup_task_status(
+        &self,
+        request: Request<quilt::GetCleanupTaskStatusRequest>,
+    ) -> Result<Response<quilt::GetCleanupTaskStatusResponse>, Status> {
+        let req = request.into_inner();
+        
+        match self.sync_engine.cleanup_service.get_task_status(req.task_id).await {
+            Ok(task) => {
+                let proto_task = quilt::CleanupTask {
+                    task_id: task.id,
+                    container_id: task.container_id,
+                    resource_type: task.resource_type.to_string(),
+                    resource_path: task.resource_path,
+                    status: task.status.to_string(),
+                    created_at: task.created_at as u64,
+                    completed_at: task.completed_at.unwrap_or(0) as u64,
+                    error_message: task.error_message.unwrap_or_default(),
+                };
+
+                Ok(Response::new(quilt::GetCleanupTaskStatusResponse {
+                    success: true,
+                    error_message: String::new(),
+                    task: Some(proto_task),
+                }))
+            }
+            Err(e) => Ok(Response::new(quilt::GetCleanupTaskStatusResponse {
+                success: false,
+                error_message: e.to_string(),
+                task: None,
+            }))
+        }
+    }
+
+    async fn list_container_cleanup_tasks(
+        &self,
+        request: Request<quilt::ListContainerCleanupTasksRequest>,
+    ) -> Result<Response<quilt::ListContainerCleanupTasksResponse>, Status> {
+        let req = request.into_inner();
+        
+        match self.sync_engine.cleanup_service.list_container_cleanup_tasks(&req.container_id).await {
+            Ok(tasks) => {
+                let proto_tasks = tasks.into_iter().map(|t| quilt::CleanupTask {
+                    task_id: t.id,
+                    container_id: t.container_id,
+                    resource_type: t.resource_type.to_string(),
+                    resource_path: t.resource_path,
+                    status: t.status.to_string(),
+                    created_at: t.created_at as u64,
+                    completed_at: t.completed_at.unwrap_or(0) as u64,
+                    error_message: t.error_message.unwrap_or_default(),
+                }).collect();
+
+                Ok(Response::new(quilt::ListContainerCleanupTasksResponse {
+                    tasks: proto_tasks,
+                    success: true,
+                    error_message: String::new(),
+                }))
+            }
+            Err(e) => Ok(Response::new(quilt::ListContainerCleanupTasksResponse {
                 tasks: vec![],
                 success: false,
                 error_message: e.to_string(),
@@ -1783,16 +1920,16 @@ impl QuiltService for QuiltServiceImpl {
     ) -> Result<Response<quilt::GetContainerNetworkResponse>, Status> {
         let req = request.into_inner();
         
-        // Use the unused runtime method to get container network config
-        match self.runtime.get_container_network(&req.container_id) {
-            Some(network_config) => {
+        // Get comprehensive network status from sync engine
+        match self.sync_engine.get_network_allocation(&req.container_id).await {
+            Ok(allocation) => {
                 let proto_config = quilt::ContainerNetworkConfig {
-                    ip_address: network_config.ip_address,
-                    bridge_interface: network_config.gateway_ip,
-                    veth_host: network_config.veth_host_name,
-                    veth_container: network_config.veth_container_name,
-                    setup_completed: true,
-                    status: format!("Network configured for container {}", req.container_id),
+                    ip_address: allocation.ip_address.clone(),
+                    bridge_interface: allocation.bridge_interface.unwrap_or_default(),
+                    veth_host: allocation.veth_host.unwrap_or_default(),
+                    veth_container: allocation.veth_container.unwrap_or_default(),
+                    setup_completed: allocation.setup_completed,
+                    status: allocation.status.to_string(),
                 };
                 
                 Ok(Response::new(quilt::GetContainerNetworkResponse {
@@ -1801,11 +1938,32 @@ impl QuiltService for QuiltServiceImpl {
                     network_config: Some(proto_config),
                 }))
             }
-            None => Ok(Response::new(quilt::GetContainerNetworkResponse {
-                success: false,
-                error_message: format!("No network configuration found for container {}", req.container_id),
-                network_config: None,
-            }))
+            Err(_) => {
+                // Fallback to runtime method
+                match self.runtime.get_container_network(&req.container_id) {
+                    Some(network_config) => {
+                        let proto_config = quilt::ContainerNetworkConfig {
+                            ip_address: network_config.ip_address,
+                            bridge_interface: network_config.gateway_ip,
+                            veth_host: network_config.veth_host_name,
+                            veth_container: network_config.veth_container_name,
+                            setup_completed: true,
+                            status: format!("Network configured for container {}", req.container_id),
+                        };
+                        
+                        Ok(Response::new(quilt::GetContainerNetworkResponse {
+                            success: true,
+                            error_message: String::new(),
+                            network_config: Some(proto_config),
+                        }))
+                    }
+                    None => Ok(Response::new(quilt::GetContainerNetworkResponse {
+                        success: false,
+                        error_message: format!("No network configuration found for container {}", req.container_id),
+                        network_config: None,
+                    }))
+                }
+            }
         }
     }
 
@@ -1861,6 +2019,51 @@ impl QuiltService for QuiltServiceImpl {
             Err(e) => Ok(Response::new(quilt::SetupContainerNetworkPostStartResponse {
                 success: false,
                 error_message: e,
+            }))
+        }
+    }
+
+    async fn list_dns_entries(
+        &self,
+        _request: Request<quilt::ListDnsEntriesRequest>,
+    ) -> Result<Response<quilt::ListDnsEntriesResponse>, Status> {
+        // Access network manager DNS entries directly
+        match self.network_manager.list_dns_entries() {
+            Ok(entries) => {
+                let proto_entries = entries.into_iter().map(|e| quilt::DnsEntry {
+                    container_id: e.container_id,
+                    container_name: e.container_name,
+                    ip_address: e.ip_address.to_string(),
+                }).collect();
+
+                Ok(Response::new(quilt::ListDnsEntriesResponse {
+                    entries: proto_entries,
+                    success: true,
+                    error_message: String::new(),
+                }))
+            }
+            Err(e) => Ok(Response::new(quilt::ListDnsEntriesResponse {
+                entries: vec![],
+                success: false,
+                error_message: e,
+            }))
+        }
+    }
+
+    async fn comprehensive_network_cleanup(
+        &self,
+        _request: Request<quilt::ComprehensiveNetworkCleanupRequest>,
+    ) -> Result<Response<quilt::ComprehensiveNetworkCleanupResponse>, Status> {
+        match self.sync_engine.comprehensive_network_cleanup().await {
+            Ok(cleaned_resources) => Ok(Response::new(quilt::ComprehensiveNetworkCleanupResponse {
+                cleaned_resources,
+                success: true,
+                error_message: String::new(),
+            })),
+            Err(e) => Ok(Response::new(quilt::ComprehensiveNetworkCleanupResponse {
+                cleaned_resources: vec![],
+                success: false,
+                error_message: e.to_string(),
             }))
         }
     }

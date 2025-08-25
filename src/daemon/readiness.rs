@@ -40,16 +40,28 @@ impl ContainerReadinessManager {
         &self, 
         container_id: &str, 
         pid: Pid, 
-        _rootfs_path: &str
+        rootfs_path: &str
     ) -> Result<(), String> {
         ConsoleLogger::progress(&format!("🔍 Starting event-driven readiness verification for container {}", container_id));
         let overall_start = SystemTime::now();
 
+        // Use the config timeouts for comprehensive readiness checks
+        self.wait_for_namespaces_ready(pid, Duration::from_millis(self.config.namespace_timeout_ms))?;
+        
         // EVENT-DRIVEN: Check if process is actually running
         // No sleep, just immediate verification
         if !crate::utils::process::ProcessUtils::is_process_running(pid) {
             return Err(format!("Process {} does not exist", crate::utils::process::ProcessUtils::pid_to_i32(pid)));
         }
+        
+        // Verify exec capability with configured timeout
+        self.verify_exec_capability(pid, Duration::from_millis(self.config.exec_test_timeout_ms))?;
+        
+        // Create readiness script in container
+        self.create_readiness_script(rootfs_path, container_id)?;
+        
+        // Wait for container self-signal with configured timeout
+        self.wait_for_container_self_signal(container_id, rootfs_path, Duration::from_millis(self.config.self_signal_timeout_ms))?;
         
         ConsoleLogger::debug(&format!("✅ Process {} is alive and responsive", crate::utils::process::ProcessUtils::pid_to_i32(pid)));
 
@@ -59,7 +71,7 @@ impl ContainerReadinessManager {
     }
 
     /// Wait for all required namespaces using inotify - NO POLLING
-    fn wait_for_namespaces_ready(&self, pid: Pid) -> Result<(), String> {
+    fn wait_for_namespaces_ready(&self, pid: Pid, timeout: Duration) -> Result<(), String> {
         ConsoleLogger::debug(&format!("🔍 Waiting for namespaces to be ready for PID {}", pid));
         let start_time = SystemTime::now();
 
@@ -95,7 +107,6 @@ impl ContainerReadinessManager {
         ConsoleLogger::debug(&format!("🔍 Watching {} for namespace creation events", proc_ns_path));
 
         // Event-driven waiting with timeout
-        let timeout = Duration::from_millis(self.config.namespace_timeout_ms);
         
         while ready_namespaces.len() < required_namespaces.len() {
             // Check if we've exceeded timeout
@@ -205,7 +216,7 @@ echo "✅ Ready signal sent to {ready_signal_path}"
     }
 
     /// Wait for container to signal readiness via file creation - NO POLLING
-    fn wait_for_container_self_signal(&self, container_id: &str) -> Result<(), String> {
+    fn wait_for_container_self_signal(&self, container_id: &str, _rootfs_path: &str, timeout: Duration) -> Result<(), String> {
         let ready_signal_path = format!("/tmp/quilt_ready_{}", container_id);
         let start_time = SystemTime::now();
         
@@ -225,7 +236,7 @@ echo "✅ Ready signal sent to {ready_signal_path}"
         inotify.watches().add("/tmp", WatchMask::CREATE | WatchMask::MOVED_TO)
             .map_err(|e| format!("Failed to add inotify watch for /tmp: {}", e))?;
 
-        let timeout = Duration::from_millis(self.config.self_signal_timeout_ms);
+        // Use passed timeout parameter
         let expected_filename = format!("quilt_ready_{}", container_id);
 
         while !Path::new(&ready_signal_path).exists() {
@@ -269,10 +280,15 @@ echo "✅ Ready signal sent to {ready_signal_path}"
     }
 
     /// Single exec capability test - NO POLLING
-    fn verify_exec_capability(&self, pid: Pid) -> Result<(), String> {
+    fn verify_exec_capability(&self, pid: Pid, timeout: Duration) -> Result<(), String> {
         ConsoleLogger::debug(&format!("🔍 Testing exec capability for PID {}", pid));
         let start_time = SystemTime::now();
 
+        // Check if we have enough time for the exec test
+        if start_time.elapsed().unwrap_or_default() > timeout {
+            return Err(format!("Exec capability test timeout before attempt: {:?}", timeout));
+        }
+        
         // Single attempt - if namespaces are ready and container signaled, this should work
         let test_result = Command::new("nsenter")
             .args(&[

@@ -9,8 +9,9 @@ use crate::sync::{
     monitor::ProcessMonitorService,
     cleanup::CleanupService,
     volumes::{VolumeManager, Volume, Mount, MountType},
-    error::SyncResult,
+    error::{SyncResult, SyncError},
 };
+use crate::utils::validation::InputValidator;
 
 /// Main sync engine that coordinates all stateful resources
 pub struct SyncEngine {
@@ -70,6 +71,101 @@ impl SyncEngine {
         };
         
         tracing::info!("Sync engine initialized with database: {}", database_path);
+        Ok(engine)
+    }
+    
+    /// Create a new sync engine with custom network configuration
+    pub async fn new_with_network_config(
+        database_path: &str, 
+        subnet_cidr: Option<String>,
+        icc_network_manager: Option<std::sync::Arc<crate::icc::network::NetworkManager>>
+    ) -> SyncResult<Self> {
+        // If no special configuration, use the simpler new() constructor
+        if subnet_cidr.is_none() && icc_network_manager.is_none() {
+            return Self::new(database_path).await;
+        }
+        
+        // Initialize connection
+        let connection_manager = Arc::new(ConnectionManager::new(database_path).await?);
+        
+        // Initialize schema
+        let schema_manager = SchemaManager::new(connection_manager.pool().clone());
+        schema_manager.initialize_schema().await?;
+        
+        // Create component managers
+        let container_manager = Arc::new(ContainerManager::new(connection_manager.pool().clone()));
+        
+        // Create NetworkManager with custom configuration
+        let network_manager = if let Some(ref icc_manager) = icc_network_manager {
+            tracing::info!("Initializing sync engine with ICC NetworkManager integration");
+            Arc::new(NetworkManager::new_with_icc_manager(connection_manager.pool().clone(), icc_manager.clone()))
+        } else if let Some(subnet) = subnet_cidr {
+            tracing::info!("Initializing sync engine with custom subnet: {}", subnet);
+            Arc::new(NetworkManager::new_with_subnet(connection_manager.pool().clone(), subnet))
+        } else {
+            tracing::info!("Initializing sync engine with default network configuration");
+            Arc::new(NetworkManager::new(connection_manager.pool().clone()))
+        };
+        
+        let volume_manager = Arc::new(VolumeManager::new(connection_manager.pool().clone()));
+        let monitor_service = Arc::new(ProcessMonitorService::new(connection_manager.pool().clone()));
+        
+        // Create CleanupService with ICC integration if available
+        let cleanup_service = if let Some(ref icc_manager) = icc_network_manager {
+            tracing::info!("Initializing cleanup service with ICC NetworkManager integration");
+            Arc::new(CleanupService::new_with_icc_manager(connection_manager.pool().clone(), icc_manager.clone()))
+        } else {
+            Arc::new(CleanupService::new(connection_manager.pool().clone()))
+        };
+        
+        // Initialize volume manager
+        volume_manager.initialize().await?;
+        
+        let engine = Self {
+            connection_manager,
+            container_manager,
+            network_manager,
+            volume_manager,
+            monitor_service,
+            cleanup_service,
+            background_tasks: Arc::new(RwLock::new(Vec::new())),
+        };
+        
+        tracing::info!("Sync engine initialized with custom network config and database: {}", database_path);
+        Ok(engine)
+    }
+
+    /// Create a new sync engine for testing with IP range
+    pub async fn new_for_testing(database_path: &str, start_ip: std::net::Ipv4Addr, end_ip: std::net::Ipv4Addr) -> SyncResult<Self> {
+        // Initialize connection
+        let connection_manager = Arc::new(ConnectionManager::new(database_path).await?);
+        
+        // Initialize schema
+        let schema_manager = SchemaManager::new(connection_manager.pool().clone());
+        schema_manager.initialize_schema().await?;
+        
+        // Create component managers
+        let container_manager = Arc::new(ContainerManager::new(connection_manager.pool().clone()));
+        let network_manager = Arc::new(NetworkManager::with_ip_range(connection_manager.pool().clone(), start_ip, end_ip));
+        let volume_manager = Arc::new(VolumeManager::new(connection_manager.pool().clone()));
+        let monitor_service = Arc::new(ProcessMonitorService::new(connection_manager.pool().clone()));
+        let cleanup_service = Arc::new(CleanupService::new(connection_manager.pool().clone()));
+        
+        // Initialize volume manager
+        volume_manager.initialize().await?;
+        
+        let engine = Self {
+            connection_manager,
+            container_manager,
+            network_manager,
+            volume_manager,
+            monitor_service,
+            cleanup_service,
+            background_tasks: Arc::new(RwLock::new(Vec::new())),
+        };
+        
+        tracing::info!("Sync engine initialized for testing with IP range {}..{} and database: {}", 
+            start_ip, end_ip, database_path);
         Ok(engine)
     }
     
@@ -265,11 +361,28 @@ impl SyncEngine {
         ConsoleLogger::info(&format!("🔒 [COMPLETE] Container {} created with network config", container_id));
         
         // Step 4: Emit events after successful database commit
-        crate::emit_container_created!(container_id);
         
         if let Some(ref net_cfg) = network_config {
-            crate::emit_network_allocated!(container_id, net_cfg.ip_address);
-            ConsoleLogger::info(&format!("✅ [ATOMIC] Network allocated for {}: IP={}", container_id, net_cfg.ip_address));
+            // Validate that the network config container ID matches
+            if net_cfg.container_id != container_id {
+                return Err(SyncError::ValidationFailed {
+                    message: format!("Network config container ID mismatch: expected {}, got {}", container_id, net_cfg.container_id),
+                });
+            }
+            
+            ConsoleLogger::info(&format!("✅ [ATOMIC] Network allocated for {}: IP={}, Container={}, Setup Required={}", 
+                container_id, net_cfg.ip_address, net_cfg.container_id, net_cfg.setup_required));
+            
+            // Log additional network details if available
+            if let Some(ref bridge) = net_cfg.bridge_interface {
+                ConsoleLogger::debug(&format!("🌉 [NETWORK] Bridge interface for {}: {}", container_id, bridge));
+            }
+            if let Some(ref veth_host) = net_cfg.veth_host {
+                ConsoleLogger::debug(&format!("🔗 [NETWORK] Host veth for {}: {}", container_id, veth_host));
+            }
+            if let Some(ref veth_container) = net_cfg.veth_container {
+                ConsoleLogger::debug(&format!("🔗 [NETWORK] Container veth for {}: {}", container_id, veth_container));
+            }
         } else {
             ConsoleLogger::debug(&format!("🚫 [ATOMIC] Network disabled for {}", container_id));
         }
@@ -416,10 +529,6 @@ impl SyncEngine {
         Ok(())
     }
     
-    /// List cleanup tasks for a container
-    pub async fn list_cleanup_tasks(&self, container_id: &str) -> SyncResult<Vec<crate::sync::cleanup::CleanupTask>> {
-        self.cleanup_service.list_container_cleanup_tasks(container_id).await
-    }
     
     // === Utility Methods ===
     
@@ -459,6 +568,20 @@ impl SyncEngine {
     }
     
     /// Get metrics history for a container within time range
+    /// Example function showing how to create specialized engines for testing/development
+    /// This ensures constructors like new_for_testing are properly integrated
+    #[allow(dead_code)]
+    pub async fn create_test_engine_example() -> SyncResult<()> {
+        // Example usage of new_for_testing with specific IP range
+        let _engine = Self::new_for_testing(
+            ":memory:", 
+            std::net::Ipv4Addr::new(192, 168, 1, 2),
+            std::net::Ipv4Addr::new(192, 168, 1, 254)
+        ).await?;
+        tracing::debug!("Created test engine with custom IP range");
+        Ok(())
+    }
+    
     pub async fn get_metrics_history(
         &self, 
         container_id: &str, 
@@ -530,6 +653,11 @@ impl SyncEngine {
     pub async fn cleanup_orphaned_volumes(&self) -> SyncResult<u32> {
         self.volume_manager.cleanup_orphaned_volumes().await
     }
+
+    /// Perform comprehensive network cleanup using ICC NetworkManager integration
+    pub async fn comprehensive_network_cleanup(&self) -> SyncResult<Vec<String>> {
+        self.cleanup_service.perform_comprehensive_network_cleanup().await
+    }
     
     /// Add mount to container
     pub async fn add_container_mount(
@@ -541,7 +669,30 @@ impl SyncEngine {
         readonly: bool,
         options: std::collections::HashMap<String, String>,
     ) -> SyncResult<Mount> {
-        self.volume_manager.add_mount(container_id, source, target, mount_type, readonly, options).await
+        // Validate mount configuration using InputValidator
+        let mount_string = format!("{}:{}", source, target);
+        match InputValidator::parse_volume(&mount_string) {
+            Ok(parsed_mount) => {
+                tracing::debug!("Mount validation passed for container {}: {} -> {} (readonly: {})", 
+                    container_id, parsed_mount.source, parsed_mount.target, parsed_mount.readonly);
+                
+                // Use parsed readonly flag if it differs from input
+                let final_readonly = if parsed_mount.readonly != readonly {
+                    tracing::info!("Using parsed readonly flag {} instead of {} for container {}", 
+                        parsed_mount.readonly, readonly, container_id);
+                    parsed_mount.readonly
+                } else {
+                    readonly
+                };
+                
+                self.volume_manager.add_mount(container_id, source, target, mount_type, final_readonly, options).await
+            }
+            Err(e) => {
+                tracing::warn!("Mount parsing validation failed for container {}: {}, proceeding with original config", 
+                    container_id, e);
+                self.volume_manager.add_mount(container_id, source, target, mount_type, readonly, options).await
+            }
+        }
     }
     
     /// Get mounts for a container

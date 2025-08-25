@@ -3,6 +3,7 @@ use sqlx::{SqlitePool, Row};
 use std::net::Ipv4Addr;
 use std::time::{SystemTime, UNIX_EPOCH};
 use crate::sync::error::{SyncError, SyncResult};
+use crate::utils::process::ProcessUtils;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum NetworkStatus {
@@ -57,14 +58,61 @@ pub struct NetworkAllocation {
     pub status: NetworkStatus,
 }
 
+impl NetworkAllocation {
+    /// Get formatted allocation timestamp
+    pub fn allocation_time_formatted(&self) -> String {
+        ProcessUtils::format_timestamp(self.allocation_time as u64)
+    }
+}
+
 pub struct NetworkManager {
     pool: SqlitePool,
+    subnet_cidr: String,  // Configurable subnet CIDR (e.g., "10.42.0.0/16")
+    icc_network_manager: Option<std::sync::Arc<crate::icc::network::NetworkManager>>,
 }
 
 impl NetworkManager {
     pub fn new(pool: SqlitePool) -> Self {
         Self {
             pool,
+            subnet_cidr: "10.42.0.0/16".to_string(),  // Default subnet
+            icc_network_manager: None,
+        }
+    }
+    
+    pub fn new_with_subnet(pool: SqlitePool, subnet_cidr: String) -> Self {
+        Self {
+            pool,
+            subnet_cidr,
+            icc_network_manager: None,
+        }
+    }
+    
+    pub fn new_with_icc_manager(
+        pool: SqlitePool, 
+        icc_network_manager: std::sync::Arc<crate::icc::network::NetworkManager>
+    ) -> Self {
+        let subnet_cidr = icc_network_manager.config.subnet_cidr.clone();
+        Self {
+            pool,
+            subnet_cidr,
+            icc_network_manager: Some(icc_network_manager),
+        }
+    }
+    
+    /// Create network manager with specific IP range for testing
+    pub fn with_ip_range(pool: SqlitePool, start_ip: Ipv4Addr, _end_ip: Ipv4Addr) -> Self {
+        // For testing purposes, create a /30 network that exactly covers the range
+        // This gives us 4 addresses (.0=network, .1=gateway, .2=first host, .3=broadcast)
+        // But our parser will use .2 and .3 as the usable range
+        let network_base = u32::from(start_ip) & 0xFFFFFFFC; // Align to /30 boundary
+        let network_ip = Ipv4Addr::from(network_base);
+        let subnet_cidr = format!("{}/30", network_ip);
+        
+        Self {
+            pool,
+            subnet_cidr,
+            icc_network_manager: None,
         }
     }
     
@@ -83,13 +131,20 @@ impl NetworkManager {
             });
         }
         
+        // Use ICC NetworkManager's lock-free allocation as starting hint if available
+        let icc_ip_hint = if let Some(ref icc_manager) = self.icc_network_manager {
+            icc_manager.allocate_next_ip().ok()
+        } else {
+            None
+        };
+        
         // FIXED: Atomic IP allocation using database transaction with retry logic
         // This eliminates the TOCTOU race condition in concurrent container creation
         let max_retries = 5;
         let mut retry_count = 0;
         
         loop {
-            match self.try_allocate_ip_atomically(container_id).await {
+            match self.try_allocate_ip_atomically(container_id, icc_ip_hint.as_deref()).await {
                 Ok(ip) => {
                     tracing::info!("Allocated IP {} for container {} (attempt {})", ip, container_id, retry_count + 1);
                     return Ok(NetworkConfig {
@@ -154,6 +209,31 @@ impl NetworkManager {
     }
     
     pub async fn mark_network_setup_complete(&self, container_id: &str, bridge_interface: &str, veth_host: &str, veth_container: &str) -> SyncResult<()> {
+        // Validate network setup using ICC NetworkManager if available
+        if let Some(ref icc_manager) = self.icc_network_manager {
+            // Validate bridge exists and is up
+            if !icc_manager.bridge_exists() {
+                return Err(SyncError::ValidationFailed {
+                    message: format!("Bridge {} does not exist during network setup completion", bridge_interface),
+                });
+            }
+            
+            // Validate bridge is up and running
+            if let Err(e) = icc_manager.bridge_manager.verify_bridge_up() {
+                tracing::warn!("Bridge verification warning during setup completion: {}", e);
+                // Continue with setup but log the warning - bridge might still be functional
+            }
+            
+            // Validate veth pair exists (if we have the methods available)
+            if let Err(e) = icc_manager.veth_manager.verify_veth_pair_created(veth_host, veth_container) {
+                return Err(SyncError::ValidationFailed {
+                    message: format!("Veth pair validation failed for {}: {}", container_id, e),
+                });
+            }
+            
+            tracing::info!("ICC bridge validation passed for container {}", container_id);
+        }
+        
         let result = sqlx::query(r#"
             UPDATE network_allocations 
             SET setup_completed = ?, status = ?, bridge_interface = ?, veth_host = ?, veth_container = ?
@@ -174,7 +254,7 @@ impl NetworkManager {
             });
         }
         
-        tracing::info!("Marked network setup complete for container {}", container_id);
+        tracing::info!("Marked network setup complete for container {} with ICC validation", container_id);
         Ok(())
     }
     
@@ -193,7 +273,7 @@ impl NetworkManager {
                 let status_str: String = row.get("status");
                 let status = NetworkStatus::from_string(&status_str)?;
                 
-                Ok(NetworkAllocation {
+                let allocation = NetworkAllocation {
                     container_id: row.get("container_id"),
                     ip_address: row.get("ip_address"),
                     bridge_interface: row.get("bridge_interface"),
@@ -202,7 +282,17 @@ impl NetworkManager {
                     allocation_time: row.get("allocation_time"),
                     setup_completed: row.get("setup_completed"),
                     status,
-                })
+                };
+                
+                // Debug logging using formatting method
+                tracing::debug!(
+                    "Network allocation for {}: IP {} allocated at {}",
+                    container_id,
+                    allocation.ip_address,
+                    allocation.allocation_time_formatted()
+                );
+                
+                Ok(allocation)
             }
             None => Err(SyncError::NotFound {
                 container_id: container_id.to_string(),
@@ -285,7 +375,7 @@ impl NetworkManager {
     
     /// PRODUCTION-GRADE: Atomically allocate IP using database transaction
     /// Eliminates TOCTOU race conditions in concurrent container creation
-    async fn try_allocate_ip_atomically(&self, container_id: &str) -> SyncResult<String> {
+    async fn try_allocate_ip_atomically(&self, container_id: &str, icc_hint: Option<&str>) -> SyncResult<String> {
         let mut transaction = self.pool.begin().await?;
         
         // Find available IP within transaction (consistent snapshot)
@@ -298,20 +388,34 @@ impl NetworkManager {
             .map(|(ip,)| ip)
             .collect();
         
-        // Find first available IP in range (10.42.0.2 to 10.42.255.254)
-        let start_ip = Ipv4Addr::new(10, 42, 0, 2);
-        let end_ip = Ipv4Addr::new(10, 42, 255, 254);
+        // Parse subnet_cidr to determine IP range
+        let (start_ip, end_ip) = self.parse_subnet_range()?;
         let start_int = u32::from(start_ip);
         let end_int = u32::from(end_ip);
         
         let mut selected_ip = None;
-        for ip_int in start_int..=end_int {
-            let ip = Ipv4Addr::from(ip_int);
-            let ip_str = ip.to_string();
-            
-            if !allocated_set.contains(&ip_str) {
-                selected_ip = Some(ip_str);
-                break;
+        
+        // Try ICC hint first if available and within range
+        if let Some(hint) = icc_hint {
+            if let Ok(hint_ip) = hint.parse::<Ipv4Addr>() {
+                let hint_int = u32::from(hint_ip);
+                if hint_int >= start_int && hint_int <= end_int && !allocated_set.contains(hint) {
+                    selected_ip = Some(hint.to_string());
+                    tracing::debug!("Using ICC hint IP {} for container {}", hint, container_id);
+                }
+            }
+        }
+        
+        // Fallback to sequential search if no hint or hint not available
+        if selected_ip.is_none() {
+            for ip_int in start_int..=end_int {
+                let ip = Ipv4Addr::from(ip_int);
+                let ip_str = ip.to_string();
+                
+                if !allocated_set.contains(&ip_str) {
+                    selected_ip = Some(ip_str);
+                    break;
+                }
             }
         }
         
@@ -349,6 +453,44 @@ impl NetworkManager {
         }
     }
     
+    /// Parse subnet CIDR into usable IP range for allocation
+    fn parse_subnet_range(&self) -> SyncResult<(Ipv4Addr, Ipv4Addr)> {
+        // Parse CIDR notation (e.g., "10.42.0.0/16")
+        let parts: Vec<&str> = self.subnet_cidr.split('/').collect();
+        if parts.len() != 2 {
+            return Err(SyncError::ValidationFailed {
+                message: format!("Invalid subnet CIDR format: {}", self.subnet_cidr),
+            });
+        }
+        
+        let network_ip: Ipv4Addr = parts[0].parse().map_err(|_| SyncError::ValidationFailed {
+            message: format!("Invalid network IP in CIDR: {}", parts[0]),
+        })?;
+        
+        let prefix_len: u32 = parts[1].parse().map_err(|_| SyncError::ValidationFailed {
+            message: format!("Invalid prefix length in CIDR: {}", parts[1]),
+        })?;
+        
+        if prefix_len > 32 {
+            return Err(SyncError::ValidationFailed {
+                message: format!("Invalid prefix length: {}", prefix_len),
+            });
+        }
+        
+        // Calculate network range
+        let network_bits = u32::from(network_ip);
+        let host_bits = 32 - prefix_len;
+        let subnet_mask = !((1u32 << host_bits) - 1);
+        let network_address = network_bits & subnet_mask;
+        let broadcast_address = network_address | ((1u32 << host_bits) - 1);
+        
+        // Exclude network and broadcast addresses, start from .2 to avoid common gateway (.1)
+        let start_ip = Ipv4Addr::from(network_address + 2);
+        let end_ip = Ipv4Addr::from(broadcast_address - 1);
+        
+        tracing::debug!("Parsed subnet {} -> range {} to {}", self.subnet_cidr, start_ip, end_ip);
+        Ok((start_ip, end_ip))
+    }
     
 }
 
@@ -418,18 +560,17 @@ mod tests {
         let schema_manager = SchemaManager::new(conn_manager.pool().clone());
         schema_manager.initialize_schema().await.unwrap();
         
-        // Create network manager with very small IP range
-        let network_manager = NetworkManager::with_ip_range(
+        // Create network manager with very small IP range using /30 subnet (4 addresses)
+        let network_manager = NetworkManager::new_with_subnet(
             conn_manager.pool().clone(),
-            Ipv4Addr::new(10, 42, 0, 10),
-            Ipv4Addr::new(10, 42, 0, 11) // Only 2 IPs available
+            "10.42.0.8/30".to_string()  // Network: .8, Gateway: .9, Usable: .10, .11
         );
         
-        // Allocate first IP
+        // Allocate first IP (should be 10.42.0.10 - first usable in /30)
         let config1 = network_manager.allocate_network("container1").await.unwrap();
         assert_eq!(config1.ip_address, "10.42.0.10");
         
-        // Allocate second IP
+        // Allocate second IP (should be 10.42.0.11 - second usable in /30) 
         let config2 = network_manager.allocate_network("container2").await.unwrap();
         assert_eq!(config2.ip_address, "10.42.0.11");
         

@@ -7,11 +7,13 @@ use crate::utils::command::CommandExecutor;
 use crate::daemon::cgroup::CgroupManager;
 use crate::icc::network::ContainerNetworkConfig;
 use crate::utils::filesystem::FileSystemUtils;
+use crate::daemon::MountConfig;
+use crate::utils::validation::VolumeMount;
 
 /// Thread-safe comprehensive resource manager for container lifecycle
 pub struct ResourceManager {
-    /// Track active mounts per container (thread-safe)
-    active_mounts: Arc<Mutex<HashMap<String, Vec<String>>>>,
+    /// Track active mounts per container with full configuration (thread-safe)
+    active_mounts: Arc<Mutex<HashMap<String, Vec<MountConfig>>>>,
     /// Track network interfaces per container (thread-safe)
     network_interfaces: Arc<Mutex<HashMap<String, ContainerNetworkConfig>>>,
 }
@@ -26,10 +28,116 @@ impl ResourceManager {
 
     /// Register mounts for a container (thread-safe)
     pub fn register_mounts(&self, container_id: &str, mounts: Vec<String>) {
-        ConsoleLogger::debug(&format!("[RESOURCE] Registering {} mounts for container {}", mounts.len(), container_id));
+        ConsoleLogger::debug(&format!("[RESOURCE] Registering {} mount paths for container {}", mounts.len(), container_id));
+        // Convert string paths to minimal MountConfig for backward compatibility
+        let mount_configs: Vec<MountConfig> = mounts.into_iter().map(|path| {
+            MountConfig {
+                source: path.clone(),
+                target: path,
+                mount_type: crate::daemon::MountType::Bind, // Default assumption
+                readonly: false, // Default to read-write
+                options: std::collections::HashMap::new(),
+            }
+        }).collect();
+        
         if let Ok(mut active_mounts) = self.active_mounts.lock() {
-            active_mounts.insert(container_id.to_string(), mounts);
+            active_mounts.insert(container_id.to_string(), mount_configs);
         }
+    }
+
+    /// Register mount configurations for a container (thread-safe, enhanced)
+    pub fn register_mount_configs(&self, container_id: &str, mount_configs: Vec<MountConfig>) {
+        ConsoleLogger::debug(&format!("[RESOURCE] Registering {} mount configs for container {}", mount_configs.len(), container_id));
+        
+        // Log readonly mounts for security awareness
+        let readonly_count = mount_configs.iter().filter(|m| m.readonly).count();
+        if readonly_count > 0 {
+            ConsoleLogger::info(&format!("[RESOURCE] Container {} has {} readonly mounts", container_id, readonly_count));
+        }
+        
+        if let Ok(mut active_mounts) = self.active_mounts.lock() {
+            active_mounts.insert(container_id.to_string(), mount_configs);
+        }
+    }
+
+    /// Validate mount configurations for security using VolumeMount integration
+    pub fn validate_mount_security(&self, container_id: &str, mount_configs: &[MountConfig]) -> Result<(), String> {
+        use crate::utils::security::SecurityValidator;
+        use crate::utils::validation::MountType as ValidationMountType;
+        
+        ConsoleLogger::debug(&format!("[RESOURCE] Validating mount security for container {} ({} mounts)", 
+            container_id, mount_configs.len()));
+        
+        for (i, mount_config) in mount_configs.iter().enumerate() {
+            // Convert MountConfig to VolumeMount for validation
+            let validation_mount = VolumeMount {
+                source: mount_config.source.clone(),
+                target: mount_config.target.clone(),
+                mount_type: match mount_config.mount_type {
+                    crate::daemon::MountType::Bind => ValidationMountType::Bind,
+                    crate::daemon::MountType::Volume => ValidationMountType::Volume,
+                    crate::daemon::MountType::Tmpfs => ValidationMountType::Tmpfs,
+                },
+                readonly: mount_config.readonly, // Use the actual readonly field from MountConfig
+                options: mount_config.options.clone(),
+            };
+            
+            // Perform security validation
+            if let Err(e) = SecurityValidator::validate_mount(&validation_mount) {
+                return Err(format!("Mount {} security validation failed for container {}: {}", 
+                    i + 1, container_id, e));
+            }
+            
+            // Log readonly mount validation
+            if validation_mount.readonly {
+                ConsoleLogger::info(&format!("[RESOURCE] Readonly mount validated for {}: {} -> {} (read-only)", 
+                    container_id, validation_mount.source, validation_mount.target));
+            }
+        }
+        
+        ConsoleLogger::success(&format!("[RESOURCE] All {} mounts validated for container {}", 
+            mount_configs.len(), container_id));
+        Ok(())
+    }
+
+    /// Get rootfs path correlation for a container's network configuration
+    pub fn get_network_rootfs_correlation(&self, container_id: &str) -> Option<String> {
+        if let Ok(network_interfaces) = self.network_interfaces.lock() {
+            if let Some(network_config) = network_interfaces.get(container_id) {
+                return network_config.rootfs_path.clone();
+            }
+        }
+        None
+    }
+
+    /// Cleanup container with rootfs-network correlation
+    pub fn cleanup_container_with_correlation(&self, container_id: &str, container_pid: Option<Pid>) -> Result<(), String> {
+        ConsoleLogger::progress(&format!("🔗 [RESOURCE] Starting correlated cleanup for container: {}", container_id));
+
+        // Get network configuration with rootfs correlation
+        let network_config = if let Ok(mut network_interfaces) = self.network_interfaces.lock() {
+            network_interfaces.remove(container_id)
+        } else {
+            None
+        };
+
+        // Perform correlation check
+        if let Some(ref network_config) = network_config {
+            if let Some(ref rootfs_path) = network_config.rootfs_path {
+                ConsoleLogger::info(&format!("[RESOURCE] Network-rootfs correlation found: {} <-> {}", 
+                    network_config.container_id, rootfs_path));
+                
+                // Validate correlation consistency
+                let expected_rootfs = format!("/tmp/quilt-containers/{}", container_id);
+                if rootfs_path != &expected_rootfs {
+                    ConsoleLogger::warning(&format!("[RESOURCE] Rootfs path mismatch: expected {}, found {}", 
+                        expected_rootfs, rootfs_path));
+                }
+            }
+        }
+
+        // Proceed with normal cleanup using correlation info
+        self.cleanup_container_resources(container_id, container_pid)
     }
 
     /// Register network configuration for a container (thread-safe)
@@ -44,7 +152,7 @@ impl ResourceManager {
     pub fn cleanup_container_resources(&self, container_id: &str, container_pid: Option<Pid>) -> Result<(), String> {
         ConsoleLogger::progress(&format!("🧹 Cleaning up all resources for container: {}", container_id));
 
-        let mut cleanup_errors = Vec::new();
+        let mut cleanup_errors: Vec<String> = Vec::new();
 
         // 1. Cleanup network resources (thread-safe)
         let network_config = if let Ok(mut network_interfaces) = self.network_interfaces.lock() {
@@ -77,8 +185,19 @@ impl ResourceManager {
             cleanup_errors.push(format!("Cgroup cleanup failed: {}", e));
         }
 
-        // 4. Final rootfs cleanup (retry with proper ordering)
+        // 4. Final rootfs cleanup with network correlation validation
         let rootfs_path = format!("/tmp/quilt-containers/{}", container_id);
+        
+        // Check if rootfs path matches network configuration correlation
+        if let Some(network_rootfs) = self.get_network_rootfs_correlation(container_id) {
+            if network_rootfs != rootfs_path {
+                ConsoleLogger::warning(&format!("[RESOURCE] Rootfs cleanup path mismatch: cleanup={}, network={}", 
+                    rootfs_path, network_rootfs));
+            } else {
+                ConsoleLogger::debug(&format!("[RESOURCE] Rootfs cleanup path correlation verified: {}", rootfs_path));
+            }
+        }
+        
         if let Err(e) = self.cleanup_rootfs_resources_safe(&rootfs_path) {
             cleanup_errors.push(format!("Rootfs cleanup failed: {}", e));
         }
@@ -93,9 +212,23 @@ impl ResourceManager {
         }
     }
 
-    /// Cleanup network resources (veth pairs, network namespaces)
+    /// Cleanup network resources (veth pairs, network namespaces) with rootfs correlation
     fn cleanup_network_resources(&self, network_config: &ContainerNetworkConfig, container_pid: Option<Pid>) -> Result<(), String> {
         ConsoleLogger::debug(&format!("🌐 Cleaning up network resources: {}", network_config.veth_host_name));
+        
+        // Use rootfs_path for cleanup correlation
+        if let Some(ref rootfs_path) = network_config.rootfs_path {
+            ConsoleLogger::info(&format!("[RESOURCE] Network cleanup correlated with rootfs: {}", rootfs_path));
+            
+            // Validate rootfs path exists before network cleanup for safety
+            if std::path::Path::new(rootfs_path).exists() {
+                ConsoleLogger::debug(&format!("[RESOURCE] Rootfs {} exists, proceeding with network cleanup", rootfs_path));
+            } else {
+                ConsoleLogger::warning(&format!("[RESOURCE] Rootfs {} not found during network cleanup - container may have been partially cleaned", rootfs_path));
+            }
+        } else {
+            ConsoleLogger::warning(&format!("[RESOURCE] No rootfs_path correlation available for container {}", network_config.container_id));
+        }
 
         // Clean up veth pair - delete the host side, container side will be cleaned up automatically
         let cleanup_host_veth = format!("ip link delete {} 2>/dev/null || true", network_config.veth_host_name);
@@ -128,15 +261,29 @@ impl ResourceManager {
     }
 
     /// Cleanup mount namespaces
-    fn cleanup_mount_resources(&self, container_id: &str, mounts: &[String], container_pid: Option<Pid>) -> Result<(), String> {
+    fn cleanup_mount_resources(&self, container_id: &str, mounts: &[MountConfig], container_pid: Option<Pid>) -> Result<(), String> {
         ConsoleLogger::debug(&format!("📁 Cleaning up {} mount points for container {}", mounts.len(), container_id));
 
+        // Log readonly mount cleanup for security audit
+        let readonly_mounts: Vec<&MountConfig> = mounts.iter().filter(|m| m.readonly).collect();
+        if !readonly_mounts.is_empty() {
+            ConsoleLogger::info(&format!("[RESOURCE] Cleaning up {} readonly mounts for container {}", 
+                readonly_mounts.len(), container_id));
+        }
+        
         // If container is still running, try to unmount from within the namespace
         if let Some(pid) = container_pid {
-            for mount_point in mounts.iter().rev() { // Reverse order for proper unmounting
+            for mount_config in mounts.iter().rev() { // Reverse order for proper unmounting
+                let mount_point = &mount_config.target;
                 let unmount_cmd = format!("nsenter -t {} -m umount -l {} 2>/dev/null || true", pid.as_raw(), mount_point);
                 if let Err(e) = CommandExecutor::execute_shell(&unmount_cmd) {
                     ConsoleLogger::debug(&format!("Namespace unmount failed for {}: {} (may be expected)", mount_point, e));
+                }
+                
+                // Log readonly mount cleanup
+                if mount_config.readonly {
+                    ConsoleLogger::debug(&format!("[RESOURCE] Cleaned readonly mount: {} -> {} for {}", 
+                        mount_config.source, mount_config.target, container_id));
                 }
             }
         }
@@ -163,8 +310,26 @@ impl ResourceManager {
                 }
             }
         }
+        
+        // Also cleanup user-defined mounts in reverse order
+        for mount_config in mounts.iter().rev() {
+            let mount_point = &mount_config.target;
+            if Path::new(mount_point).exists() {
+                let unmount_cmd = format!("umount {} 2>/dev/null || umount -l {} 2>/dev/null || true", mount_point, mount_point);
+                if let Err(e) = CommandExecutor::execute_shell(&unmount_cmd) {
+                    ConsoleLogger::debug(&format!("User mount cleanup failed for {}: {}", mount_point, e));
+                }
+                
+                // Log cleanup of readonly mounts
+                if mount_config.readonly {
+                    ConsoleLogger::info(&format!("[RESOURCE] Successfully cleaned readonly mount: {} for {}", 
+                        mount_point, container_id));
+                }
+            }
+        }
 
-        ConsoleLogger::success("Mount resources cleaned up");
+        ConsoleLogger::success(&format!("Mount resources cleaned up ({} user mounts, {} readonly)", 
+            mounts.len(), readonly_mounts.len()));
         Ok(())
     }
 
@@ -259,45 +424,6 @@ impl ResourceManager {
         Ok(())
     }
 
-    /// Cleanup all resources for all containers (system-wide cleanup, thread-safe)
-    pub fn cleanup_all_resources(&self) -> Result<(), String> {
-        ConsoleLogger::warning("🧹 Performing system-wide resource cleanup");
-
-        // Get all container IDs (thread-safe)
-        let container_ids: Vec<String> = if let Ok(active_mounts) = self.active_mounts.lock() {
-            active_mounts.keys().cloned().collect()
-        } else {
-            vec![]
-        };
-        
-        let mut cleanup_errors = Vec::new();
-        for container_id in container_ids {
-            if let Err(e) = self.emergency_cleanup(&container_id) {
-                cleanup_errors.push(format!("Failed to cleanup {}: {}", container_id, e));
-            }
-        }
-
-        // Clean up any leftover veth interfaces
-        let cleanup_veth_cmd = "ip link show | grep 'veth-\\|qnet' | cut -d: -f2 | cut -d@ -f1 | xargs -I {} ip link delete {} 2>/dev/null || true";
-        let _ = CommandExecutor::execute_shell(cleanup_veth_cmd);
-
-        // Force unmount any remaining quilt mounts
-        let cleanup_mounts_cmd = "umount -l /tmp/quilt-containers/*/proc /tmp/quilt-containers/*/sys 2>/dev/null || true";
-        let _ = CommandExecutor::execute_shell(cleanup_mounts_cmd);
-
-        // Remove all container directories
-        let cleanup_dirs_cmd = "rm -rf /tmp/quilt-containers/* 2>/dev/null || true";
-        let _ = CommandExecutor::execute_shell(cleanup_dirs_cmd);
-
-        if cleanup_errors.is_empty() {
-            ConsoleLogger::success("✅ System-wide resource cleanup completed");
-            Ok(())
-        } else {
-            let error_msg = format!("Some cleanup operations failed: {}", cleanup_errors.join("; "));
-            ConsoleLogger::warning(&error_msg);
-            Err(error_msg)
-        }
-    }
 }
 
 /// Thread-safe singleton resource manager using proper synchronization

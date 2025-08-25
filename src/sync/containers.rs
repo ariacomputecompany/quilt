@@ -3,12 +3,20 @@ use sqlx::{SqlitePool, Row};
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use crate::sync::error::{SyncError, SyncResult};
+use crate::utils::process::ProcessUtils;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogEntry {
     pub timestamp: i64,
     pub level: String,
     pub message: String,
+}
+
+impl LogEntry {
+    /// Get formatted timestamp for this log entry
+    pub fn timestamp_formatted(&self) -> String {
+        ProcessUtils::format_timestamp(self.timestamp as u64)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -90,6 +98,23 @@ pub struct ContainerStatus {
     pub started_at: Option<i64>,
     pub exited_at: Option<i64>,
     pub rootfs_path: Option<String>,
+}
+
+impl ContainerStatus {
+    /// Get formatted created timestamp
+    pub fn created_at_formatted(&self) -> String {
+        ProcessUtils::format_timestamp(self.created_at as u64)
+    }
+    
+    /// Get formatted started timestamp
+    pub fn started_at_formatted(&self) -> Option<String> {
+        self.started_at.map(|ts| ProcessUtils::format_timestamp(ts as u64))
+    }
+    
+    /// Get formatted exited timestamp
+    pub fn exited_at_formatted(&self) -> Option<String> {
+        self.exited_at.map(|ts| ProcessUtils::format_timestamp(ts as u64))
+    }
 }
 
 pub struct ContainerManager {
@@ -310,6 +335,17 @@ impl ContainerManager {
                 exited_at: row.get("exited_at"),
                 rootfs_path: row.get("rootfs_path"),
             });
+        }
+        
+        // Debug logging using formatting methods
+        for container in &containers {
+            tracing::debug!(
+                "Container {} - Created: {}, Started: {:?}, Exited: {:?}",
+                container.id,
+                container.created_at_formatted(),
+                container.started_at_formatted(),
+                container.exited_at_formatted()
+            );
         }
         
         Ok(containers)
