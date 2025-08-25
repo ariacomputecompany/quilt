@@ -38,7 +38,7 @@ cargo build --release
 
 ### Generate Container Image
 ```bash
-./dev.sh generate-rootfs
+./scripts/dev.sh generate minimal
 ```
 
 ### Create Container
@@ -81,10 +81,18 @@ cargo build --release
 ## Testing
 
 ```bash
-# Run all tests
-./tests/test_container_functionality.sh
-./tests/test_sync_engine.sh
-./tests/test_icc.sh
+# Basic functionality tests
+./tests/test_container_functionality.sh       # Core container features (~18s)
+./tests/test_sync_engine.sh                   # SQLite sync engine
+./tests/test_icc.sh                           # Inter-container communication
+
+# Advanced tests
+./tests/test_runtime_downloads.sh             # Real software downloads (~25s)
+./tests/test_volumes_comprehensive.sh         # Volume functionality
+./tests/test_production_containers.sh         # Production readiness
+
+# Development helper
+./scripts/dev.sh test                          # Run comprehensive test suite
 ```
 
 ## Project Structure
@@ -100,6 +108,9 @@ src/
 
 proto/
 └── quilt.proto       # gRPC service definitions
+
+scripts/
+└── dev.sh            # Development helper script
 
 tests/                # Test scripts
 ```
@@ -129,4 +140,4 @@ tests/                # Test scripts
 
 ## License
 
-[Specify license]
+MIT OR Apache-2.0

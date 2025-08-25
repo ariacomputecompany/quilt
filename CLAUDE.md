@@ -55,6 +55,17 @@ All test scripts are located in the `tests/` directory:
 ./tests/stress_test_full_e2e.sh
 ./tests/stress_test_icc.sh
 ./tests/stress_test_network_baseline.sh
+
+# Additional test scripts
+./tests/benchmark_sync_engine.sh          # Benchmark sync engine performance
+./tests/diagnostic_test.sh                # System diagnostics
+./tests/focused_test.sh                   # Quick focused testing
+./tests/ping_test.sh                      # Network ping tests
+./tests/quick_test.sh                     # Quick validation tests
+./tests/test_fixes.sh                     # Test recent fixes
+./tests/test_metrics_observability.sh     # Metrics and observability
+./tests/test_parallel_startup_success.sh  # Parallel container startup
+./tests/test_resource_cleanup.sh          # Resource cleanup validation
 ```
 
 ### Running Rust Tests
@@ -87,17 +98,25 @@ cargo check
 ### Development Helper
 ```bash
 # Development script with various utilities
-./dev.sh [command]
+./scripts/dev.sh [command]
 
 # Available dev.sh commands:
-./dev.sh build                    # Build both binaries
-./dev.sh server                   # Start server in foreground
-./dev.sh server-bg                # Start server in background
-./dev.sh cli [args]               # Run CLI with arguments
-./dev.sh test                     # Run comprehensive tests
-./dev.sh generate [type]          # Generate rootfs (minimal, dev, python, nodejs, rust)
-./dev.sh clean                    # Stop server and cleanup
-./dev.sh status                   # Show development status
+./scripts/dev.sh build                    # Build both binaries
+./scripts/dev.sh server                   # Start server in foreground
+./scripts/dev.sh server-bg                # Start server in background
+./scripts/dev.sh cli [args]               # Run CLI with arguments
+./scripts/dev.sh test                     # Run comprehensive tests
+./scripts/dev.sh generate [type]          # Generate rootfs (minimal, dev, python, nodejs, rust)
+./scripts/dev.sh clean                    # Stop server and cleanup
+./scripts/dev.sh status                   # Show development status
+./scripts/dev.sh help                     # Show detailed help with examples
+
+# Rootfs generation types:
+./scripts/dev.sh generate minimal         # Basic shell and coreutils
+./scripts/dev.sh generate dev             # Development tools (curl, wget, python, node)
+./scripts/dev.sh generate python          # Python with common packages
+./scripts/dev.sh generate nodejs          # Node.js with npm
+./scripts/dev.sh generate rust            # Rust development environment
 ```
 
 ## High-Level Architecture
@@ -160,7 +179,7 @@ The sync engine uses SQLite with tables for:
 
 - Supports rootfs tarballs (`.tar.gz`)
 - Users must generate their own container images
-- Use `./dev.sh generate-rootfs` to create test images
+- Use `./scripts/dev.sh generate` to create test images
 - Automatic binary fixing for Nix-generated containers with broken symlinks
 - Custom shell binary compiled during build for environments with broken symlinks
 
@@ -209,7 +228,7 @@ The sync engine uses SQLite with tables for:
 ### Create Container
 ```bash
 # First generate a container image if needed
-./dev.sh generate-rootfs
+./scripts/dev.sh generate minimal
 
 # Create a container
 ./target/debug/cli create \
@@ -268,3 +287,5 @@ The sync engine uses SQLite with tables for:
 - **Build profiles**: Optimized release profile with LTO and symbol stripping
 - **Dependencies**: Uses Tokio for async runtime, SQLx for database, Tonic for gRPC
 - **Binary targets**: `quilt` (server) and `cli` (client) defined in Cargo.toml
+- **Protobuf compilation**: Auto-generated with `tonic-build` during compilation
+- **Embedded resources**: Busybox binary located at `src/daemon/resources/busybox`
