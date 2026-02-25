@@ -13,7 +13,6 @@ Included in OSS:
 - Image/registry workflows and runtime support modules
 - Volume and metrics paths
 - Fozzy scenarios and verification tooling
-- NOTE: For native Kubernetes-like cluster management, use [quiltc](https://github.com/ariacomputecompany/quiltc)
 
 ## Requirements
 
@@ -54,6 +53,43 @@ Optional local stack:
 ```bash
 docker compose up --build
 ```
+
+## Cluster Management with `quiltc`
+
+`quilt-core` focuses on single-runtime and local container operations. For Kubernetes-style cluster workflows, use [`quiltc`](https://github.com/ariacomputecompany/quiltc).
+
+Use `quiltc` when you need:
+- cluster/node/workload lifecycle management
+- replica orchestration across multiple nodes
+- placement and rescheduling behavior
+- distributed agent registration, heartbeat, and status reporting
+
+High-level mapping:
+- Workload (replicas) ~= Deployment/ReplicaSet
+- Placement (`replica_index -> node`) ~= Pod scheduled to a Node
+- Agent register/heartbeat/report ~= node lifecycle and status flow
+
+## Optional GUI Workloads (`qgui`)
+
+If you need browser-accessible desktop apps inside a container, use `qgui` in a GUI-capable image (for example `prod-gui`).
+
+Typical flow:
+
+```bash
+# 1) Start GUI services in the container
+./quilt.sh exec <container_id> "qgui up"
+
+# 2) Launch a GUI app on the container display
+./quilt.sh exec <container_id> "apk add --no-cache xeyes xclock && DISPLAY=:1 xeyes & DISPLAY=:1 xclock &"
+
+# 3) Request a signed URL and open it immediately in browser
+curl -sS -H "Authorization: Bearer $QUILT_API_KEY" \
+  "$QUILT_API_URL/api/containers/<container_id>/gui-url"
+```
+
+Notes:
+- `qgui status` reports xvfb/vnc/websockify health.
+- `/gui/<id>/` may return `401` in direct API-key flows; use the signed `gui_url` response.
 
 ## Testing
 
